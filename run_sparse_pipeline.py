@@ -9,8 +9,9 @@ Two modes are intentionally supported:
     iteration.
 
 ``adaptive``
-    Fit K=1 as above, freeze its sparse mean, add LD-rank covariance boundaries
-    while the global LD-CUSUM score is significant, jointly refit alpha/theta
+    Fit K=1 as above, freeze its sparse mean, refit the ordinary offset-REML
+    null, then add LD-rank covariance boundaries while the global LD-CUSUM
+    score is significant, jointly refit alpha/theta
     with validation-selected lambda at the endpoint, and then perform the same
     final combined-sample refit as fixed mode.
 
@@ -653,6 +654,44 @@ def _prepare_ld_rank(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
     return rank_path, metadata
 
 
+def _run_frozen_covariance_fit(
+    args: argparse.Namespace,
+    *,
+    component_spec: Path,
+    state_path: Path,
+    parent_summary_path: Path,
+    theta_init: Sequence[float],
+    output_path: Path,
+    expected_k: int,
+) -> dict[str, Any]:
+    """Fit the working ordinary-REML covariance without changing the sparse mean."""
+    if not output_path.is_file():
+        _run_command(
+            _adaptive_stage_command(
+                args,
+                "frozen-fit",
+                component_spec=component_spec,
+                state_path=state_path,
+                extra=[
+                    "--parent-summary", str(parent_summary_path),
+                    "--theta-init-json", json.dumps(list(theta_init), separators=(",", ":")),
+                    "--out", str(output_path),
+                ],
+            ),
+            output_path.with_suffix(".log"),
+        )
+    summary = read_json(output_path)
+    if (summary.get("schema_version") != 1
+            or summary.get("method") != "fixed_sparse_mean_covariance_reml"
+            or summary.get("n_grms") != expected_k):
+        raise ValueError(f"Incompatible frozen fit; use a new work directory: {output_path}")
+    theta = np.asarray(summary["var_components_lasso_ml"], dtype=np.float64)
+    if (theta.shape != (expected_k + 1,) or not np.all(np.isfinite(theta))
+            or np.any(theta[:-1] < 0) or theta[-1] <= 0):
+        raise RuntimeError(f"Invalid frozen covariance fit: {output_path}")
+    return summary
+
+
 def _run_adaptive_selection(
     args: argparse.Namespace,
 ) -> tuple[Path, Path, dict[str, Any], dict[str, Any]]:
@@ -672,26 +711,38 @@ def _run_adaptive_selection(
     )
     rank_path, ld_metadata = _prepare_ld_rank(args)
 
+    # K=1 alpha/theta were jointly fitted with selected-mean information
+    # correction. The split score instead uses ordinary offset REML. Fit that
+    # working null before the first score, keeping alpha and q_chive unchanged.
+    # Preserve k1_summary separately for reporting and the no-split endpoint.
+    adaptive_dir = args.work_dir / "adaptive" / "fixed_alpha_path"
     current_k = 1
     current_spec = root_spec
-    current_summary_path = Path(str(_k1_prefix) + ".summary.json")
-    current_summary: dict[str, Any] = k1_summary
+    current_summary_path = adaptive_dir / "k0001.frozen_fit.json"
+    current_summary = _run_frozen_covariance_fit(
+        args,
+        component_spec=root_spec,
+        state_path=k1_state,
+        parent_summary_path=Path(str(_k1_prefix) + ".summary.json"),
+        theta_init=k1_summary["var_components_lasso_ml"],
+        output_path=current_summary_path,
+        expected_k=1,
+    )
     path: list[dict[str, Any]] = [
         {
             "k": 1,
-            "h2": float(k1_summary["h2"]),
-            "q_chive": float(k1_summary["q_chive"]),
+            "h2": float(current_summary["h2"]),
+            "q_chive": float(current_summary["q_chive"]),
             "theta": [
-                float(value) for value in k1_summary["var_components_lasso_ml"]
+                float(value) for value in current_summary["var_components_lasso_ml"]
             ],
-            "genetic_trace_atoms": list(k1_summary["genetic_trace_atoms"]),
+            "genetic_trace_atoms": list(current_summary["genetic_trace_atoms"]),
             "component_spec": str(root_spec.resolve()),
             "fit": str(current_summary_path.resolve()),
-            "stage": "k1_validation_lambda",
+            "stage": "fixed_k1_sparse_mean_null_refit",
         }
     ]
     stop_reason = "running"
-    adaptive_dir = args.work_dir / "adaptive" / "fixed_alpha_path"
     while True:
         score_path = adaptive_dir / f"k{current_k:04d}.score.json"
         if not score_path.is_file():
@@ -779,33 +830,16 @@ def _run_adaptive_selection(
             atomic_json(build_path, build)
         build = read_json(build_path)
         next_fit_path = adaptive_dir / f"k{next_k:04d}.frozen_fit.json"
-        if not next_fit_path.is_file():
-            _run_command(
-                _adaptive_stage_command(
-                    args,
-                    "frozen-fit",
-                    component_spec=next_spec,
-                    state_path=k1_state,
-                    extra=[
-                        "--parent-summary",
-                        str(current_summary_path),
-                        "--theta-init-json",
-                        json.dumps(
-                            build["variance_components_init"], separators=(",", ":")
-                        ),
-                        "--out",
-                        str(next_fit_path),
-                    ],
-                ),
-                adaptive_dir / f"k{next_k:04d}.frozen_fit.log",
-            )
-        next_summary = read_json(next_fit_path)
-        if (next_summary.get("schema_version") != 1
-                or next_summary.get("method") != "fixed_sparse_mean_covariance_reml"):
-            raise ValueError(f"Incompatible frozen fit; use a new work directory: {next_fit_path}")
+        next_summary = _run_frozen_covariance_fit(
+            args,
+            component_spec=next_spec,
+            state_path=k1_state,
+            parent_summary_path=current_summary_path,
+            theta_init=build["variance_components_init"],
+            output_path=next_fit_path,
+            expected_k=next_k,
+        )
         theta = np.asarray(next_summary["var_components_lasso_ml"], dtype=np.float64)
-        if theta.shape != (next_k + 1,) or not np.all(np.isfinite(theta)):
-            raise RuntimeError(f"Invalid frozen covariance fit: {next_fit_path}")
         path.append(
             {
                 "k": next_k,
@@ -827,7 +861,7 @@ def _run_adaptive_selection(
     path_payload = {
         "schema_version": 1,
         "status": "complete",
-        "algorithm": "fixed_k1_sparse_mean_global_ld_cusum",
+        "algorithm": "fixed_k1_sparse_mean_null_refit_then_global_ld_cusum",
         "stop_reason": stop_reason,
         "selected_k": current_k,
         "selected_h2_fixed_alpha": float(current_summary["h2"]),
@@ -1278,7 +1312,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "algorithm": (
                 "fixed_k_validation_lambda_then_combined_refit"
                 if args.mode == "fixed"
-                else "k1_validation_then_fixed_alpha_ld_cusum_then_endpoint_validation_and_combined_refits"
+                else "k1_validation_then_ordinary_null_refit_then_fixed_alpha_ld_cusum_then_endpoint_validation_and_combined_refits"
             ),
             "selection": selection_result,
             "final_refit": {

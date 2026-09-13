@@ -140,6 +140,15 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
         single_path = next(tmp_path.glob("**/k1_validation/coherit.summary.json"))
         single = json.loads(single_path.read_text())
         assert single["primary_h2_method"] == "information_corrected_sparse_reml"
+        null_path = single_path.parents[1]/"fixed_alpha_path"/"k0001.frozen_fit.json"
+        null = json.loads(null_path.read_text())
+        assert null["n_grms"] == 1
+        np.testing.assert_allclose(null["theta_initial"], single["var_components_lasso_ml"])
+        assert Path(null["parent_summary"]) == single_path
+        first_node = pipeline["selection"]["fixed_alpha_path"]["path"][0]
+        assert first_node["stage"] == "fixed_k1_sparse_mean_null_refit"
+        assert first_node["h2"] == null["h2"]
+        assert pipeline["selection"]["k1_validation"]["h2"] == single["h2"]
         frozen_paths = list(tmp_path.glob("**/fixed_alpha_path/k*.frozen_fit.json"))
         assert frozen_paths, "The adaptive fixture must exercise an ordinary covariance refit."
         for frozen_path in frozen_paths:

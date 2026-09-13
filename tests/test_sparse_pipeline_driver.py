@@ -1,10 +1,12 @@
 import argparse
 import importlib
+import json
 import os
 from pathlib import Path
 import sys
 
 import pytest
+import numpy as np
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PARENT = os.path.dirname(REPO_ROOT)
@@ -30,6 +32,84 @@ def test_trace_score_cli_defaults():
     assert args.score_trace_tol == 0.05
     assert args.score_trace_seed >= 0
     assert not any("bootstrap" in name for name in vars(args))
+
+
+@pytest.mark.parametrize("accept_first", [False, True])
+def test_adaptive_null_refit_precedes_score_and_keeps_joint_endpoint(monkeypatch, tmp_path, accept_first):
+    args = RUN_SPARSE.parse_args(score_args())
+    args.work_dir = tmp_path
+    args.genotype_prefix = tmp_path / "geno"
+    args.genotype_format = "bed"
+    calls, validation_calls = [], []
+    def summary(k, theta, h2):
+        return dict(n_grms=k, h2=h2, var_components_lasso_ml=theta,
+                    q_chive=.2, genetic_trace_atoms=[1.]*k, support_size=2,
+                    lasso_selected_lam_ratio=.1, lasso_selected_validation_r2=.3,
+                    outer_iterations=3, outer_stop_reason="converged")
+    original = summary(1, [.6,.2], .8)
+    def validation(args, *, directory, **kwargs):
+        validation_calls.append((directory.name, kwargs))
+        directory.mkdir(parents=True, exist_ok=True)
+        result = original if directory.name == "k1_validation" else summary(2,[.1,.3,.4],.6)
+        prefix, state = directory/"coherit", directory/"sparse_state.npz"
+        RUN_SPARSE.atomic_json(Path(str(prefix)+".summary.json"), result)
+        return prefix, state, result
+    def rank(args):
+        path = args.work_dir/"adaptive"/"ld_rank.npz"
+        RUN_SPARSE.write_ld_rank_artifact(path, np.arange(8), bins=2)
+        return path, {}
+    def stage(args, kind, *, component_spec, state_path, extra):
+        calls.append((kind, component_spec, state_path, list(extra)))
+        return [kind, *extra]
+    def run(command, log):
+        def value(flag):
+            return command[command.index(flag)+1]
+        output = Path(value("--out"))
+        if command[0] == "frozen-fit":
+            initial = json.loads(value("--theta-init-json"))
+            k = len(initial)-1
+            theta = [.3,.5] if k == 1 else [.1,.3,.4]
+            fit = summary(k,theta,.6)
+            fit.update(schema_version=1, method="fixed_sparse_mean_covariance_reml",
+                       parent_q_sparse_held_fixed=.2)
+            RUN_SPARSE.atomic_json(output,fit)
+        else:
+            parent = Path(value("--summary-path"))
+            assert parent.name.endswith(".frozen_fit.json")
+            fit = RUN_SPARSE.read_json(parent)
+            accepted = accept_first and fit["n_grms"] == 1
+            RUN_SPARSE.atomic_json(output, dict(schema_version=3,
+                method="joint_quadratic_reml_ld_cusum", accepted=accepted,
+                diagnostics=dict(global_p_value=.01 if accepted else .8),
+                selected_candidate=dict(boundary_position=4,score_statistic=9.),
+                stop_reason="split_signal" if accepted else "global_score_not_significant"))
+    monkeypatch.setattr(RUN_SPARSE,"load_variant_records",lambda *args: list(range(8)))
+    monkeypatch.setattr(RUN_SPARSE,"_run_validation_fit",validation)
+    monkeypatch.setattr(RUN_SPARSE,"_prepare_ld_rank",rank)
+    monkeypatch.setattr(RUN_SPARSE,"_adaptive_stage_command",stage)
+    monkeypatch.setattr(RUN_SPARSE,"_run_command",run)
+    spec,state,endpoint,result = RUN_SPARSE._run_adaptive_selection(args)
+    assert [c[0] for c in calls] == (["frozen-fit","score","frozen-fit","score"]
+                                    if accept_first else ["frozen-fit","score"])
+    assert all(c[2].parent.name == "k1_validation" for c in calls)
+    root_args = calls[0][3]
+    assert json.loads(root_args[root_args.index("--theta-init-json")+1]) == [.6,.2]
+    path = result["fixed_alpha_path"]["path"]
+    assert path[0]["stage"] == "fixed_k1_sparse_mean_null_refit"
+    assert path[0]["theta"] == [.3,.5]
+    assert result["k1_validation"]["theta"] == [.6,.2]
+    if accept_first:
+        child_args = calls[2][3]
+        assert json.loads(child_args[child_args.index("--theta-init-json")+1]) == [.15,.15,.5]
+        assert validation_calls[-1][1]["theta_init"] == [.1,.3,.4]
+        assert validation_calls[-1][1]["warm_state_in"].parent.name == "k1_validation"
+        assert endpoint["n_grms"] == 2
+    else:
+        assert endpoint is original
+        assert len(validation_calls) == 1
+    # Completed covariance/score stages must be reused, including the new null.
+    monkeypatch.setattr(RUN_SPARSE,"_run_command",lambda *a: pytest.fail("Unexpected repeat fit"))
+    RUN_SPARSE._run_adaptive_selection(args)
 
 
 @pytest.mark.parametrize("option,value", [
