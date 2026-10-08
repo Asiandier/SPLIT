@@ -16,6 +16,7 @@ dependencies = [
     "polars>=0.20",
     "numba>=0.58",
     "bed-reader>=0.3",
+    "threadpoolctl>=3.1",
 ]
 
 [project.optional-dependencies]

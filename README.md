@@ -604,3 +604,21 @@ python -m pip wheel --no-deps --no-build-isolation \
   conclusions.
 - No public license has been selected yet. Do not redistribute until the project
   owner adds an explicit license.
+
+## Current prediction refinement
+
+The active COHERIT-LD4 refinement updates sparse effects with a four-group,
+single-slab variational EM model using the projected likelihood. It then
+recomputes the covariate coefficients and conditional background BLUP and
+applies iterative SNP-effect-squared weighted ridge. A validation set chooses
+the iteration and calibration; independent test labels are reserved for final
+evaluation. The implementation remains matrix-free and does not materialize a
+sample GRM.
+
+The main numerical modules are `grouped_slab_variational.py`,
+`profiled_prediction_refinement.py`, and `iterative_weighted_ridge.py`.
+The 450-case batch was stopped at 251 completed cases at the user’s request.
+Its frozen driver and dependency source are archived with the result. The
+cleaned package keeps the current mathematical kernels and focused regression
+tests; see [prediction_refinement/README.md](../coherit_mixture3_ldselected_bg50_v4_20260930/prediction_refinement/README.md)
+for the partial result and source snapshot.

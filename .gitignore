@@ -48,3 +48,13 @@ bolt_jax_副本 22-47-38-277/
 report.md
 
 mph-main
+
+# Current prediction refinement regression tests.
+!tests/test_blup_effect_weighting.py
+!tests/test_blup_square_continuation.py
+!tests/test_grouped_slab_variational.py
+!tests/test_iterative_weighted_ridge.py
+!tests/test_matrix_free_inverse_quadratics.py
+!tests/test_matrix_free_sparse_statistics.py
+!tests/test_precision_refined_covariance.py
+!tests/test_profiled_prediction_refinement.py
