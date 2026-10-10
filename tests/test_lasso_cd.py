@@ -637,12 +637,9 @@ class TestFitWeightedLassoWithCovariates:
         Z64 = Z.astype(np.float64)
         GCC = C.T @ HC + 1e-8 * np.eye(p_c)
         GCZ = C.T @ (Hinv @ Z64)
-        GZZ = Z64.T @ (Hinv @ Z64)
         gCy = C.T @ Hy
         gZy = Z64.T @ Hy
         Ainv_gCy = np.linalg.solve(GCC, gCy)
-        Ainv_GCZ = np.linalg.solve(GCC, GCZ)
-        Q = 0.5 * ((GZZ - GCZ.T @ Ainv_GCZ) + (GZZ - GCZ.T @ Ainv_GCZ).T)
         q = gZy - GCZ.T @ Ainv_gCy
         lam = float(np.max(np.abs(q)))
         beta_ref = np.zeros(p_z, dtype=np.float64)

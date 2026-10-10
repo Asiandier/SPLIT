@@ -6,7 +6,6 @@ subtract tr{Z (Z' P_C Z)^-1 Z'}/n from the calibrated sparse quadratic.
 """
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import scipy.linalg as sla

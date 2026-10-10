@@ -11,7 +11,6 @@ from typing import Optional, Sequence
 
 import jax
 import jax.numpy as jnp
-import jax.scipy as jsp
 import numpy as np
 
 from .geno_stream import BedBlockStreamer, GenoBlockStreamer, _ensure_on_device

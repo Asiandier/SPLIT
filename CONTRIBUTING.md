@@ -5,7 +5,7 @@ Thank you for considering a contribution to GPU_REML.
 ## Development Setup
 
 ```bash
-python -m pip install -e .
+python -m pip install -e ".[dev]"
 ```
 
 Optional PGEN support:
@@ -19,8 +19,14 @@ python -m pip install -e ".[pgen]"
 Run:
 
 ```bash
+JAX_PLATFORMS=cpu python -m pytest -q tests
+python -m pyflakes *.py tests/*.py
 python -m pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/gpu_reml_wheel .
 ```
+
+FP64-specific tests use scoped precision contexts; they must not change global
+JAX precision at collection time. GPU tests can select CUDA explicitly through
+`JAX_PLATFORMS=cuda,cpu` and `CUDA_VISIBLE_DEVICES`.
 
 For changes touching genotype streaming, REML scoring, PCG, preconditioning,
 or sparse paths, validate against a dense or analytically simple reference

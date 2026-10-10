@@ -7,7 +7,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import scipy.linalg as sla
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))

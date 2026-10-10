@@ -21,7 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 pgen = ["pgenlib>=0.90"]
-dev = []
+dev = ["pytest>=7", "pyflakes>=3.2"]
 
 [project.scripts]
 gpu-reml = "GPU_REML.run_reml_pipeline:main"

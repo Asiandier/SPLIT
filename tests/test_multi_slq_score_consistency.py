@@ -97,6 +97,24 @@ def test_float32_full_depth_is_finite_and_matches_dense_probe_oracle(kind):
     assert value_only[1] is None
 
 
+def test_promoted_callback_dtype_preserves_slq_value_and_derivative():
+    matrices, theta = problem('regular')
+    with jax.experimental.enable_x64():
+        directions = jnp.asarray(matrices, dtype=jnp.float64)
+        t = jnp.asarray(theta, dtype=jnp.float32)
+        value, gradient = oracle(directions, t, 16)
+        assert value.dtype == jnp.float32
+        reference = oracle(directions, t.astype(jnp.float64), 16)
+        np.testing.assert_allclose(value, reference[0], rtol=2e-5, atol=2e-5)
+        np.testing.assert_allclose(gradient, reference[1], rtol=2e-4, atol=2e-4)
+        finite = []
+        for k in range(len(t)):
+            delta = jnp.eye(len(t), dtype=t.dtype)[k]*.002
+            finite.append(float((oracle(directions, t+delta, 16)[0]
+                                 -oracle(directions, t-delta, 16)[0])/.004))
+        np.testing.assert_allclose(gradient, finite, rtol=2e-3, atol=2e-3)
+
+
 def test_probe_batching_preserves_the_same_target_and_gradient():
     directions, theta = problem("regular")
     with jax.experimental.enable_x64():

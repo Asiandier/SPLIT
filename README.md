@@ -607,18 +607,31 @@ python -m pip wheel --no-deps --no-build-isolation \
 
 ## Current prediction refinement
 
-The active COHERIT-LD4 refinement updates sparse effects with a four-group,
-single-slab variational EM model using the projected likelihood. It then
-recomputes the covariate coefficients and conditional background BLUP and
-applies iterative SNP-effect-squared weighted ridge. A validation set chooses
-the iteration and calibration; independent test labels are reserved for final
-evaluation. The implementation remains matrix-free and does not materialize a
-sample GRM.
+Background experiments now fix the native COHERIT-LD4 LASSO SNP coefficients
+and covariate coefficients. Their training response is
+`r = y - X @ alpha_lasso - C @ gamma_lasso`. The original four GRM
+variance components and original BLUP remain the reference.
 
-The main numerical modules are `grouped_slab_variational.py`,
-`profiled_prediction_refinement.py`, and `iterative_weighted_ridge.py`.
-The 450-case batch was stopped at 251 completed cases at the user’s request.
-Its frozen driver and dependency source are archived with the result. The
-cleaned package keeps the current mathematical kernels and focused regression
-tests; see [prediction_refinement/README.md](../coherit_mixture3_ldselected_bg50_v4_20260930/prediction_refinement/README.md)
-for the partial result and source snapshot.
+The GPU background SS implementation is `grouped_ss_vamp.py`; its model,
+constrained EM update, sample-space VAMP solver, numerical checks and limits
+are described in [grouped SS EM-VAMP](docs/grouped_ss_vamp.md).
+This optional refinement keeps the genotype design resident and caches an
+exact sample Gram eigensystem. Its memory scales as `O(n*p + n*n)` and its
+one-time eigendecomposition as `O(n^3)`; these requirements are separate from
+the streamed, matrix-free REML engine. It never forms a `p*p` LD matrix.
+
+Add `--background-ss` to the sparse pipeline command to run this refinement
+automatically after the final LASSO refit. The pipeline supplies the final
+alpha, gamma, native BLUP, GRM normalizers and variance components; the SS
+posterior means then feed the existing effect writer and prediction path.
+`--background-ss-max-iterations` defaults to 2000. In the high level
+`run_sparse_pipeline` command, refinement runs only on the final combined
+sample fit. It adds no validation tuning step.
+
+The additional `<prefix>.background_ss.npz` and `.background_ss.json` retain
+the original BLUP initialization, posterior moments, group parameters and
+convergence metadata. `beta_background` in the effect table is the refined
+SS mean when enabled. The legacy prediction column `lasso_background_blup`
+also contains that supplied SS background; its metadata identifies
+`background_estimator=constrained_ss_em_vamp`. See the documentation for
+the reusable in-memory adapter and batched inference API.

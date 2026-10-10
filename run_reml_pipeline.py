@@ -6,7 +6,6 @@ import atexit
 import importlib
 import logging
 import os
-import re
 import sys
 import time
 from datetime import datetime

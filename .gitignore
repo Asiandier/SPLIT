@@ -50,9 +50,11 @@ report.md
 mph-main
 
 # Current prediction refinement regression tests.
+!tests/test_grouped_ss_vamp.py
+!tests/test_background_ss.py
+!tests/test_operator_oracles.py
 !tests/test_blup_effect_weighting.py
 !tests/test_blup_square_continuation.py
-!tests/test_grouped_slab_variational.py
 !tests/test_iterative_weighted_ridge.py
 !tests/test_matrix_free_inverse_quadratics.py
 !tests/test_matrix_free_sparse_statistics.py

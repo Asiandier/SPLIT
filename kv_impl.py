@@ -182,7 +182,7 @@ def _xtv_one_call_jit(
 @partial(jax.jit, donate_argnums=(0,))
 def _xtv_scatter_jit(out: Array, block_out: Array, snp_off: Array) -> Array:
     """Write one call-block X^T @ V result into the full output matrix."""
-    return jax.lax.dynamic_update_slice(out, block_out, (snp_off, 0))
+    return jax.lax.dynamic_update_slice(out, block_out, (snp_off, jnp.asarray(0, dtype=snp_off.dtype)))
 
 
 @jax.jit

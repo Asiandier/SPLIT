@@ -81,6 +81,8 @@ def run_continuous_gwas(
 
     y_np = np.asarray(y, dtype=np.float32).reshape(-1)
     n = int(y_np.shape[0])
+    if not np.all(np.isfinite(y_np)):
+        raise ValueError('GWAS phenotype must be finite')
     dense_streamers = tuple(fitter.streamers[: fitter._n_dense_streamers])
     if not dense_streamers:
         raise ValueError("GWAS requires at least one dense genotype streamer.")
@@ -107,6 +109,8 @@ def run_continuous_gwas(
             raise ValueError(
                 f"Covariate row mismatch: expected {n}, got {int(X.shape[0])}."
             )
+    if not np.all(np.isfinite(X)):
+        raise ValueError('GWAS covariates must be finite')
 
     Q, rank = _orthonormal_covariate_basis(X)
     if rank == 0:
@@ -150,18 +154,29 @@ def run_continuous_gwas(
                 jax.device_get(st.xtv(V_dev, normalize=False)),
                 dtype=np.float64,
             )
+            counts = np.asarray(st._count_host, dtype=np.float64).reshape(-1)
+            means = np.asarray(st._means_host, dtype=np.float64).reshape(-1)
+            inv_sd = np.asarray(st._inv_sds_host, dtype=np.float64).reshape(-1)
+            if cross.shape != (int(st.m), V.shape[1]) or any(
+                    a.size != int(st.m) for a in [counts, means, inv_sd]):
+                raise RuntimeError('Internal GWAS statistics do not match variant count')
+            # Component-partitioned caches reorder SNPs. Scores and scaling
+            # must return to source order before pairing with BIM/PVAR rows.
+            cache_to_source = getattr(st, '_cache_to_source_variant_indices', None)
+            if cache_to_source is not None:
+                cache_to_source = np.asarray(cache_to_source, dtype=np.int64)
+                if (cache_to_source.shape != (int(st.m),) or not np.array_equal(
+                        np.sort(cache_to_source), np.arange(int(st.m)))):
+                    raise ValueError('GWAS cache-to-source mapping must cover every variant once')
+                source_order = np.argsort(cache_to_source)
+                cross = cross[source_order]
+                counts, means, inv_sd = [a[source_order] for a in [counts, means, inv_sd]]
             x_ty = cross[:, 0]
             if rank > 0:
                 x_t_q = cross[:, 1:]
                 proj_ss = np.einsum("ij,ij->i", x_t_q, x_t_q, optimize=True)
             else:
                 proj_ss = np.zeros((int(st.m),), dtype=np.float64)
-
-            counts = np.asarray(st._count_host, dtype=np.float64).reshape(-1)
-            means = np.asarray(st._means_host, dtype=np.float64).reshape(-1)
-            inv_sd = np.asarray(st._inv_sds_host, dtype=np.float64).reshape(-1)
-            if counts.size != int(st.m):
-                raise RuntimeError("Internal GWAS count vector length mismatch.")
 
             x_var = counts - proj_ss
             valid = (inv_sd > 0.0) & (x_var > 1e-8)

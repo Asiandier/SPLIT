@@ -133,6 +133,10 @@ def _batch_pullback(matvec_pullback, basis, products, beta, a_bar, b_bar):
         )
         q_bar = q_bar + dq
         input_bar, part = matvec_pullback(dw, basis[index])
+        # A user callback may promote its output (for example an FP64
+        # kernel with an FP32 Krylov state). Keep adjoints on the same
+        # declared SLQ precision as the corresponding forward recurrence.
+        input_bar = jnp.asarray(input_bar, dtype=q_bar.dtype)
         q_bar = _set_row(q_bar, index, q_bar[index]+input_bar)
         gradient = part if gradient is None else gradient+part
         if index:
@@ -180,7 +184,7 @@ def logdet_value_and_grad(matvec, matvec_pullback, n, key, *, nsamples, m,
         alpha, beta = [], []
         previous_beta = jnp.zeros(count, dtype=dtype)
         for index in range(depth):
-            product = matvec(basis[index])
+            product = jnp.asarray(matvec(basis[index]), dtype=dtype)
             next_q, a, b = _step(basis, product, previous_beta, jnp.asarray(index))
             if products is not None:
                 products = _set_row(products, index, product)

@@ -10,8 +10,6 @@ import sys
 import time
 from datetime import datetime
 
-import numpy as np
-
 repo_root = os.path.dirname(os.path.abspath(__file__))
 parent = os.path.dirname(repo_root)
 if parent not in sys.path:

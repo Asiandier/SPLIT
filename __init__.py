@@ -4,6 +4,15 @@ import importlib
 
 
 _EXPORTS: dict[str, str] = {
+    "GroupedSSBackgroundContext": ".background_ss",
+    "BackgroundSSResult": ".background_ss",
+    "refine_lasso_background_ss": ".background_ss",
+    "refine_sparse_fit_background": ".background_ss",
+    "VAMPConfig": ".grouped_ss_vamp",
+    "VAMPResult": ".grouped_ss_vamp",
+    "GenotypeProducts": ".grouped_ss_vamp",
+    "SampleSpectrum": ".grouped_ss_vamp",
+    "fit_grouped_ss_vamp": ".grouped_ss_vamp",
     "GenoBlockSource": ".geno_source",
     "BedGenoSource": ".geno_source",
     "PgenGenoSource": ".geno_source",

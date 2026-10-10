@@ -13,8 +13,6 @@ from .geno_stream import (
     GenoBlockStreamer,
     _ensure_on_device,
     _numba_thread_mask,
-    _stats_and_transcode_raw_bed_numba,
-    _stats_from_raw_bed_numba,
 )
 
 logger = logging.getLogger(__name__)

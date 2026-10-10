@@ -435,6 +435,8 @@ def _low_level_command(
             ]
         )
     if final_outputs:
+        if getattr(args, 'background_ss', False):
+            command.extend(['--background-ss', '--background-ss-max-iterations', str(args.background_ss_max_iterations)])
         if args.compute_effects:
             command.append("--compute-effects")
         if args.prediction_prefix is not None:
@@ -989,6 +991,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prediction-covar-txt", default="")
     parser.add_argument("--prediction-keep-path", default="")
     parser.add_argument("--compute-effects", action="store_true")
+    parser.add_argument('--background-ss', action='store_true',
+                        help='Apply BLUP-initialized constrained SS after the final combined-sample LASSO refit.')
+    parser.add_argument('--background-ss-max-iterations', type=int, default=2000)
     parser.add_argument("--out-prefix", required=True)
 
     parser.add_argument("--lam-min-ratio", type=float, default=1e-3)
@@ -1205,6 +1210,8 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
             }
         ),
         "compute_effects": bool(args.compute_effects),
+        **({'background_ss': True, 'background_ss_max_iterations': int(args.background_ss_max_iterations)}
+           if args.background_ss else {}),
         "lambda_path": {
             "minimum_ratio": float(args.lam_min_ratio),
             "points": int(args.n_lambda),

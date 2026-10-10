@@ -13,11 +13,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize(
-    "mode", ["fixed", "fixed_multi", "adaptive", "alignment", "missing_single", "missing_multi"]
+    "mode", ["fixed", "fixed_multi", "adaptive", "alignment", "missing_single", "missing_multi", "ss_multi"]
 )
 def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
     rng = np.random.default_rng(206)
     n, m = 480, 96
+    if mode == 'ss_multi':
+        n, m = 160, 384  # SS integration exercises the requested p > n regime.
     x = rng.binomial(2, 0.3, size=(n, m)).astype(np.int8)
     ids = [f"sample{i}" for i in range(n)]
     variants = [f"rs{i}" for i in range(m)]
@@ -35,6 +37,8 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
         x[320:344, m // 2:] = -127
     to_bed(str(prefix) + ".bed", x, properties={"iid": ids, "fid": ids, "sid": variants})
     subsets = {"train": range(320), "validation": range(320, 400), "test": range(400, n)}
+    if mode == 'ss_multi':
+        subsets = {'train': range(90), 'validation': range(90, 120), 'test': range(120, n)}
     for name, indices in subsets.items():
         (tmp_path / f"{name}.keep").write_text("".join(f"{ids[i]} {ids[i]}\n" for i in indices))
         if name != "test":
@@ -62,10 +66,12 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
         "--lam-min-ratio", min_ratio, "--screen-topk", "96", "--candidate-k", "32",
         "--pcg-tol", "0.001", "--verbose",
     ]
-    if mode in {"fixed_multi", "missing_multi"}:
+    if mode in {"fixed_multi", "missing_multi", "ss_multi"}:
         spec = tmp_path / "partition.npz"
         np.savez(spec, arr_0=np.arange(m // 2), arr_1=np.arange(m // 2, m))
         command += ["--component-spec", str(spec)]
+    if mode == 'ss_multi':
+        command += ['--background-ss']
     if mode == "adaptive":
         ld = tmp_path / "ld.tsv"
         ld.write_text("ID\tld_score\n" + "".join(f"{v}\t{i + 1}\n" for i, v in enumerate(variants)))
@@ -103,9 +109,34 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
     final = json.loads(output.with_suffix(".summary.json").read_text())
     assert final["sparse_output_schema_version"] == 11
     assert final["primary_h2_method"] == "information_corrected_sparse_reml"
-    assert final["n_samples"] == 400
+    assert final["n_samples"] == (120 if mode == 'ss_multi' else 400)
     assert final["lasso_branch_valid"]
     assert final["sparse_prediction"]["status"] == "emitted"
+    if mode == 'ss_multi':
+        assert final['n_grms'] == 2
+        assert final['background_ss']['status'] == 'converged'
+        assert final['background_ss']['initial_effect'] == 'native_BLUP'
+        assert final['background_ss']['initialization']['first_mean_relative_l2_error'][0] < 1e-10
+        with np.load(output.with_suffix('.background_ss.npz')) as posterior:
+            np.testing.assert_allclose(posterior['pi']*posterior['slab_variance'],
+                                      posterior['theta'][:-1]/posterior['normalizers'], rtol=1e-12)
+            inactive = posterior['theta'][:-1][posterior['groups']] == 0
+            assert np.all(posterior['beta_background'][inactive] == 0)
+            # Independent held-out matrix product verifies that prediction
+            # consumes the SS coefficients, with training-only SNP scaling.
+            import csv
+            training = x[:120].astype(np.float32)
+            mu = training.mean(axis=0)
+            variance = np.maximum((training*training).mean(axis=0)-mu*mu, 0.)
+            inv = np.where(variance > 0, 1./np.sqrt(np.maximum(variance, 1e-6)), 0.)
+            test_design = (x[120:].astype(np.float32)-mu)*inv
+            expected_background = test_design[:, posterior['source_snp_indices']]@posterior['beta_background']
+            with output.with_suffix('.sparse_prediction.tsv').open() as handle:
+                prediction_rows = list(csv.DictReader(handle, delimiter='\t'))
+            actual_background = np.array([float(row['lasso_background_blup']) for row in prediction_rows])
+            np.testing.assert_allclose(actual_background, expected_background, rtol=2e-5, atol=2e-5)
+        metadata = json.loads(output.with_suffix('.sparse_prediction_metadata.json').read_text())
+        assert metadata['branches']['lasso']['background_estimator'] == 'constrained_ss_em_vamp'
     # Summary is published last and describes the complete output set.
     for name, size in final["output_artifacts"].items():
         assert Path(name).is_file()
@@ -113,7 +144,7 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
     for suffix in (".history.json", ".selected_snps.tsv", ".sparse_effects.tsv", ".sparse_prediction.tsv"):
         assert str(output.with_suffix(suffix)) in final["output_artifacts"]
     assert output.with_suffix(".sparse_effects.tsv").is_file()
-    assert len(output.with_suffix(".sparse_prediction.tsv").read_text().splitlines()) == 81
+    assert len(output.with_suffix(".sparse_prediction.tsv").read_text().splitlines()) == (41 if mode == 'ss_multi' else 81)
     if mode in {"fixed_multi", "missing_multi"}:
         assert final["n_grms"] == 2
     if mode == "adaptive":

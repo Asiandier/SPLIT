@@ -13,7 +13,10 @@ import scipy.linalg as sla
 logger = logging.getLogger(__name__)
 
 from .suggest_params_v3 import suggest_call_width, PlanResult
-from .runtime_env import resolve_cpu_threads
+from . import runtime_env
+
+# Public shared alias used by CLI loaders and the model API.
+resolve_cpu_threads = runtime_env.resolve_cpu_threads
 
 
 def genetic_variance(theta_g, trace_atoms) -> float:
