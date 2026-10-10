@@ -2,8 +2,9 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-test/
-tests/
+# Local tests and test datasets are intentionally not tracked.
+/test/
+/tests/
 *.egg-info/
 build/
 dist/
@@ -15,48 +16,9 @@ effect_estimate/
 *.csv
 *.png
 
-# Local tests and test datasets are intentionally not pushed to GitHub.
-
-# Publication-critical sparse-REML regression tests are version-visible even
-# though the remainder of the local validation suite and datasets stay ignored.
-!tests/
-tests/*
-!tests/test_sparse_reml_regressions.py
-!tests/test_sparse_prediction.py
-!tests/test_affine_slq_score_consistency.py
-!tests/test_multi_slq_score_consistency.py
-!tests/test_lasso_cd.py
-!tests/test_sparsity_selection.py
-!tests/test_ld_score.py
-!tests/test_adaptive_ld.py
-!tests/test_sparse_effect_io.py
-!tests/test_sparse_pipeline_driver.py
-!tests/test_reml_probe_cache.py
-!tests/test_reml_lazy_evaluation.py
-!tests/test_pcg_stability.py
-!tests/test_score_process.py
-!tests/validate_score_process.py
-!tests/test_sparse_pipeline_end_to_end.py
-!tests/test_sparse_information.py
-!tests/test_sparse_output_recovery.py
-!tests/test_runtime_resources.py
-!tests/test_suggest_params.py
-
 # Local backup snapshot
 bolt_jax_副本 22-47-38-277/
 
 report.md
 
 mph-main
-
-# Current prediction refinement regression tests.
-!tests/test_grouped_ss_vamp.py
-!tests/test_background_ss.py
-!tests/test_operator_oracles.py
-!tests/test_blup_effect_weighting.py
-!tests/test_blup_square_continuation.py
-!tests/test_iterative_weighted_ridge.py
-!tests/test_matrix_free_inverse_quadratics.py
-!tests/test_matrix_free_sparse_statistics.py
-!tests/test_precision_refined_covariance.py
-!tests/test_profiled_prediction_refinement.py
