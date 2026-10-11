@@ -39,6 +39,10 @@ before publishing.
   genotype-streaming functions inside `jax.jit`-traced regions.
 - Prefer explicit validation for sample order, variant order, and component
   definitions.
+- Runtime modules must serve a supported project pipeline or public model API.
+  Keep study-specific batch runners, prior comparisons, benchmark utilities and
+  oracle analyses in the study workspace outside this package. Numerical unit
+  tests of production methods belong in the local test directory.
 - Do not commit benchmark outputs, logs, temporary genotype splits, or private
   data paths.
 

@@ -16,6 +16,7 @@ GPU_REML is organized around one contract: a covariance component must expose
 | Downstream models | `lasso_cd.py`, `gwas.py` | Reuse the fitted covariance for sparse GLS and marginal GWAS. |
 | Sparse mean information | `sparse_information.py` | Selected-span log determinant, score correction and paired sparse-variance correction, without sample-square matrices. |
 | Adaptive partition | `run_sparse_pipeline.py`, `adaptive_ld.py`, `score_process.py` | Orchestrate the path, stream shared boundary contractions, and calibrate trace-defined quadratic scores. |
+| Sparse prediction refinement | `background_ss.py`, `grouped_ss_vamp.py`, `progressive_alpha.py`, `sparse_prediction.py` | Refine native BLUP with constrained SS, select and refit joint OLS prefixes, then predict through the existing streaming operators. |
 
 ## Fit Lifecycle
 

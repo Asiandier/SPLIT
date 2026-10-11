@@ -1,7 +1,6 @@
 """GPU EM-VAMP for a fixed residual and grouped SS priors.
 
-The default constrains pi[g] * slab_variance[g] = theta[g] / M[g].
-An unconstrained mode jointly learns pi and slab variance in all groups.
+The prior constrains pi[g] * slab_variance[g] = theta[g] / M[g].
 The Gaussian likelihood uses all groups jointly. No foreground parameters,
 noise variance or hyperpriors are estimated here. Genotypes are SNP-major.
 
@@ -37,14 +36,6 @@ def constrained_ss_m_step(a, b, counts, d, pi_min=1e-8):
     root = 3*a/jnp.maximum(c+jnp.sqrt(disc), jnp.finfo(c.dtype).tiny)
     root = jnp.where(d > 0, jnp.clip(root, pi_min, 1.), 0.)
     return root, jnp.where(d > 0, safe_d/jnp.maximum(root, pi_min), 0.)
-
-
-@jax.jit
-def unconstrained_ss_m_step(a, b, counts, pi_min=1e-8, variance_min=1e-16):
-    """No-hyperprior SS EM: pi=A/P, v=B/A; bounds are numerical only."""
-    pi = jnp.clip(a/counts, pi_min, 1.)
-    slab = jnp.maximum(b/jnp.maximum(a, jnp.finfo(b.dtype).tiny), variance_min)
-    return pi, slab
 
 
 @jax.jit
@@ -213,7 +204,6 @@ class VAMPConfig:
     consecutive_converged: int = 5
     log_every: int = 10
     learn_pi: bool = True
-    variance_constraint: bool = True
     slab_variance_min: float = 1e-16
 
 
@@ -230,31 +220,25 @@ class VAMPResult:
     iterations: int
     precision: np.ndarray
     initialization: dict | None = None
-    final_state: dict | None = None
 
 
 def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
                         normalizers, noise_variance, spectrum: SampleSpectrum,
                         config: VAMPConfig | None = None,
                         callback: Callable[[dict], None] | None = None,
-                        initial_mean=None, initial_state=None) -> VAMPResult:
+                        initial_mean=None) -> VAMPResult:
     """Fit a batch of cases with identical active groups, without test data.
 
     theta is (G, cases), residual is (n, cases), noise is (cases,). A single
-    case may pass one-dimensional inputs. In constrained mode, zero-theta
-    SNPs are excluded from Onsager averages and have zero background effects.
-    Free mode opens all groups; native theta is used only to initialize v.
+    case may pass one-dimensional inputs. Zero-theta SNPs are excluded from
+    Onsager averages and have zero background effects.
     Optional initial_mean (p,cases) is the desired first nonlinear posterior
     mean. It is mapped to a compatible r1 message by scalar SS inversion;
     constrained zero-theta entries are masked to zero even if supplied nonzero.
-    initial_state resumes a constrained fit from a previous final_state, on
-    exactly the same data and model. Iteration offsets preserve EM warmup.
     Stops on *undamped* message, module agreement, precision and constrained
     EM fixed-point errors, rather than merely small damped iterate changes.
     """
     config = config or VAMPConfig()
-    if initial_state is not None and (initial_mean is not None or not config.variance_constraint):
-        raise ValueError('Continuation requires a constrained fit without initial_mean')
     if not jax.config.jax_enable_x64:
         raise RuntimeError('Enable jax_enable_x64 before fitting FP64 EM-VAMP')
     if not (0 < config.damping <= 1 and 0 < config.em_damping <= 1):
@@ -304,9 +288,9 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
         raise ValueError('Inconsistent dimensions or invalid model parameters')
     if np.any(counts_host == 0):
         raise ValueError('Every modeled group must contain at least one SNP')
-    if np.any((norm_host == 0) & (np.any(t_host > 0, axis=1) | (not config.variance_constraint))):
+    if np.any((norm_host == 0) & np.any(t_host > 0, axis=1)):
         raise ValueError('Active groups require positive GRM normalizers')
-    active_groups = t_host > 0 if config.variance_constraint else np.ones_like(t_host, bool)
+    active_groups = t_host > 0
     if not np.all(active_groups == active_groups[:, :1]):
         raise ValueError('Cases in one batch must have identical active groups')
     active_host = active_groups[groups_host, 0]
@@ -316,12 +300,6 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
     y, group_ids = jax.device_put(y_host), jax.device_put(groups_host)
     active = jax.device_put(active_host[:, None])
     d_host = t_host/np.where(norm_host > 0, norm_host, 1.)[:, None]
-    if not config.variance_constraint:
-        # Native components initialize the free model but never fix a group.
-        # Zero native components receive the positive pooled initial variance
-        # so EM can leave the all-zero absorbing state. No test data is used.
-        pooled = np.where(t_host.sum(axis=0) > 0, t_host.sum(axis=0), noise_host)/norm_host.sum()
-        d_host = np.where(d_host > 0, d_host, pooled[None, :])
     d = jax.device_put(d_host)
     counts = jax.device_put(counts_host[:, None])
     noise = jax.device_put(noise_host)
@@ -329,7 +307,7 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
     slab = jnp.where(d > 0, d/jnp.maximum(pi, config.pi_min), 0.)
     r1 = jnp.zeros((products.p, batch), jnp.float64)
     # Training-only scale. The next linear module refines this precision.
-    initial_total = t_host.sum(axis=0) if config.variance_constraint else np.sum(d_host*norm_host[:, None], axis=0)
+    initial_total = t_host.sum(axis=0)
     gamma1 = products.n/jnp.maximum(noise+jax.device_put(initial_total), 1e-12)
     initialization = dict(method='zero', initial_pi=np.asarray(pi).T.tolist(),
                           initial_slab_variance=np.asarray(slab).T.tolist(),
@@ -353,37 +331,8 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
                               first_mean_relative_l2_error=relative.tolist(),
                               first_mean_max_abs_error=np.max(np.abs(actual-target_host), axis=0).tolist())
 
-    offset = 0
     stable = np.zeros(batch, int)
     done = np.zeros(batch, bool)
-    if initial_state is not None:
-        saved_pi = np.asarray(initial_state['pi'], float)
-        saved_r1 = np.asarray(initial_state['r1'], float)
-        saved_precision = np.asarray(initial_state['gamma1'], float)
-        stable = np.asarray(initial_state.get('stable', stable))
-        done = np.asarray(initial_state.get('done', done), bool)
-        offset = initial_state.get('iterations', 0)
-        if (saved_pi.shape != (ng, batch) or saved_r1.shape != (products.p, batch)
-                or saved_precision.shape != (batch,) or stable.shape != (batch,)
-                or done.shape != (batch,)):
-            raise ValueError('Inconsistent continuation state shapes')
-        if (not np.all(np.isfinite(saved_r1)) or not np.all(np.isfinite(saved_precision))
-                or np.any(saved_precision <= 0) or not np.all(np.isfinite(saved_pi))
-                or np.any(saved_pi < 0) or np.any(saved_pi > 1)
-                or np.any(saved_pi[d_host > 0] < config.pi_min)
-                or np.any(saved_pi[d_host == 0] != 0)
-                or not np.issubdtype(stable.dtype, np.integer) or np.any(stable < 0)
-                or not isinstance(offset, (int, np.integer)) or offset < 0):
-            raise ValueError('Invalid continuation messages or probabilities')
-        stable, done = stable.copy(), done.copy()
-        pi, r1, gamma1 = map(jax.device_put, (saved_pi, saved_r1, saved_precision))
-        r1 = jnp.where(active, r1, 0.)
-        slab = jnp.where(d > 0, d/jnp.maximum(pi, config.pi_min), 0.)
-        initialization = dict(method='continued_EM_VAMP_state',
-                              initial_pi=saved_pi.T.tolist(),
-                              initial_message_precision=saved_precision.tolist(),
-                              iteration_offset=int(offset))
-
     def reduce_group(values):
         return jnp.stack([jnp.sum(jnp.where((group_ids == g)[:, None], values, 0.), axis=0)
                           for g in range(ng)])
@@ -458,67 +407,6 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
         em_error = jnp.max(jnp.where(d > 0, jnp.abs(new_pi-prob)/jnp.maximum(prob, config.pi_min), 0.), axis=0)
         return mean, var, pip, divergence, em_error
 
-    def free_posterior(r, gam, params):
-        slab_variance = jnp.exp(params[1])/jnp.maximum(params[0], config.pi_min)
-        return spike_slab_denoise(r, gam[None, :], params[0][group_ids], slab_variance[group_ids])
-
-    @jax.jit
-    def free_em_map(r, gam, params):
-        mean, var, pip, mu, s2, evidence = free_posterior(r, gam, params)
-        new_pi, new_slab = unconstrained_ss_m_step(reduce_group(pip),
-            reduce_group(pip*(s2+mu*mu)), counts, config.pi_min, config.slab_variance_min)
-        return jnp.stack([new_pi, jnp.log(new_pi*new_slab)]), reduce_group(evidence)
-
-    @jax.jit
-    def free_evidence_at(r, gam, params):
-        return reduce_group(free_posterior(r, gam, params)[-1])
-
-    @jax.jit
-    def learn_free_prior(r, gam, params):
-        # Two-parameter SQUAREM in (pi, log(pi*v)). The second coordinate
-        # represents total prior variance per marker, which is better
-        # identified than slab variance when pi and v trade off. Both remain
-        # free; the EM map still sets pi=A/P and v=B/A. Damping is geometric
-        # in the variance coordinate and is safeguarded by scalar evidence.
-        def body(_, old):
-            one, _ = free_em_map(r, gam, old)
-            if not config.em_acceleration:
-                return one
-            two, _ = free_em_map(r, gam, one)
-            delta, curvature = one-old, two-2*one+old
-            step = -jnp.clip(jnp.sqrt(jnp.sum(delta*delta, axis=0)/
-                jnp.maximum(jnp.sum(curvature*curvature, axis=0), 1e-60)), 1., config.em_max_step)
-            baseline = free_evidence_at(r, gam, two)
-            resolved = jnp.maximum(jnp.abs(delta[0])/jnp.maximum(old[0], config.pi_min),
-                                   jnp.abs(delta[1])) > config.em_acceleration_floor
-            def attempt(state):
-                trial, current_step, accepted, result = state
-                proposed = old-2*current_step[None]*delta+current_step[None]**2*curvature
-                prob = jnp.clip(proposed[0], jnp.maximum(config.pi_min, .8*old[0]),
-                                 jnp.minimum(1., 1.25*old[0]))
-                logd = jnp.maximum(jnp.clip(proposed[1], old[1]+jnp.log(.8), old[1]+jnp.log(1.25)),
-                                    jnp.log(prob*config.slab_variance_min))
-                polished, _ = free_em_map(r, gam, jnp.stack([prob, logd]))
-                same_direction = jnp.all((polished-old)*delta >= 0, axis=0)
-                better = (free_evidence_at(r, gam, polished) >= baseline-1e-10) & same_direction & resolved
-                result = jnp.where((better & ~accepted)[None], polished, result)
-                return trial+1, -jnp.maximum(jnp.abs(current_step)*.5, 1.), accepted | better | (jnp.abs(current_step) <= 1.), result
-            state = (0, step, ~resolved, two)
-            return jax.lax.while_loop(lambda s: (s[0] < 42) & jnp.any(~s[2]), attempt, state)[3]
-        optimum = jax.lax.fori_loop(0, config.em_inner_steps, body, params)
-        return params+config.em_damping*(optimum-params)
-
-    @jax.jit
-    def free_nonlinear(r, gam, prob, slab_variance):
-        mean, var, pip, mu, s2, evidence = spike_slab_denoise(
-            r, gam[None, :], prob[group_ids], slab_variance[group_ids])
-        divergence = gam*jnp.sum(var, axis=0)/p_active
-        new_pi, new_slab = unconstrained_ss_m_step(reduce_group(pip), reduce_group(pip*(s2+mu*mu)),
-            counts, config.pi_min, config.slab_variance_min)
-        pi_error = jnp.max(jnp.abs(new_pi-prob)/jnp.maximum(prob, config.pi_min), axis=0)
-        slab_error = jnp.max(jnp.abs(new_slab-slab_variance)/jnp.maximum(slab_variance, config.slab_variance_min), axis=0)
-        return mean, var, pip, divergence, jnp.maximum(pi_error, slab_error)
-
     @jax.jit
     def relative_norm(a, b):
         scale = jnp.maximum(jnp.sum(a*a, axis=0), jnp.sum(b*b, axis=0))
@@ -526,23 +414,13 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
 
     trace = []
     status = ['max_iterations']*batch
-    for iteration in range(offset+1, offset+config.max_iterations+1):
+    for iteration in range(1, config.max_iterations+1):
         old_pi, old_slab = pi, slab
         if config.learn_pi and iteration > config.em_warmup:
-            if config.variance_constraint:
-                learned_pi = learn_prior(r1, gamma1, pi)
-                pi = jnp.where(jax.device_put(done)[None, :], old_pi, learned_pi)
-                slab = jnp.where(d > 0, d/jnp.maximum(pi, config.pi_min), 0.)
-            else:
-                learned = learn_free_prior(r1, gamma1, jnp.stack([pi, jnp.log(pi*slab)]))
-                frozen_case = jax.device_put(done)[None, :]
-                pi = jnp.where(frozen_case, old_pi, learned[0])
-                learned_slab = jnp.maximum(jnp.exp(learned[1])/jnp.maximum(learned[0], config.pi_min), config.slab_variance_min)
-                slab = jnp.where(frozen_case, old_slab, learned_slab)
-        if config.variance_constraint:
-            m1, var1, pip, alpha1, em_error = nonlinear(r1, gamma1, pi)
-        else:
-            m1, var1, pip, alpha1, em_error = free_nonlinear(r1, gamma1, pi, slab)
+            learned_pi = learn_prior(r1, gamma1, pi)
+            pi = jnp.where(jax.device_put(done)[None, :], old_pi, learned_pi)
+            slab = jnp.where(d > 0, d/jnp.maximum(pi, config.pi_min), 0.)
+        m1, var1, pip, alpha1, em_error = nonlinear(r1, gamma1, pi)
         alpha_host = np.asarray(alpha1)
         if np.any(~np.isfinite(alpha_host)) or np.any(alpha_host <= 0) or np.any(alpha_host >= 1):
             raise ArithmeticError(f'Invalid nonlinear Onsager divergence at {iteration}: {alpha_host}')
@@ -568,8 +446,6 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
         good = np.max(errors[:3], axis=0) < config.tolerance
         if config.learn_pi:
             good &= (errors[3] < config.em_tolerance) & (errors[4] < config.em_tolerance)
-            if not config.variance_constraint:
-                good &= errors[5] < config.em_tolerance
         stable = np.where(good & eligible, stable+1, 0)
         done |= stable >= config.consecutive_converged
         # Freeze finished cases in a batch to retain their actual fixed point.
@@ -578,11 +454,10 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
         r1 = ((1-damp)[None, :]*gamma1[None, :]*r1
               +damp[None, :]*gamma_proposed[None, :]*r_proposed)/gamma_next[None, :]
         gamma1 = gamma_next
-        if config.variance_constraint:
-            slab = jnp.where(d > 0, d/jnp.maximum(pi, config.pi_min), 0.)
-            constraint = np.asarray(jnp.where(d > 0, jnp.abs(pi*slab-d)/jnp.maximum(d, 1e-300), 0.))
-            if constraint.max() > 1e-12:
-                raise ArithmeticError('Prior variance equality violated')
+        slab = jnp.where(d > 0, d/jnp.maximum(pi, config.pi_min), 0.)
+        constraint = np.asarray(jnp.where(d > 0, jnp.abs(pi*slab-d)/jnp.maximum(d, 1e-300), 0.))
+        if constraint.max() > 1e-12:
+            raise ArithmeticError('Prior variance equality violated')
         if iteration == 1 or iteration % config.log_every == 0 or done.all():
             row = dict(iteration=iteration, seconds=time.monotonic()-start, pi=np.asarray(pi).T.tolist(),
                        gamma1=np.asarray(gamma1).tolist(), alpha1=alpha_host.tolist(),
@@ -591,19 +466,14 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
                        pi_change=errors[4].tolist(), converged=done.tolist(),
                        slab_variance=np.asarray(slab).T.tolist(), slab_change=errors[5].tolist(),
                        prior_variance_components=np.asarray(pi*slab*norm_host[:, None]).T.tolist(),
-                       prior_constraint_max_relative_error=float(constraint.max()) if config.variance_constraint else None)
+                       prior_constraint_max_relative_error=float(constraint.max()))
             trace.append(row)
             if callback:
                 callback(row)
         if done.all():
             break
-    if config.variance_constraint:
-        mean, variance, pip, _, _ = nonlinear(r1, gamma1, pi)
-    else:
-        mean, variance, pip, _, _ = free_nonlinear(r1, gamma1, pi, slab)
+    mean, variance, pip, _, _ = nonlinear(r1, gamma1, pi)
     status = ['converged' if flag else 'max_iterations' for flag in done]
     return VAMPResult(np.asarray(mean), np.asarray(variance), np.asarray(pip), np.asarray(pi),
                       np.asarray(slab),
-                      status, trace, time.monotonic()-start, iteration, np.asarray(gamma1), initialization,
-                      dict(r1=np.asarray(r1), gamma1=np.asarray(gamma1), pi=np.asarray(pi),
-                           stable=stable, done=done, iterations=iteration))
+                      status, trace, time.monotonic()-start, iteration, np.asarray(gamma1), initialization)

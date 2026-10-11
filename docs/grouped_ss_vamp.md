@@ -2,9 +2,9 @@
 
 `grouped_ss_vamp.py` implements background inference with a fixed LASSO
 foreground. It does not update alpha, gamma, the REML components or noise.
-Training-only experiment protocols and fitted results are maintained separately
-from the package. Native output metadata records the initialization, numerical
-attempts, variance constraint and fixed-parameter declarations.
+The sparse workflow consumes this kernel directly after its native fit.
+Native output metadata records the initialization, numerical attempts,
+variance constraint and fixed-parameter declarations.
 
 ## Model
 
@@ -59,8 +59,7 @@ violate the rotational assumptions of VAMP theory.
 ## GPU computation
 
 One exact genotype-derived sample eigensystem is cached per active group
-pattern. The 450-case experiment uses seven patterns. Each has size `n*n`,
-not `p*p`.
+pattern. Each has size `n*n`, not `p*p`.
 With `G=A_active@A_active.T`, `lambda=gamma2*sigma_e_squared`,
 
 ```
@@ -79,15 +78,13 @@ Messages are damped in natural coordinates `(gamma1, gamma1*r1)`.
 FP32 genotypes remain resident; 4096-SNP chunks are cast to FP64 for both
 products. Enable `jax_enable_x64` before fitting. A whole FP64 genotype
 conversion and transpose would require considerably more device memory.
-The 450-case driver runs two GPU processes with up to 16 cases per product
-batch and reuses the training design and spectra. Single-case kernels are
-also available through the same API.
 
 Stopping requires undamped message residual, agreement of the nonlinear
 and linear posterior means, precision residual, the constrained EM-map
 residual and actual pi change, each below `1e-5` for five consecutive
-iterations. Max-iteration results are diagnostic and the prediction script
-refuses to score them. Finished cases in a batch freeze both messages and pi.
+iterations. The native adapter rejects unconverged posterior results before
+publishing effects or predictions. Finished cases in a batch freeze both
+messages and pi.
 
 ## BLUP initialization
 
@@ -116,7 +113,7 @@ The runner checks the first mean against the supplied effects and records
 relative L2 and maximum absolute errors, initial prior parameters and precision.
 The existing 10-iteration pi warmup, damping, EM and stopping rules are retained.
 This changes initialization only; it need not reduce runtime or change the
-eventual fixed point. The experiment runners expose `--initial-effect blup`.
+eventual fixed point.
 
 ## Native sparse pipeline integration
 
@@ -190,8 +187,7 @@ On a fresh cohort, constructing the full training design and exact sample
 Gram/eigenspectrum adds setup work before VAMP iterations. The native
 metadata separates total refinement time from posterior fit time, and
 records setup plus foreground/component products separately. Repeated
-models on the same cohort should reuse a context and cached spectra, as
-the 450-case experiment does.
+models on the same cohort can reuse a context and cached spectra.
 
 ## Verification
 
@@ -202,10 +198,11 @@ the trace identity; the Gaussian multigroup limit against exact BLUP;
 inactive groups; a sparse batch fixed point; the non-Gaussian orthogonal
 case against its exact posterior with both zero and BLUP initializations;
 initial message inversion against independent SciPy roots; and rejection of
-invalid initial effect arrays. The real runner verifies the cached spectrum
-against genotype products and checks all prior constraints. Prediction
-independently checks GPU BED decoding and original native alpha/BLUP scores.
-All coefficients and test predictions are hashed before test labels are read.
+invalid initial effect arrays. The native adapter checks all prior constraints
+and rejects unconverged results. Real-file end-to-end tests independently
+check that SS and OLS coefficients reproduce held-out prediction components
+using training-only normalization, and verify the completed outputs and resume
+contract without supplying test phenotypes.
 
 References:
 
@@ -217,39 +214,3 @@ References:
 This is a new JAX implementation with a grouped constrained prior, not a
 port of all gVAMP corrections. No validation-adaptive damping, noise-variance
 learning, causal effect inputs or test-score-based iteration selection are used.
-
-## Free group variances
-
-`VAMPConfig(variance_constraint=False)` retains the same foreground and
-fixed noise variance, and estimates both prior parameters for each group:
-
-```
-A_g = sum(PIP_j)
-B_g = sum(E_q[beta_j^2])
-pi_g = A_g / P_g
-v_g = B_g / A_g
-theta_implied_g = M_g * pi_g * v_g
-```
-
-There are no hyperpriors or pseudocounts. Both P and M retain their original
-definitions. All groups are active, including those whose native theta was
-zero, so use the eigenspectrum of all SNPs. Native theta initializes the
-positive group variances; zero groups receive the pooled positive variance
-`sum(native theta)/sum(M)` per marker. Native components are never used in
-subsequent M steps. Numerical floors are `pi_min=1e-8` and
-`slab_variance_min=1e-16`, with boundary hits reported separately.
-
-The two-dimensional inner EM accelerator uses coordinates `(pi, log(pi*v))`,
-where the second coordinate describes total prior variance per marker. This
-reduces the pi/slab-variance tradeoff in the numerical iteration; it adds no
-variance constraint. EM still updates the original parameters by A/P and B/A.
-The guarded extrapolation follows the local EM directions, restricts each
-proposal to a 0.8–1.25 multiplicative span, and checks scalar evidence against
-two ordinary EM steps. Messages are damped as before. Both actual slab
-parameter change and the undamped pi/variance EM residual enter stopping.
-
-The experiment driver accepts `--unconstrained`; the same prediction freezer
-and evaluator are reused. `scripts/compare_free_variance.py` independently
-checks the saved posterior moments against A/P and B/A, verifies all original
-foreground files, and compares the free and constrained runs. Its files are
-stored under `em_vamp/unconstrained`, separate from `em_vamp/guarded`.

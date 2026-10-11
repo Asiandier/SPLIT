@@ -24,8 +24,8 @@ the sample sizes are supplied by the keep files.
    the selected count. Use the combined cohort's own support, standardization
    and LASSO ranking, capping the count at its support size, and jointly OLS-refit
    that prefix with its background and gamma frozen.
-6. Emit full prediction and effects using the new alpha, frozen SS and gamma.
-   A prediction phenotype is never accepted or read.
+6. Emit full prediction and optional effect tables using the new alpha, frozen SS
+   and gamma. A prediction phenotype is never accepted or read.
 
 For a prefix `T` within support `S`, the coefficient correction solves
 
@@ -44,10 +44,17 @@ python -m GPU_REML.run_sparse_pipeline \
   --mode fixed --bed-prefix genotype --component-spec ld4.npz \
   --pheno-txt train.pheno --keep-path train.keep \
   --validation-pheno-txt validation.pheno --validation-keep-path validation.keep \
-  --progressive-alpha --compute-effects \
+  --progressive-alpha \
   --prediction-bed-prefix genotype --prediction-keep-path test.keep \
   --out-prefix results/coherit
 ```
+
+Prediction is enabled by `--prediction-bed-prefix` or
+`--prediction-pgen-prefix`. Add `--prediction-keep-path` when selecting a
+prediction cohort from a larger genotype file. `--compute-effects` separately
+requests effect tables; prediction always computes its required effects in
+memory. The command completes selection, combined-sample refitting and full
+prediction in the same workflow.
 
 Add the ordinary covariate arguments when needed. The workflow supports the
 existing BED/PGEN and fixed/adaptive component interfaces. The low-level command
@@ -67,54 +74,3 @@ and reusable LASSO warm states describe the original covariance-aligned fit.
 Prediction refinement does not redefine those inference results. Its training
 squared terms and validation metrics are reported separately under
 `progressive_alpha` in the summary.
-
-Local frozen full-450 results, oracle diagnostics and numerical regression
-inputs belong to the v4 study at
-`STUDY/prediction_refinement/progressive_ss_450_20261010`.
-Their physical storage is managed by the study rather than the code package.
-The local `validation/progressive_ss_450` compatibility symlink allows
-existing numerical regression commands to access that study folder.
-Validate the kernel against the full reference with:
-
-```bash
-OPENBLAS_NUM_THREADS=1 python tests/validate_progressive_reference.py \
-  --reference validation/progressive_ss_450
-```
-
-## Refining a completed simulation study
-
-`python -m GPU_REML.run_progressive_refinement` reuses completed native 8k/10k
-fits without rerunning LASSO or REML. It reads each successful attempt from the
-study's `runs/<case>/coherit_ld4/result.json`, including attempts after retries.
-Reused Random cases may instead be resolved through `random_result_reuse.tsv`;
-the recorded source-result hash is checked. Held-out phenotype paths follow the
-successful native fit's input directory, including reused study inputs.
-The output directory supplies genotype caches under `cache/train8000` and
-`cache/fit10000`: native-standardized SNP-major designs, normalization,
-component membership, sample identity, and phenotype-independent sample Grams.
-Caches are checked against the native partition, sample order, and independent
-BED decoding before use. Their physical files may be linked from shared storage.
-
-Run the stages in this order, supplying the same `--out-dir` each time:
-
-```text
-prepare --study-root STUDY --architectures high_ld low_ld
-background --stage 8
-select
-background --stage 10
-refit
-predict
-evaluate
-```
-
-Two GPUs may split either background stage using `CUDA_VISIBLE_DEVICES` and
-`--worker 0 --workers 2` / `--worker 1 --workers 2`. Finished cases are retained;
-unfinished constrained EM-VAMP messages can continue with conservative damping
-and identical fixed-point tolerances. Full prediction uses batched FP64 BED
-products, with independent host decoding and native prediction checks.
-Packed genotypes and the compiled prediction kernel are reused across batches,
-without constructing a full test genotype design.
-Validation choices, final coefficients and predictions are frozen successively.
-Only `evaluate` reads test phenotypes. Per-case effects and prediction arrays,
-validation paths, squared fitted terms, paired metrics and architecture/setting
-summaries are written separately from the original native fits.

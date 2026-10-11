@@ -399,6 +399,11 @@ gpu-reml-sparse \
   --out-prefix out/sparse_single
 ```
 
+A prediction genotype prefix enables prediction directly after the final refit.
+`--compute-effects` independently controls effect-table export and is optional
+for prediction. Add `--progressive-alpha` to use constrained background SS and
+validation-selected progressive OLS alpha throughout this workflow.
+
 The combined phenotype and keep files are constructed automatically from the
 training and validation inputs. They may instead be supplied explicitly with
 `--fit-pheno-txt` and `--fit-keep-path`. A fixed multi-GRM run only adds an
@@ -612,10 +617,10 @@ The adopted full prediction workflow is now available with
 validation selection of a strongest-LASSO joint OLS prefix, and combined-sample
 SS plus OLS refit using the frozen count. Alpha refinement freezes SS and gamma
 and applies no alpha Q constraint. See [progressive OLS alpha](docs/progressive_alpha.md)
-for the model, command, outputs and full-450 numerical reference.
+for the model, command, inputs and outputs.
 
-Background experiments now fix the native COHERIT-LD4 LASSO SNP coefficients
-and covariate coefficients. Their training response is
+Background SS refinement fixes the native COHERIT-LD4 LASSO SNP coefficients
+and covariate coefficients. Its training response is
 `r = y - X @ alpha_lasso - C @ gamma_lasso`. The original four GRM
 variance components and original BLUP remain the reference.
 

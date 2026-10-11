@@ -84,8 +84,7 @@ def _matrix(value, rows, batch, name):
 
 
 def refine_lasso_background_ss(context, *, y, alpha, gamma, covariates,
-                               blup, variance_components, config=None, callback=None,
-                               initial_state=None):
+                               blup, variance_components, config=None, callback=None):
     """Consume final LASSO alpha/gamma, native BLUP and theta automatically.
 
     Supports one case or a batch with the same active GRM groups. Computes
@@ -93,8 +92,6 @@ def refine_lasso_background_ss(context, *, y, alpha, gamma, covariates,
     The input designs are standardized using training statistics only.
     """
     config = config or VAMPConfig(max_iterations=2000)
-    if not config.variance_constraint:
-        raise ValueError('Native SS refinement requires the variance constraint')
     if not jax.config.jax_enable_x64:
         raise RuntimeError('Enable jax_enable_x64 before SS refinement')
     response = np.asarray(y, float)
@@ -124,8 +121,7 @@ def refine_lasso_background_ss(context, *, y, alpha, gamma, covariates,
     if active_groups:
         posterior = fit_grouped_ss_vamp(context.products, residual, context.groups,
             theta[:-1], context.normalizers, theta[-1], context.spectrum(active_groups),
-            config, callback, initial_mean=initial if initial_state is None else None,
-            initial_state=initial_state)
+            config, callback, initial_mean=initial)
     else:
         zeros = np.zeros_like(initial)
         parameters = np.zeros((context.n_groups, batch))

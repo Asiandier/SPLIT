@@ -36,7 +36,7 @@ Examples:
   ./run_gpu.sh --mode reml --bed-prefix /path/to/data --pheno-txt /path/to/pheno.txt --covar-txt /path/to/covar.txt
   ./run_gpu.sh --mode reml --bed-prefix /path/to/data --pheno-txt /path/to/pheno.txt --covar-txt /path/to/covar.txt --compute-effects --out-prefix ./logs/reml_effects
   ./run_gpu.sh --mode reml --bed-prefix /path/to/train --pheno-txt /path/to/pheno.txt --covar-txt /path/to/train.covar --prediction-bed-prefix /path/to/test --prediction-covar-txt /path/to/test.covar --out-prefix ./logs/reml_pred
-  ./run_gpu.sh --mode reml --bed-prefix /DATA/jiaxin/dense --rare-bed-prefix /DATA/jiaxin/rare
+  ./run_gpu.sh --mode reml --bed-prefix /path/to/dense --rare-bed-prefix /path/to/rare
   ./run_gpu.sh --mode lasso --bed-prefix /path/to/data --pheno-txt /path/to/pheno.txt --covar-txt /path/to/covar.txt --out-prefix ./logs/lasso_run
   ./run_gpu.sh --mode gwas --bed-prefix /path/to/data --pheno-txt /path/to/pheno.txt --covar-txt /path/to/covar.txt --out-prefix ./logs/gwas_run
 EOF
