@@ -686,6 +686,7 @@ def _emit_lasso_prediction(
     max_pcg_iters: int,
     background_effects=None,
     background_refinement=None,
+    alpha_refinement=None,
 ) -> dict[str, object]:
     """Predict one cohort from an already fitted alpha/theta pair."""
     request_metadata = {
@@ -745,7 +746,8 @@ def _emit_lasso_prediction(
             "estimator_valid": True,
             "output_emitted": True,
             "invalid_reasons": [],
-            "mean_estimator": "final_weighted_lasso",
+            "mean_estimator": (alpha_refinement['method'] if alpha_refinement else 'final_weighted_lasso'),
+            "alpha_refinement": alpha_refinement,
             "covariance_estimator": "lasso_covariate_contrast_reml",
             "background_estimator": (background_refinement['method'] if background_refinement else 'gaussian_multi_blup'),
             "background_refinement": background_refinement,
@@ -852,6 +854,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--background-ss', action='store_true',
                    help='Refine the final LASSO background with variance-constrained SS EM-VAMP, initialized from native BLUP.')
     p.add_argument('--background-ss-max-iterations', type=int, default=2000)
+    progressive = p.add_mutually_exclusive_group()
+    progressive.add_argument('--progressive-alpha-select', action='store_true',
+        help='After background SS, select a strongest-LASSO OLS prefix by full validation corr-squared.')
+    progressive.add_argument('--progressive-alpha-k', type=int, default=None,
+        help='After background SS, refit this frozen prefix count using the current native LASSO ranking.')
     p.add_argument("--keep-path", default=env("KEEP_PATH", ""))
     p.add_argument("--keep-out", default=env("KEEP_OUT", ""))
     p.add_argument("--dropped-out", default=env("DROPPED_OUT", ""))
@@ -3131,6 +3138,18 @@ def _parse_variance_components_init(
 
 def main() -> None:
     args = parse_args()
+    progressive_requested = args.progressive_alpha_select or args.progressive_alpha_k is not None
+    if progressive_requested:
+        args.background_ss = True
+    if args.background_ss_max_iterations < 1:
+        raise SystemExit('background-ss-max-iterations must be positive.')
+    if args.progressive_alpha_k is not None and args.progressive_alpha_k < 0:
+        raise SystemExit('progressive-alpha-k must be nonnegative.')
+    if args.progressive_alpha_select and (args.lasso_fixed_lam_ratio is not None
+                                         or not args.sparsity_validation_pheno_txt):
+        raise SystemExit('progressive-alpha-select requires the validation-selection fit.')
+    if args.progressive_alpha_k is not None and args.lasso_fixed_lam_ratio is None:
+        raise SystemExit('progressive-alpha-k requires a frozen-lambda final refit.')
     if int(args.screen_topk) < int(args.candidate_k):
         raise SystemExit("screen-topk must be >= candidate-k.")
     if int(args.outer_max) < 1:
@@ -5352,6 +5371,70 @@ def main() -> None:
         logger.info('[background SS] converged in %s iterations, fit %.2fs, total refinement %.2fs',
                     ss_posterior.iterations, ss_posterior.seconds, ss_result.total_seconds)
 
+    # Prediction refinement does not alter the native LASSO state, KKT
+    # certificate, selected-SNP table, REML/CHIVE estimates or warm state.
+    prediction_alpha_active = np.asarray(beta_lasso_active, dtype=np.float64).copy()
+    progressive_alpha_summary = {'requested': bool(progressive_requested), 'status': 'not_requested'}
+    if progressive_requested:
+        progressive_mod = importlib.import_module(f'{pkg_name}.progressive_alpha')
+        validation_args = {}
+        if args.progressive_alpha_select:
+            if prediction_context is None or validation_outcome is None:
+                raise RuntimeError('Progressive alpha selection requires the aligned validation cohort.')
+            if set(fam_keep).intersection(prediction_context.sample_ids):
+                raise ValueError('Progressive alpha training and validation samples must be disjoint.')
+            validation_support = prediction_context.grm_index.extract_standardized_columns(support)
+            # Reuse the fixed SS coefficients; this never recomputes BLUP
+            # conditional on any candidate alpha along the OLS path.
+            from jax.experimental import enable_x64
+            with enable_x64():
+                validation_prediction = predict_sparse_branch(
+                    name='lasso', fitter=fitter, test_fitter=prediction_context.fitter,
+                    y_train=y_np, train_covar=covar_np, test_covar=prediction_context.covar,
+                    train_active_geno=Z_support, test_active_geno=validation_support,
+                    beta_cov=beta_cov_lasso, beta_active=beta_lasso_active,
+                    theta=theta_lasso_ml, pcg_tol=args.pcg_tol, max_pcg_iters=args.max_pcg_iters,
+                    background_effects=background_effects)
+            validation_args = dict(validation_design=validation_support,
+                validation_fixed_score=validation_prediction.nuisance_fixed_score+validation_prediction.background_blup,
+                validation_response=validation_outcome)
+        progressive_result = progressive_mod.refine_alpha(
+            design=Z_support, y=y_np, covariates=covar_np, gamma=beta_cov_lasso,
+            background_score=np.asarray(background_effects.random_effect, dtype=np.float64),
+            alpha=beta_lasso_active, source_indices=grm_index.source_variant_indices(support),
+            selected_k=args.progressive_alpha_k, **validation_args)
+        prediction_alpha_active = progressive_result.alpha
+        alpha_file = out_prefix+'.progressive_alpha.npz'
+        alpha_metadata = out_prefix+'.progressive_alpha.json'
+        alpha_path = out_prefix+'.progressive_alpha_path.tsv'
+        order, k = progressive_result.path.order, progressive_result.selected_k
+        np.savez(alpha_file, support=support,
+            source_snp_indices=grm_index.source_variant_indices(support),
+            alpha=prediction_alpha_active, old_alpha=progressive_result.old_alpha,
+            order=order, selected_k=k, reestimated_snps=support[order[:k]],
+            reestimated_source_snps=grm_index.source_variant_indices(support[order[:k]]),
+            train_alpha_score=progressive_result.training_sparse_score,
+            path_metrics=progressive_result.path.metrics,
+            gamma_fixed=beta_cov_lasso, theta_fixed=theta_lasso_ml)
+        with open(alpha_path, 'w') as handle:
+            handle.write('k\trank\ttraining_mse_reduction\tsparse_squared_term\tnormal_equation_error\tpivot\tvalidation_corr2\tvalidation_mse\n')
+            for index, row in enumerate(progressive_result.path.metrics):
+                validation_values = (['NA', 'NA'] if progressive_result.validation_corr2 is None else
+                    [str(progressive_result.validation_corr2[index]), str(progressive_result.validation_mse[index])])
+                handle.write('\t'.join([str(v) for v in row]+validation_values)+'\n')
+        progressive_alpha_summary = dict(progressive_result.summary,
+            background_conditioning_alpha='native_weighted_lasso_before_progressive_OLS',
+            inference_estimates_source='native covariance-aligned LASSO; prediction refinement is separate',
+            paths={'effects': alpha_file, 'metadata': alpha_metadata, 'path': alpha_path})
+        atomic_json(alpha_metadata, _json_safe_value(progressive_alpha_summary))
+        logger.info('[progressive alpha] %s, k=%s/%s, background and gamma fixed',
+                    progressive_alpha_summary['mode'], k, len(support))
+    else:
+        for suffix in ('.progressive_alpha.npz', '.progressive_alpha.json', '.progressive_alpha_path.tsv'):
+            path = out_prefix+suffix
+            if os.path.exists(path):
+                os.unlink(path)
+
     if args.compute_effects:
         if not lasso_branch_valid or background_effects is None:
             raise RuntimeError(
@@ -5374,7 +5457,7 @@ def main() -> None:
             support_source_variant_indices=grm_index.source_variant_indices(
                 support
             ),
-            sparse_effects=beta_lasso_active,
+            sparse_effects=prediction_alpha_active,
             component_source_variant_indices=(
                 [np.asarray(group, dtype=np.int64) for group in component_variant_indices]
                 if component_variant_indices
@@ -5408,6 +5491,9 @@ def main() -> None:
                         metadata = json.load(handle)
                     metadata['background_estimator'] = 'constrained_ss_em_vamp'
                     metadata['background_ss_metadata'] = out_prefix+'.background_ss.json'
+                    if progressive_requested:
+                        metadata['sparse_estimator'] = 'progressive_ols_alpha'
+                        metadata['progressive_alpha_metadata'] = out_prefix+'.progressive_alpha.json'
                     atomic_json(path, metadata)
 
     prediction_summary = {
@@ -5531,12 +5617,13 @@ def main() -> None:
                 train_support=Z_support,
                 support_indices=support,
                 beta_cov=beta_cov_lasso,
-                beta_active=beta_lasso_active,
+                beta_active=prediction_alpha_active,
                 theta=theta_lasso_ml,
                 pcg_tol=args.pcg_tol,
                 max_pcg_iters=args.max_pcg_iters,
                 background_effects=background_effects,
                 background_refinement=background_ss_summary if args.background_ss else None,
+                alpha_refinement=progressive_alpha_summary if progressive_requested else None,
             )
 
     output_contract = _sparse_output_contract()
@@ -5708,6 +5795,7 @@ def main() -> None:
         "outer_history": history,
         "sparse_effects": sparse_effect_summary,
         "background_ss": background_ss_summary,
+        "progressive_alpha": progressive_alpha_summary,
         "sparse_prediction": prediction_summary,
         "sparsity_validation": sparsity_validation_summary,
     }
@@ -5784,6 +5872,7 @@ def main() -> None:
         artifacts.append(args.lasso_warm_state_out)
     artifacts.extend(sparse_effect_summary.get("paths", {}).values())
     artifacts.extend(background_ss_summary.get('paths', {}).values())
+    artifacts.extend(progressive_alpha_summary.get('paths', {}).values())
     artifacts.extend(prediction_summary.get("paths", {}).values())
     artifacts.extend(sparsity_validation_summary.get("outputs", {}).values())
     summary["output_artifacts"] = output_manifest(artifacts)

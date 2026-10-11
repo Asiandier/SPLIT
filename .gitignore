@@ -5,6 +5,7 @@ __pycache__/
 # Local tests and test datasets are intentionally not tracked.
 /test/
 /tests/
+/validation/
 *.egg-info/
 build/
 dist/

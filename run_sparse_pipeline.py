@@ -331,6 +331,7 @@ def _low_level_command(
     theta_init: Sequence[float] | None = None,
     fixed_lam_ratio: float | None = None,
     final_outputs: bool = False,
+    progressive_k: int | None = None,
 ) -> list[str]:
     if validation_selection == (fixed_lam_ratio is not None):
         raise ValueError("Choose validation selection or a frozen lambda ratio.")
@@ -434,8 +435,16 @@ def _low_level_command(
                 ),
             ]
         )
+    if getattr(args, 'progressive_alpha', False):
+        command.extend(['--background-ss', '--background-ss-max-iterations', str(args.background_ss_max_iterations)])
+        if validation_selection:
+            command.append('--progressive-alpha-select')
+        elif progressive_k is not None:
+            command.extend(['--progressive-alpha-k', str(int(progressive_k))])
+        else:
+            raise ValueError('Progressive alpha final refit requires a validation-selected prefix count')
     if final_outputs:
-        if getattr(args, 'background_ss', False):
+        if getattr(args, 'background_ss', False) and not getattr(args, 'progressive_alpha', False):
             command.extend(['--background-ss', '--background-ss-max-iterations', str(args.background_ss_max_iterations)])
         if args.compute_effects:
             command.append("--compute-effects")
@@ -522,6 +531,8 @@ def _validate_summary(
     require_prediction: bool,
     require_effects: bool = False,
     required_state: Path | None = None,
+    require_progressive: bool = False,
+    progressive_k: int | None = None,
 ) -> dict[str, Any]:
     path = Path(str(prefix) + ".summary.json")
     try:
@@ -552,6 +563,17 @@ def _validate_summary(
         required.append(str(prefix) + ".sparse_effects.tsv")
     if required_state is not None:
         required.append(required_state)
+    if require_progressive:
+        refinement = summary.get('progressive_alpha', {})
+        expected_mode = 'validation_selection' if expected_method == 'validation_predictive_r2' else 'frozen_count_refit'
+        if (refinement.get('status') != 'solved' or refinement.get('mode') != expected_mode
+                or summary.get('background_ss', {}).get('status') != 'converged'):
+            raise ValueError('Requested progressive alpha and background SS were not completed')
+        if progressive_k is not None and refinement.get('transferred_k') != progressive_k:
+            raise ValueError('Final alpha refit did not preserve the validation-selected prefix count')
+        required.extend(str(prefix)+suffix for suffix in (
+            '.background_ss.npz', '.background_ss.json', '.progressive_alpha.npz',
+            '.progressive_alpha.json', '.progressive_alpha_path.tsv'))
     validate_output_manifest(summary.get("output_artifacts"), required_paths=required)
     return summary
 
@@ -605,6 +627,7 @@ def _run_validation_fit(
     requirements = dict(
         expected_k=expected_k, expected_method="validation_predictive_r2",
         require_prediction=True, required_state=state,
+        require_progressive=bool(getattr(args, 'progressive_alpha', False)),
     )
     summary = _completed_summary(prefix, **requirements)
     if summary is None:
@@ -914,10 +937,18 @@ def _run_final_refit(
     selected_summary: Mapping[str, Any],
 ) -> dict[str, Any]:
     expected_k = _component_count(component_spec)
+    progressive_k = None
+    if getattr(args, 'progressive_alpha', False):
+        refinement = selected_summary.get('progressive_alpha', {})
+        if refinement.get('status') != 'solved' or refinement.get('mode') != 'validation_selection':
+            raise ValueError('Final alpha refit requires completed validation prefix selection')
+        progressive_k = int(refinement['selected_k'])
     requirements = dict(
         expected_k=expected_k, expected_method="fixed_lam_ratio",
         require_prediction=args.prediction_prefix is not None,
         require_effects=args.compute_effects,
+        require_progressive=bool(getattr(args, 'progressive_alpha', False)),
+        progressive_k=progressive_k,
     )
     final = _completed_summary(args.out_prefix, **requirements)
     if final is None:
@@ -932,6 +963,7 @@ def _run_final_refit(
             theta_init=selected_summary["var_components_lasso_ml"],
             fixed_lam_ratio=float(selected_summary["lasso_selected_lam_ratio"]),
             final_outputs=True,
+            progressive_k=progressive_k,
         )
         _run_command(command, args.work_dir / "final_refit.log")
         final = _validate_summary(args.out_prefix, **requirements)
@@ -994,6 +1026,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--background-ss', action='store_true',
                         help='Apply BLUP-initialized constrained SS after the final combined-sample LASSO refit.')
     parser.add_argument('--background-ss-max-iterations', type=int, default=2000)
+    parser.add_argument('--progressive-alpha', action='store_true',
+        help='Run background SS on training samples, select a joint OLS prefix by validation corr-squared, then refit SS and that prefix count on combined samples.')
     parser.add_argument("--out-prefix", required=True)
 
     parser.add_argument("--lam-min-ratio", type=float, default=1e-3)
@@ -1053,6 +1087,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         if not (args.prediction_bed_prefix or args.prediction_pgen_prefix):
             parser.error("Prediction covariate/keep inputs require prediction genotype.")
     positive_integer_names = (
+        "background_ss_max_iterations",
         "ld_window_kb",
         "ld_rank_bins",
         "n_lambda",
@@ -1109,6 +1144,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("GPU budget, threads, call width, and ring depth must be nonnegative.")
     if args.pcg_tol <= 0.0 or args.pcg_ridge < 0.0:
         parser.error("PCG tolerance must be positive and ridge nonnegative.")
+    if args.progressive_alpha:
+        args.background_ss = True
     return args
 
 
@@ -1212,6 +1249,9 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
         "compute_effects": bool(args.compute_effects),
         **({'background_ss': True, 'background_ss_max_iterations': int(args.background_ss_max_iterations)}
            if args.background_ss else {}),
+        **({'progressive_alpha': dict(method='progressive_ols_alpha', selection_metric='full_prediction_corr2',
+              transfer='prefix count only; combined sample native LASSO ranking',
+              background_and_gamma_fixed=True, Q_constraint=False)} if args.progressive_alpha else {}),
         "lambda_path": {
             "minimum_ratio": float(args.lam_min_ratio),
             "points": int(args.n_lambda),
@@ -1345,6 +1385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
             },
             "prediction_phenotype_used": False,
+            **({'progressive_alpha': final['progressive_alpha']} if args.progressive_alpha else {}),
             "config": str(config_path.resolve()),
             "finished_at": _now(),
         }

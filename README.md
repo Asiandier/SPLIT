@@ -607,6 +607,13 @@ python -m pip wheel --no-deps --no-build-isolation \
 
 ## Current prediction refinement
 
+The adopted full prediction workflow is now available with
+`run_sparse_pipeline --progressive-alpha`: training-sample background SS,
+validation selection of a strongest-LASSO joint OLS prefix, and combined-sample
+SS plus OLS refit using the frozen count. Alpha refinement freezes SS and gamma
+and applies no alpha Q constraint. See [progressive OLS alpha](docs/progressive_alpha.md)
+for the model, command, outputs and full-450 numerical reference.
+
 Background experiments now fix the native COHERIT-LD4 LASSO SNP coefficients
 and covariate coefficients. Their training response is
 `r = y - X @ alpha_lasso - C @ gamma_lasso`. The original four GRM
@@ -624,8 +631,8 @@ Add `--background-ss` to the sparse pipeline command to run this refinement
 automatically after the final LASSO refit. The pipeline supplies the final
 alpha, gamma, native BLUP, GRM normalizers and variance components; the SS
 posterior means then feed the existing effect writer and prediction path.
-`--background-ss-max-iterations` defaults to 2000. In the high level
-`run_sparse_pipeline` command, refinement runs only on the final combined
+`--background-ss-max-iterations` defaults to 2000. With `--background-ss` alone,
+the high level `run_sparse_pipeline` command refines only the final combined
 sample fit. It adds no validation tuning step.
 
 The additional `<prefix>.background_ss.npz` and `.background_ss.json` retain
