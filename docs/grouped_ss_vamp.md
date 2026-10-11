@@ -245,6 +245,12 @@ models on the same cohort can reuse a context and cached trace quadrature.
 
 ## Verification
 
+SQUAREM extrapolation stops when the ordinary EM displacement is below the
+configured EM tolerance (or the larger numerical acceleration floor). The
+ordinary EM fallback still runs. This prevents an unresolved curvature estimate
+on nearly flat scalar evidence from moving pi far away after its conditional
+M step has already converged; it does not change the M-step objective or prior.
+
 In the separate validation workspace, `tests/test_grouped_ss_vamp.py` checks scalar posteriors against mixture
 densities and numerical derivatives; constrained roots against an independent
 optimizer; chunk products and sample solves against dense CPU references;

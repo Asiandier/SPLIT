@@ -361,6 +361,7 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
     def learn_prior(r, gam, prob):
         # SQUAREM acceleration of the constrained EM fixed-point mapping.
         # Guard each group independently with the exact scalar evidence.
+        resolution = max(config.em_acceleration_floor, config.em_tolerance)
         def body(_, old):
             one, _ = em_map(r, gam, old)
             if not config.em_acceleration:
@@ -382,7 +383,11 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
                 proposal = jnp.where(d > 0, proposal, 0.)
                 polished, _ = em_map(r, gam, proposal)
                 same_direction = (polished-old)*delta >= 0
-                resolved = jnp.abs(delta) > config.em_acceleration_floor*jnp.maximum(old, config.pi_min)
+                # Once ordinary EM is within its requested tolerance, its
+                # curvature cannot justify a large extrapolation. On nearly
+                # flat evidence that jump can otherwise keep pi oscillating
+                # after the conditional M step has already converged.
+                resolved = jnp.abs(delta) > resolution*jnp.maximum(old, config.pi_min)
                 better = ((evidence_at(r, gam, polished) >= baseline_evidence-1e-10)
                           & same_direction & resolved)
                 result = jnp.where(better & ~accepted, polished, result)
@@ -394,7 +399,7 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
             # Unaccepted acceleration always falls back to two ordinary EM
             # steps; backtracking uses the current training scalar channel.
             # Already stationary EM maps need no curvature extrapolation.
-            resolved = jnp.abs(delta) > config.em_acceleration_floor*jnp.maximum(old, config.pi_min)
+            resolved = jnp.abs(delta) > resolution*jnp.maximum(old, config.pi_min)
             initial = (0, step, ~resolved, two)
             return jax.lax.while_loop(lambda s: (s[0] < 42) & jnp.any(~s[2]), attempt, initial)[3]
         optimum = jax.lax.fori_loop(0, config.em_inner_steps, body, prob)
