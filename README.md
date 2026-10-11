@@ -401,8 +401,9 @@ gpu-reml-sparse \
 
 A prediction genotype prefix enables prediction directly after the final refit.
 `--compute-effects` independently controls effect-table export and is optional
-for prediction. Add `--progressive-alpha` to use constrained background SS and
-validation-selected progressive OLS alpha throughout this workflow.
+for prediction. Add `--progressive-alpha` to select and refit progressive OLS
+alpha with conditional BLUP fixed, then update constrained background SS once
+after the final alpha refit.
 
 The combined phenotype and keep files are constructed automatically from the
 training and validation inputs. They may instead be supplied explicitly with
@@ -613,15 +614,19 @@ python -m pip wheel --no-deps --no-build-isolation \
 ## Current prediction refinement
 
 The adopted full prediction workflow is now available with
-`run_sparse_pipeline --progressive-alpha`: training-sample background SS,
-validation selection of a strongest-LASSO joint OLS prefix, and combined-sample
-SS plus OLS refit using the frozen count. Alpha refinement freezes SS and gamma
-and applies no alpha Q constraint. See [progressive OLS alpha](docs/progressive_alpha.md)
+`run_sparse_pipeline --progressive-alpha`: validation selection of a
+strongest-LASSO joint OLS prefix with native conditional BLUP fixed, then
+combined-sample OLS refit using the frozen count, followed by one background SS
+update. Alpha refinement freezes conditional BLUP and native gamma and applies
+no alpha Q constraint. No training-only background SS is needed.
+See [progressive OLS alpha](docs/progressive_alpha.md)
 for the model, command, inputs and outputs.
 
-Background SS refinement fixes the native COHERIT-LD4 LASSO SNP coefficients
-and covariate coefficients. Its training response is
-`r = y - X @ alpha_lasso - C @ gamma_lasso`. The original four GRM
+Background SS refinement fixes the current prediction alpha and native
+covariate coefficients. Its training response is
+`r = y - X @ alpha_prediction - C @ gamma_lasso`: alpha is the OLS update with
+`--progressive-alpha`, or native LASSO alpha with `--background-ss` alone.
+The original GRM
 variance components and original BLUP remain the reference.
 
 The GPU background SS implementation is `grouped_ss_vamp.py`; its model,
@@ -637,7 +642,8 @@ host genotype cache remains part of the native streaming workflow.
 The statistical model and background variance constraints are unchanged.
 
 Add `--background-ss` to the sparse pipeline command to run this refinement
-automatically after the final LASSO refit. The pipeline supplies the final
+automatically after the final LASSO refit, or after OLS when
+`--progressive-alpha` is enabled. The pipeline supplies the final prediction
 alpha, gamma, native BLUP, GRM normalizers and variance components; the SS
 posterior means then feed the existing effect writer and prediction path.
 `--background-ss-max-iterations` defaults to 2000. With `--background-ss` alone,

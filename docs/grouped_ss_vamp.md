@@ -156,7 +156,11 @@ Both sparse CLI entry points accept `--background-ss` and
 `--background-ss-lanczos-steps`. After the final valid
 LASSO/variance fit, the pipeline computes its native BLUP and calls
 `background_ss.refine_sparse_fit_background` with the in-memory final
-support, alpha, gamma, theta, training phenotype and component BLUP vectors.
+support, prediction alpha, native gamma, theta, training phenotype and component
+BLUP vectors. With `--progressive-alpha`, validation selection and the
+combined-sample OLS refit both freeze their cohort's native conditional BLUP.
+Only the final combined fit runs SS, after OLS, on the residual formed with
+the updated alpha. It reuses the existing native BLUP for initialization.
 The adapter reuses native training-standardized operators in logical GRM
 order and calculates the residual itself. A scoped FP64 context preserves
 the surrounding pipeline precision setting.

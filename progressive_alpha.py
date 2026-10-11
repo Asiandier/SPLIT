@@ -148,7 +148,7 @@ def select_prefix(path, design, fixed_score, response, tie_tolerance=1e-12):
 def refine_alpha(*, design, y, covariates, gamma, background_score, alpha,
                  source_indices, selected_k=None, validation_design=None,
                  validation_fixed_score=None, validation_response=None):
-    """Refit alpha conditional on frozen SS and gamma, without a Q constraint.
+    """Refit alpha conditional on a frozen background and gamma, without a Q constraint.
 
     With no selected_k, validation is required and selects the prefix count.
     With a frozen count, no validation argument is accepted; the refit ranks

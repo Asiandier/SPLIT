@@ -1,4 +1,4 @@
-"""Constrained SS background refinement of finalized native LASSO outputs.
+"""Constrained SS background refinement of finalized sparse prediction outputs.
 
 The context owns reusable genotype products and trace quadrature. All supplied
 phenotypes, designs and coefficients must be on the model's training scale.
@@ -203,7 +203,7 @@ def _matrix(value, rows, batch, name):
 
 def refine_lasso_background_ss(context, *, y, alpha, gamma, covariates,
                                blup, variance_components, config=None, callback=None):
-    """Consume final LASSO alpha/gamma, native BLUP and theta automatically.
+    """Consume current prediction alpha, native gamma, BLUP and theta automatically.
 
     Supports one case or a batch with the same active GRM groups. Computes
     y-X alpha-C gamma itself, uses BLUP initialization, and fixes zero groups.
