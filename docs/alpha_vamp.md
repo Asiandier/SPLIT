@@ -73,8 +73,19 @@ when the Gaussian linear posterior remains positive definite. A transient
 precision safeguard is recorded; a safeguarded iterate cannot satisfy stopping.
 Message, module, precision and constrained EM fixed-point errors must satisfy
 1e-4 for five consecutive iterations. Message and EM damping are both .2.
-`--alpha-vamp-max-iterations` defaults to 10000, an iteration ceiling rather
-than a mandatory count. Unconverged alpha is rejected before final prediction.
+`--alpha-vamp-max-iterations` defaults to 10000 damped iterations, an iteration
+ceiling rather than a mandatory count. If these iterations oscillate,
+`ss_fixed_point.polish_support_fixed_point` makes a bounded Newton-Krylov
+attempt at the same support-space EM-VAMP equations, starting from the final
+iterate. It reuses the denoiser, constrained M step and support linear solver;
+the prior, likelihood and stopping tolerances remain fixed. At most 100 root
+iterations are allowed, followed by five ordinary EM-VAMP verification steps.
+The root solver's success flag alone cannot authorize an output. The original
+undamped diagnostics must pass without a precision safeguard, and the EM steps
+must lie in the ordinary-EM fallback region of the guarded SQUAREM update.
+Metadata records the root attempt and verification. An unresolved fit is still
+rejected before final prediction. A budget below the configured minimum
+iterations or EM warmup does not activate this fallback.
 
 The method adds no alpha tuning stage. The two conditional rounds do not
 constitute an outer convergence test or imply joint posterior convergence.
