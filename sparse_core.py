@@ -186,29 +186,6 @@ class MultiGRMIndex:
         return result
 
 
-class SingleGRMIndex(MultiGRMIndex):
-    """Compatibility wrapper for callers that explicitly require K=1."""
-
-    def __init__(self, streamers):
-        if len(streamers) != 1:
-            raise ValueError(
-                "The sparse pipeline supports exactly one whole-genome GRM."
-            )
-        streamer = streamers[0]
-        if bool(getattr(streamer, "has_component_partition", False)) or int(
-            getattr(streamer, "n_components", 1)
-        ) != 1:
-            raise ValueError(
-                "The single-GRM index does not accept component partitions."
-            )
-        super().__init__(streamers)
-
-    def lookup_bim_rows(
-        self, bed_prefix: str, marker_idx: np.ndarray
-    ) -> dict[int, tuple[str, str, str, str, str, str]]:
-        return super().lookup_bim_rows([bed_prefix], marker_idx)
-
-
 def lookup_bim_rows(bim_path: str, snp_indices: np.ndarray) -> dict[int, tuple[str, str, str, str, str, str]]:
     idx = np.asarray(snp_indices, dtype=np.int64)
     if idx.size == 0:

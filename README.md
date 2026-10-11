@@ -402,9 +402,9 @@ gpu-reml-sparse \
 
 A prediction genotype prefix enables prediction directly after the final refit.
 `--compute-effects` independently controls effect-table export and is optional
-for prediction. Add `--progressive-alpha` to select and refit progressive OLS
-alpha with conditional BLUP fixed, then update constrained background SS once
-after the final alpha refit.
+for prediction. Add `--alpha-vamp` to update alpha directly after the final
+refit with a single prior-Q SS EM-VAMP model and two conditional alpha/background
+SS rounds. Alpha refinement has no validation-selected parameter.
 
 The combined phenotype and keep files are constructed automatically from the
 training and validation inputs. They may instead be supplied explicitly with
@@ -454,8 +454,8 @@ gpu-reml-gwas \
 
 Add `--covar-txt covar.txt` when covariates should be included.
 
-The repository-local `run_gpu.sh` launcher remains available for
-environment-heavy benchmark runs.
+The repository-local `run_gpu.sh` launcher sets runtime environment options
+and records CPU/GPU resource usage for the REML, sparse and GWAS entry points.
 
 ## Component Specifications
 
@@ -626,18 +626,21 @@ python -m pip wheel --no-deps --no-build-isolation \
 ## Current prediction refinement
 
 The adopted full prediction workflow is now available with
-`run_sparse_pipeline --progressive-alpha`: validation selection of a
-strongest-LASSO joint OLS prefix with native conditional BLUP fixed, then
-combined-sample OLS refit using the frozen count, followed by one background SS
-update. Alpha refinement freezes conditional BLUP and native gamma and applies
-no alpha Q constraint. No training-only background SS is needed.
-See [progressive OLS alpha](docs/progressive_alpha.md)
+`run_sparse_pipeline --alpha-vamp`: after the combined-sample LASSO/variance
+refit, run two conditional alpha/background SS rounds with a single alpha SS
+EM-VAMP model. The first alpha fit conditions on native conditional BLUP; the
+second conditions on the preceding background SS mean. Each background SS fit
+starts from the same native BLUP. Gamma, support and variance components stay
+fixed, and alpha's prior expected sparse variance is constrained to Q_s. Pi has no hyperprior;
+its EM count includes all SNPs, with outside-support indicators fixed zero.
+No alpha-specific validation selection or training-only SS is needed.
+See [prior-Q VAMP alpha](docs/alpha_vamp.md)
 for the model, command, inputs and outputs.
 
 Background SS refinement fixes the current prediction alpha and native
 covariate coefficients. Its training response is
-`r = y - X @ alpha_prediction - C @ gamma_lasso`: alpha is the OLS update with
-`--progressive-alpha`, or native LASSO alpha with `--background-ss` alone.
+`r = y - X @ alpha_prediction - C @ gamma_lasso`: alpha is the VAMP update with
+`--alpha-vamp`, or native LASSO alpha with `--background-ss` alone.
 The original GRM
 variance components and original BLUP remain the reference.
 
@@ -651,11 +654,12 @@ It constructs neither a full standardized genotype design nor an `n*n` sample
 Gram or `p*p` LD matrix. Additional workspaces scale linearly with sample and
 SNP counts for fixed probe batch width and Lanczos depth; the original packed
 host genotype cache remains part of the native streaming workflow.
+The two rounds reuse background genotype products and trace quadrature.
 The statistical model and background variance constraints are unchanged.
 
 Add `--background-ss` to the sparse pipeline command to run this refinement
-automatically after the final LASSO refit, or after OLS when
-`--progressive-alpha` is enabled. The pipeline supplies the final prediction
+automatically after the final LASSO refit, or after alpha VAMP when
+`--alpha-vamp` is enabled. The pipeline supplies the final prediction
 alpha, gamma, native BLUP, GRM normalizers and variance components; the SS
 posterior means then feed the existing effect writer and prediction path.
 `--background-ss-max-iterations` defaults to 2000. With `--background-ss` alone,

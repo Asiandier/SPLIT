@@ -16,12 +16,20 @@ python -m pip install -e ".[pgen]"
 
 ## Checks Before Submitting
 
-Run:
+Check the production checkout:
+
+```bash
+python -m pyflakes *.py
+python -m pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/gpu_reml_wheel .
+```
+
+Keep numerical regression tests and generated data in a separate validation
+workspace. Run that suite against a snapshot of the candidate source (retaining
+the package name `GPU_REML`), and record the source hashes with its results.
+For example, from the validation snapshot containing its external `tests/`:
 
 ```bash
 JAX_PLATFORMS=cpu python -m pytest -q tests
-python -m pyflakes *.py tests/*.py
-python -m pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/gpu_reml_wheel .
 ```
 
 FP64-specific tests use scoped precision contexts; they must not change global
@@ -41,8 +49,8 @@ before publishing.
   definitions.
 - Runtime modules must serve a supported project pipeline or public model API.
   Keep study-specific batch runners, prior comparisons, benchmark utilities and
-  oracle analyses in the study workspace outside this package. Numerical unit
-  tests of production methods belong in the local test directory.
+  oracle analyses in the study workspace outside this package. Keep numerical
+  regression tests and their fixtures in the separate validation workspace.
 - Do not commit benchmark outputs, logs, temporary genotype splits, or private
   data paths.
 

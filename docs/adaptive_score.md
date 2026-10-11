@@ -253,7 +253,7 @@ the same observations.
 
 ## Validation
 
-`tests/test_score_process.py` checks dense REML/Fisher identities, nuisance
+In the separate validation workspace, `tests/test_score_process.py` checks dense REML/Fisher identities, nuisance
 projection, the joint reference covariance and jackknife, degenerate directions,
 known chi-square tails, duplicate candidates, and batching invariance.
 `tests/test_adaptive_ld.py` checks genotype normalization, source/cache order,
@@ -261,7 +261,7 @@ covariance-factor probes, temporary cleanup, and real BED/PCG scores against
 a full dense reference. The adaptive end-to-end test exercises split decisions,
 refits, final output, prediction and resume.
 
-The reproducible offline experiment runs the production operator construction
+The reproducible offline experiment in that workspace runs the production operator construction
 and calibrator against a complete quadratic reference:
 
 ```bash

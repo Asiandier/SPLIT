@@ -88,7 +88,6 @@ fit_weighted_lasso_with_covariates = _lasso_mod.fit_weighted_lasso_with_covariat
 pcg_solve = _pcg_mod.pcg_solve
 SparseMeanInformation = _information_mod.SparseMeanInformation
 MultiGRMIndex = _core_mod.MultiGRMIndex
-SingleGRMIndex = _core_mod.SingleGRMIndex
 _validate_component_partition = _core_mod.validate_component_partition
 _accepted_reml_theta = _core_mod.accepted_reml_theta
 _sparse_dense_h2 = _core_mod.sparse_dense_h2
@@ -856,11 +855,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--background-ss-pcg-tol', type=float, default=1e-9)
     p.add_argument('--background-ss-trace-probes', type=int, default=32)
     p.add_argument('--background-ss-lanczos-steps', type=int, default=64)
-    progressive = p.add_mutually_exclusive_group()
-    progressive.add_argument('--progressive-alpha-select', action='store_true',
-        help='With native conditional BLUP fixed, select a strongest-LASSO OLS prefix by full validation corr-squared; skip background SS.')
-    progressive.add_argument('--progressive-alpha-k', type=int, default=None,
-        help='With native conditional BLUP fixed, refit this frozen prefix count using the current native LASSO ranking, then run background SS.')
+    p.add_argument('--alpha-vamp', action='store_true',
+        help='After the frozen-lambda refit, run two conditional alpha/background SS rounds with prior-Q alpha EM-VAMP.')
+    p.add_argument('--alpha-vamp-max-iterations', type=int, default=10000)
     p.add_argument("--keep-path", default=env("KEEP_PATH", ""))
     p.add_argument("--keep-out", default=env("KEEP_OUT", ""))
     p.add_argument("--dropped-out", default=env("DROPPED_OUT", ""))
@@ -3124,23 +3121,17 @@ def main() -> None:
     args = parse_args()
     if not np.isfinite(args.slq_quadrature_tol) or args.slq_quadrature_tol < 0:
         raise SystemExit('--slq-quadrature-tol must be finite and nonnegative.')
-    progressive_requested = args.progressive_alpha_select or args.progressive_alpha_k is not None
-    if args.progressive_alpha_select:
-        args.background_ss = False
-    elif args.progressive_alpha_k is not None:
+    if args.alpha_vamp:
         args.background_ss = True
     if args.background_ss_max_iterations < 1:
         raise SystemExit('background-ss-max-iterations must be positive.')
     if (not 0 < args.background_ss_pcg_tol < 1
             or args.background_ss_trace_probes < 1 or args.background_ss_lanczos_steps < 1):
         raise SystemExit('Invalid background SS matrix-free numerical settings.')
-    if args.progressive_alpha_k is not None and args.progressive_alpha_k < 0:
-        raise SystemExit('progressive-alpha-k must be nonnegative.')
-    if args.progressive_alpha_select and (args.lasso_fixed_lam_ratio is not None
-                                         or not args.sparsity_validation_pheno_txt):
-        raise SystemExit('progressive-alpha-select requires the validation-selection fit.')
-    if args.progressive_alpha_k is not None and args.lasso_fixed_lam_ratio is None:
-        raise SystemExit('progressive-alpha-k requires a frozen-lambda final refit.')
+    if args.alpha_vamp_max_iterations < 1:
+        raise SystemExit('alpha-vamp-max-iterations must be positive.')
+    if args.alpha_vamp and args.lasso_fixed_lam_ratio is None:
+        raise SystemExit('alpha-vamp requires a frozen-lambda final refit.')
     if int(args.screen_topk) < int(args.candidate_k):
         raise SystemExit("screen-topk must be >= candidate-k.")
     if int(args.outer_max) < 1:
@@ -5312,7 +5303,7 @@ def main() -> None:
         "requested": bool(args.compute_effects),
         "status": "not_requested",
     }
-    background_effects_requested = bool(args.compute_effects or prediction_active or args.background_ss or progressive_requested)
+    background_effects_requested = bool(args.compute_effects or prediction_active or args.background_ss)
     if lasso_branch_valid and background_effects_requested:
         background_residual = np.asarray(y_np, dtype=np.float64).copy()
         if covar_np is not None and beta_cov_lasso.size:
@@ -5332,93 +5323,90 @@ def main() -> None:
     # Prediction refinement does not alter the native LASSO state, KKT
     # certificate, selected-SNP table, REML/CHIVE estimates or warm state.
     prediction_alpha_active = np.asarray(beta_lasso_active, dtype=np.float64).copy()
-    progressive_alpha_summary = {'requested': bool(progressive_requested), 'status': 'not_requested'}
-    if progressive_requested:
-        if not lasso_branch_valid or background_effects is None:
-            raise RuntimeError('Progressive alpha requires a valid final LASSO branch and native BLUP.')
-        progressive_mod = importlib.import_module(f'{pkg_name}.progressive_alpha')
-        validation_args = {}
-        if args.progressive_alpha_select:
-            if prediction_context is None or validation_outcome is None:
-                raise RuntimeError('Progressive alpha selection requires the aligned validation cohort.')
-            if set(fam_keep).intersection(prediction_context.sample_ids):
-                raise ValueError('Progressive alpha training and validation samples must be disjoint.')
-            validation_support = prediction_context.grm_index.extract_standardized_columns(support)
-            # Reuse the native conditional BLUP; this never recomputes BLUP
-            # conditional on any candidate alpha along the OLS path.
-            from jax.experimental import enable_x64
-            with enable_x64():
-                validation_prediction = predict_sparse_branch(
-                    name='lasso', fitter=fitter, test_fitter=prediction_context.fitter,
-                    y_train=y_np, train_covar=covar_np, test_covar=prediction_context.covar,
-                    train_active_geno=Z_support, test_active_geno=validation_support,
-                    beta_cov=beta_cov_lasso, beta_active=beta_lasso_active,
-                    theta=theta_lasso_ml, pcg_tol=args.pcg_tol, max_pcg_iters=args.max_pcg_iters,
-                    background_effects=background_effects)
-            validation_args = dict(validation_design=validation_support,
-                validation_fixed_score=validation_prediction.nuisance_fixed_score+validation_prediction.background_blup,
-                validation_response=validation_outcome)
-        progressive_result = progressive_mod.refine_alpha(
-            design=Z_support, y=y_np, covariates=covar_np, gamma=beta_cov_lasso,
-            background_score=np.asarray(background_effects.random_effect, dtype=np.float64),
-            alpha=beta_lasso_active, source_indices=grm_index.source_variant_indices(support),
-            selected_k=args.progressive_alpha_k, **validation_args)
-        prediction_alpha_active = progressive_result.alpha
-        alpha_file = out_prefix+'.progressive_alpha.npz'
-        alpha_metadata = out_prefix+'.progressive_alpha.json'
-        alpha_path = out_prefix+'.progressive_alpha_path.tsv'
-        order, k = progressive_result.path.order, progressive_result.selected_k
-        np.savez(alpha_file, support=support,
-            source_snp_indices=grm_index.source_variant_indices(support),
-            alpha=prediction_alpha_active, old_alpha=progressive_result.old_alpha,
-            order=order, selected_k=k, reestimated_snps=support[order[:k]],
-            reestimated_source_snps=grm_index.source_variant_indices(support[order[:k]]),
-            train_alpha_score=progressive_result.training_sparse_score,
-            train_conditioning_background_score=np.asarray(background_effects.random_effect, dtype=np.float64),
-            path_metrics=progressive_result.path.metrics,
-            gamma_fixed=beta_cov_lasso, theta_fixed=theta_lasso_ml)
-        with open(alpha_path, 'w') as handle:
-            handle.write('k\trank\ttraining_mse_reduction\tsparse_squared_term\tnormal_equation_error\tpivot\tvalidation_corr2\tvalidation_mse\n')
-            for index, row in enumerate(progressive_result.path.metrics):
-                validation_values = (['NA', 'NA'] if progressive_result.validation_corr2 is None else
-                    [str(progressive_result.validation_corr2[index]), str(progressive_result.validation_mse[index])])
-                handle.write('\t'.join([str(v) for v in row]+validation_values)+'\n')
-        progressive_alpha_summary = dict(progressive_result.summary,
-            background_estimator='native_conditional_blup',
-            background_conditioning_alpha='native_weighted_lasso_before_progressive_OLS',
-            refinement_order=('conditional_blup_then_progressive_ols' if args.progressive_alpha_select
-                              else 'progressive_ols_then_background_ss'),
-            squared_terms_background='native_conditional_blup',
-            inference_estimates_source='native covariance-aligned LASSO; prediction refinement is separate',
-            paths={'effects': alpha_file, 'metadata': alpha_metadata, 'path': alpha_path})
-        logger.info('[progressive alpha] %s, k=%s/%s, background and gamma fixed',
-                    progressive_alpha_summary['mode'], k, len(support))
-    else:
-        for suffix in ('.progressive_alpha.npz', '.progressive_alpha.json', '.progressive_alpha_path.tsv'):
-            path = out_prefix+suffix
-            if os.path.exists(path):
-                os.unlink(path)
-
-    # Only the combined-sample refit runs SS in the progressive workflow.
-    # Condition on the updated alpha, reusing the native BLUP for initialization.
+    alpha_vamp_summary = {'requested': bool(args.alpha_vamp), 'status': 'not_requested'}
     background_ss_summary = {'requested': bool(args.background_ss), 'status': 'not_requested'}
     if args.background_ss:
         if not lasso_branch_valid or background_effects is None:
             raise RuntimeError('--background-ss requires a valid final LASSO branch and native BLUP.')
         ss_mod = importlib.import_module(f'{pkg_name}.background_ss')
         ss_core = importlib.import_module(f'{pkg_name}.grouped_ss_vamp')
-        background_effects, ss_result, initial_blup = ss_mod.refine_sparse_fit_background(
-            fitter=fitter, grm_index=grm_index, y=y_np, covariates=covar_np,
-            support=support, beta_active=prediction_alpha_active, beta_cov=beta_cov_lasso,
-            theta=theta_lasso_ml, background_effects=background_effects,
-            config=ss_core.VAMPConfig(max_iterations=args.background_ss_max_iterations,
-                linear_pcg_tolerance=args.background_ss_pcg_tol,
-                trace_probes=args.background_ss_trace_probes,
-                trace_lanczos_steps=args.background_ss_lanczos_steps))
+        if args.alpha_vamp:
+            alpha_mod = importlib.import_module(f'{pkg_name}.alpha_vamp')
+        native_background_effects = background_effects
+        conditioning_background_score = np.asarray(background_effects.random_effect, dtype=np.float64)
+        ss_context = None
+        alpha_rounds, background_rounds = [], []
+        round_one_alpha = {}
+        n_refinement_rounds = 2 if args.alpha_vamp else 1
+        for refinement_round in range(1, n_refinement_rounds+1):
+            if args.alpha_vamp:
+                conditioning_estimator = ('native_conditional_blup' if refinement_round == 1
+                                          else 'constrained_ss_em_vamp')
+                alpha_result = alpha_mod.refine_alpha_vamp(
+                    design=Z_support, y=y_np, covariates=covar_np, gamma=beta_cov_lasso,
+                    background_score=conditioning_background_score,
+                    alpha=prediction_alpha_active, total_snps=grm_index.m_total,
+                    q_sparse=q_chive, noise_variance=float(theta_lasso_ml[-1]),
+                    background_estimator=conditioning_estimator,
+                    config=ss_core.VAMPConfig(max_iterations=args.alpha_vamp_max_iterations,
+                        damping=.2, em_damping=.2, tolerance=1e-4, em_tolerance=1e-4, log_every=25),
+                    callback=lambda row: logger.info(
+                        '[alpha VAMP round %s] iteration=%s, module_error=%s, EM_error=%s',
+                        refinement_round, row['iteration'], row['module_error'], row['em_error']))
+                prediction_alpha_active = alpha_result.alpha
+                alpha_rounds.append(dict(alpha_result.summary, round=refinement_round,
+                    background_conditioning_alpha=('native_weighted_lasso_before_alpha_VAMP'
+                        if refinement_round == 1 else 'previous_round_prior_Q_ss_em_vamp_alpha'),
+                    squared_terms_background=conditioning_estimator))
+                if refinement_round == 1:
+                    round_one_alpha = dict(round1_alpha=alpha_result.alpha,
+                        round1_train_alpha_score=alpha_result.training_sparse_score,
+                        round1_training_residual=alpha_result.residual)
+                logger.info('[alpha VAMP round %s] converged in %s iterations, pi=%s, support=%s',
+                    refinement_round, alpha_result.posterior.iterations, alpha_result.summary['pi'], len(support))
+
+            # Every background fit starts at the same native conditional BLUP.
+            # Reuse streamed products and trace quadrature, not posterior messages.
+            background_effects, ss_result, initial_blup = ss_mod.refine_sparse_fit_background(
+                fitter=fitter, grm_index=grm_index, y=y_np, covariates=covar_np,
+                support=support, beta_active=prediction_alpha_active, beta_cov=beta_cov_lasso,
+                theta=theta_lasso_ml, background_effects=native_background_effects, context=ss_context,
+                config=ss_core.VAMPConfig(max_iterations=args.background_ss_max_iterations,
+                    linear_pcg_tolerance=args.background_ss_pcg_tol,
+                    trace_probes=args.background_ss_trace_probes,
+                    trace_lanczos_steps=args.background_ss_lanczos_steps))
+            ss_context = ss_result.context
+            ss_posterior = ss_result.posterior
+            training_full_score = ss_result.fitted_mean[:, 0]
+            background_rounds.append(dict(requested=True, status='converged', round=refinement_round,
+                method='constrained_ss_em_vamp', initial_effect='native_BLUP', initial_pi=.1, hyperpriors=None,
+                conditioning_alpha='prior_Q_ss_em_vamp_alpha' if args.alpha_vamp else 'native_weighted_lasso',
+                alpha_gamma_fixed=True, zero_theta_groups_fixed_zero=True,
+                variance_components_fixed=True, noise_fixed=True,
+                variance_constraint='pi_g*slab_variance_g=theta_g/M_g',
+                pi=ss_posterior.pi[:, 0].tolist(), slab_variance=ss_posterior.slab_variance[:, 0].tolist(),
+                group_snp_counts=np.bincount(ss_result.groups).tolist(),
+                grm_normalizers=ss_result.normalizers.tolist(),
+                training_full_squared_term=float(np.mean(training_full_score**2)),
+                training_mse=float(np.mean((np.asarray(y_np, dtype=np.float64)-training_full_score)**2)),
+                iterations=ss_posterior.iterations, fit_seconds=ss_posterior.seconds,
+                total_refinement_seconds=ss_result.total_seconds,
+                setup_and_products_seconds=ss_result.setup_and_products_seconds,
+                initialization=ss_posterior.initialization, numerical_attempts=ss_result.numerical_attempts,
+                linear_solver=ss_posterior.linear_solver,
+                pcg_diagnostics='Original BLUP initialization PCG; SS convergence is recorded separately.'))
+            logger.info('[background SS round %s] converged in %s iterations, fit %.2fs, total %.2fs',
+                refinement_round, ss_posterior.iterations, ss_posterior.seconds, ss_result.total_seconds)
+            if refinement_round < n_refinement_rounds:
+                conditioning_background_score = ss_result.background[:, 0]
+                # Only the preceding training score is needed by the next alpha
+                # fit. Release its full posterior and per-component effects.
+                background_effects = native_background_effects
+                del ss_result, ss_posterior
+
+        # Publish only after every requested conditional fit has converged.
         ss_file = out_prefix+'.background_ss.npz'
         ss_metadata = out_prefix+'.background_ss.json'
-        ss_posterior = ss_result.posterior
-        training_full_score = ss_result.foreground[:, 0]+ss_result.background[:, 0]
         np.savez(ss_file, beta_background=ss_posterior.mean[:, 0],
                  posterior_variance=ss_posterior.variance[:, 0], pip=ss_posterior.pip[:, 0],
                  pi=ss_posterior.pi[:, 0], slab_variance=ss_posterior.slab_variance[:, 0],
@@ -5426,46 +5414,60 @@ def main() -> None:
                  theta=theta_lasso_ml, beta_initial_blup=initial_blup,
                  conditioning_support=support, conditioning_alpha=prediction_alpha_active,
                  training_residual=ss_result.residual[:, 0],
+                 training_background_score=ss_result.background[:, 0],
+                 alternating_rounds=n_refinement_rounds,
                  source_snp_indices=grm_index.source_variant_indices(np.arange(grm_index.m_total)))
-        background_ss_summary = dict(requested=True, status='converged', method='constrained_ss_em_vamp',
-            initial_effect='native_BLUP', initial_pi=.1, hyperpriors=None,
-            conditioning_alpha='progressive_ols_alpha' if progressive_requested else 'native_weighted_lasso',
-            alpha_gamma_fixed=True, zero_theta_groups_fixed_zero=True,
-            variance_components_fixed=True, noise_fixed=True,
-            variance_constraint='pi_g*slab_variance_g=theta_g/M_g',
-            pi=ss_posterior.pi[:, 0].tolist(), slab_variance=ss_posterior.slab_variance[:, 0].tolist(),
-            group_snp_counts=np.bincount(ss_result.groups).tolist(),
-            grm_normalizers=ss_result.normalizers.tolist(),
-            training_full_squared_term=float(np.mean(training_full_score**2)),
-            training_mse=float(np.mean((np.asarray(y_np, dtype=np.float64)-training_full_score)**2)),
-            iterations=ss_posterior.iterations, fit_seconds=ss_posterior.seconds,
-            total_refinement_seconds=ss_result.total_seconds,
-            setup_and_products_seconds=ss_result.setup_and_products_seconds,
-            initialization=ss_posterior.initialization,
-            numerical_attempts=ss_result.numerical_attempts,
-            linear_solver=ss_posterior.linear_solver,
-            pcg_diagnostics='Original BLUP initialization PCG; SS convergence is recorded separately.',
+        background_ss_summary = dict(background_rounds[-1], alternating_rounds=n_refinement_rounds,
+            rounds=background_rounds,
+            **{key:sum(row[key] for row in background_rounds) for key in
+                ('iterations', 'fit_seconds', 'total_refinement_seconds', 'setup_and_products_seconds')},
             paths={'posterior':ss_file, 'metadata':ss_metadata})
         atomic_json(ss_metadata, _json_safe_value(background_ss_summary))
-        logger.info('[background SS] converged in %s iterations, fit %.2fs, total refinement %.2fs',
-                    ss_posterior.iterations, ss_posterior.seconds, ss_result.total_seconds)
+
+        if args.alpha_vamp:
+            alpha_file = out_prefix+'.alpha_vamp.npz'
+            alpha_metadata = out_prefix+'.alpha_vamp.json'
+            posterior = alpha_result.posterior
+            np.savez(alpha_file, support=support,
+                source_snp_indices=grm_index.source_variant_indices(support),
+                alpha=prediction_alpha_active, old_alpha=beta_lasso_active,
+                previous_alpha=round_one_alpha['round1_alpha'],
+                posterior_variance=posterior.variance[:, 0], pip=posterior.pip[:, 0],
+                pi=posterior.pi[:, 0], slab_variance=posterior.slab_variance[:, 0],
+                train_alpha_score=alpha_result.training_sparse_score,
+                training_residual=alpha_result.residual, Q_s=alpha_result.summary['Q_s'],
+                trace_normalizer=alpha_result.summary['trace_normalizer'],
+                train_conditioning_background_score=conditioning_background_score,
+                native_train_background_score=np.asarray(native_background_effects.random_effect, dtype=np.float64),
+                gamma_fixed=beta_cov_lasso, theta_fixed=theta_lasso_ml,
+                alternating_rounds=n_refinement_rounds, **round_one_alpha)
+            alpha_vamp_summary = dict(alpha_rounds[-1], alternating_rounds=n_refinement_rounds,
+                rounds=[dict(round=i+1, alpha=a, background=b)
+                        for i, (a, b) in enumerate(zip(alpha_rounds, background_rounds))],
+                **{key:sum(row[key] for row in alpha_rounds) for key in
+                    ('iterations', 'fit_seconds', 'total_refinement_seconds')},
+                final_background_estimator='constrained_ss_em_vamp',
+                final_full_squared_term=background_ss_summary['training_full_squared_term'],
+                final_training_mse=background_ss_summary['training_mse'],
+                total_alternating_refinement_seconds=(sum(row['total_refinement_seconds'] for row in alpha_rounds)
+                    +background_ss_summary['total_refinement_seconds']),
+                inference_estimates_source='native covariance-aligned LASSO; prediction refinement is separate',
+                paths={'posterior':alpha_file, 'metadata':alpha_metadata})
+            atomic_json(alpha_metadata, _json_safe_value(alpha_vamp_summary))
+        # The two-round cache is no longer needed. Free it before held-out
+        # prediction allocates its own streamed genotype workspaces.
+        del ss_context, ss_result, ss_posterior, native_background_effects, initial_blup
     else:
         for suffix in ('.background_ss.npz', '.background_ss.json'):
             path = out_prefix+suffix
             if os.path.exists(path):
                 os.unlink(path)
 
-    if progressive_requested:
-        if args.background_ss:
-            final_squared_term = background_ss_summary['training_full_squared_term']
-            final_training_mse = background_ss_summary['training_mse']
-        else:
-            final_squared_term = progressive_alpha_summary['new_full_squared_term']
-            final_training_mse = progressive_alpha_summary['new_training_mse']
-        progressive_alpha_summary.update(
-            final_background_estimator='constrained_ss_em_vamp' if args.background_ss else 'native_conditional_blup',
-            final_full_squared_term=final_squared_term, final_training_mse=final_training_mse)
-        atomic_json(alpha_metadata, _json_safe_value(progressive_alpha_summary))
+    if not args.alpha_vamp:
+        for suffix in ('.alpha_vamp.npz', '.alpha_vamp.json'):
+            path = out_prefix+suffix
+            if os.path.exists(path):
+                os.unlink(path)
 
     if args.compute_effects:
         if not lasso_branch_valid or background_effects is None:
@@ -5516,17 +5518,16 @@ def main() -> None:
             "status": "emitted",
             "paths": effect_paths,
         }
-        if args.background_ss or progressive_requested:
+        if args.background_ss:
             for key, path in effect_paths.items():
                 if str(path).endswith('.json'):
                     with open(path) as handle:
                         metadata = json.load(handle)
-                    if args.background_ss:
-                        metadata['background_estimator'] = 'constrained_ss_em_vamp'
-                        metadata['background_ss_metadata'] = out_prefix+'.background_ss.json'
-                    if progressive_requested:
-                        metadata['sparse_estimator'] = 'progressive_ols_alpha'
-                        metadata['progressive_alpha_metadata'] = out_prefix+'.progressive_alpha.json'
+                    metadata['background_estimator'] = 'constrained_ss_em_vamp'
+                    metadata['background_ss_metadata'] = out_prefix+'.background_ss.json'
+                    if args.alpha_vamp:
+                        metadata['sparse_estimator'] = 'prior_Q_ss_em_vamp_alpha'
+                        metadata['alpha_vamp_metadata'] = out_prefix+'.alpha_vamp.json'
                     atomic_json(path, metadata)
 
     prediction_summary = {
@@ -5656,7 +5657,7 @@ def main() -> None:
                 max_pcg_iters=args.max_pcg_iters,
                 background_effects=background_effects,
                 background_refinement=background_ss_summary if args.background_ss else None,
-                alpha_refinement=progressive_alpha_summary if progressive_requested else None,
+                alpha_refinement=alpha_vamp_summary if args.alpha_vamp else None,
             )
 
     output_contract = _sparse_output_contract()
@@ -5828,7 +5829,7 @@ def main() -> None:
         "outer_history": history,
         "sparse_effects": sparse_effect_summary,
         "background_ss": background_ss_summary,
-        "progressive_alpha": progressive_alpha_summary,
+        "alpha_vamp": alpha_vamp_summary,
         "sparse_prediction": prediction_summary,
         "sparsity_validation": sparsity_validation_summary,
     }
@@ -5905,7 +5906,7 @@ def main() -> None:
         artifacts.append(args.lasso_warm_state_out)
     artifacts.extend(sparse_effect_summary.get("paths", {}).values())
     artifacts.extend(background_ss_summary.get('paths', {}).values())
-    artifacts.extend(progressive_alpha_summary.get('paths', {}).values())
+    artifacts.extend(alpha_vamp_summary.get('paths', {}).values())
     artifacts.extend(prediction_summary.get("paths", {}).values())
     artifacts.extend(sparsity_validation_summary.get("outputs", {}).values())
     summary["output_artifacts"] = output_manifest(artifacts)

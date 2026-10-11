@@ -1,4 +1,4 @@
-"""Matrix-free shifted sample solves and cached Onsager trace quadrature."""
+"""Selected-SNP spectral solves and matrix-free background trace quadrature."""
 from __future__ import annotations
 
 import time
@@ -8,6 +8,87 @@ import numpy as np
 
 from .pcg import pcg_solve
 from .slq import _set_row, _step
+
+
+class SupportPrecisionSolver:
+    """Exact SNP-space Gaussian module for a small selected support.
+
+    Stores an s-by-s eigensystem, never an n-by-n sample Gram. Natural
+    messages allow a negative extrinsic precision when the linear posterior
+    is positive definite. Rank-deficient designs retain their null space.
+    """
+    def __init__(self, products, sample_chunk_size=4096):
+        if not jax.config.jax_enable_x64:
+            raise RuntimeError('Enable jax_enable_x64 before support SS setup')
+        self.n, self.p = products.n, products.p
+        self.active = np.ones(self.p, bool)
+        size = min(int(sample_chunk_size), self.n)
+        if size < 1:
+            raise ValueError('Sample chunk size must be positive')
+        x = products.x
+        whole = self.n//size*size
+
+        @jax.jit
+        def build_gram(x):
+            def body(i, total):
+                block = jax.lax.dynamic_slice(x, (0, i*size), (self.p, size)).astype(jnp.float64)
+                return total+jnp.matmul(block, block.T, precision=jax.lax.Precision.HIGHEST)
+            gram = jax.lax.fori_loop(0, whole//size, body,
+                                    jnp.zeros((self.p, self.p), jnp.float64))
+            if whole < self.n:
+                block = x[:, whole:].astype(jnp.float64)
+                gram += jnp.matmul(block, block.T, precision=jax.lax.Precision.HIGHEST)
+            return gram
+
+        eig, vec = jnp.linalg.eigh(build_gram(x))
+        values = np.asarray(eig)
+        scale = max(float(values[-1]), 1.)
+        if values[0] < -1e-10*scale:
+            raise ArithmeticError('Indefinite support Gram')
+        self.values, self.vectors = jnp.maximum(eig, 0.), vec
+        self.trace_normalizer = float(np.sum(np.maximum(values, 0.))/self.n)
+        self.precision_safeguard_count = 0
+        self.last_diagnostics = dict(method='exact_support_spectrum',
+            rank=int(np.count_nonzero(values > 1e-12*scale)))
+
+    def prepare_natural_module(self, products, residual, noise):
+        self.noise = jnp.asarray(noise)
+        projected = self.vectors.T@products.transpose(residual)
+        values, vec, noise = self.values, self.vectors, self.noise
+
+        @jax.jit
+        def module(h2, gamma2):
+            denominator = values[:, None]+noise[None, :]*gamma2[None, :]
+            projected_h = vec.T@h2
+            mean = vec@((projected+noise[None, :]*projected_h)/denominator)
+            variance = noise*jnp.mean(1/denominator, axis=0)
+            eta2 = 1/variance
+            # This form avoids cancellation in eta2-gamma2 for very sparse pi.
+            precision = jnp.mean(values[:, None]/denominator, axis=0)/variance
+            message = ((eta2[None, :]*projected+
+                        (noise[None, :]*precision[None, :]-values[:, None])*projected_h)
+                       /denominator)
+            r = (vec@message)/precision[None, :]
+            return mean, precision, r, jnp.min(denominator, axis=0)
+        self._natural_module = module
+
+    def stabilize_eta(self, eta, gamma):
+        lower = gamma-self.values[0]/self.noise+1e-6*gamma
+        guarded = eta < lower
+        self.precision_safeguard_count += int(np.asarray(guarded).sum())
+        return jnp.maximum(eta, lower), guarded
+
+    def natural_module(self, h2, gamma2):
+        mean, precision, r, minimum = self._natural_module(h2, gamma2)
+        if (np.any(np.asarray(minimum) <= 0) or np.any(np.asarray(precision) <= 0)
+                or not np.all(np.isfinite(np.asarray(mean)))):
+            raise ArithmeticError('Nonpositive or nonfinite support linear posterior')
+        return mean, precision, r
+
+    def diagnostics(self):
+        return dict(self.last_diagnostics, sample_gram_materialized=False,
+            support_gram_shape=[self.p, self.p],
+            precision_safeguard_count=self.precision_safeguard_count)
 
 
 class MatrixFreeSampleSolver:

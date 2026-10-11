@@ -216,6 +216,7 @@ class BackgroundSSResult:
     numerical_attempts: list[dict] | None = None
     total_seconds: float | None = None
     setup_and_products_seconds: float | None = None
+    context: GroupedSSBackgroundContext | None = None
 
     @property
     def fitted_mean(self):
@@ -314,23 +315,27 @@ def refine_lasso_background_ss(context, *, y, alpha, gamma, covariates,
 
 def refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
                                  beta_active, beta_cov, theta, background_effects,
-                                 config=None):
+                                 config=None, context=None):
     """Automatic adapter for the final sparse pipeline's in-memory outputs.
 
     Reuses native streamed training products in logical GRM order, which is
     also the order of the native component BLUP vectors. Returns refined
     EffectEstimates directly usable by existing effect writers/predictors.
+    Pass the preceding result's context to reuse packed products and trace
+    quadrature across conditional rounds. Initialization remains the supplied
+    native BLUP; it is independent of the reused linear solver.
     """
     # Keep the native FP32 pipeline's global precision setting intact.
     from jax.experimental import enable_x64
     with enable_x64():
         return _refine_sparse_fit_background(fitter=fitter, grm_index=grm_index,
             y=y, covariates=covariates, support=support, beta_active=beta_active,
-            beta_cov=beta_cov, theta=theta, background_effects=background_effects, config=config)
+            beta_cov=beta_cov, theta=theta, background_effects=background_effects,
+            config=config, context=context)
 
 
 def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
-                                  beta_active, beta_cov, theta, background_effects, config):
+                                  beta_active, beta_cov, theta, background_effects, config, context):
     from dataclasses import asdict, replace
     began = time.monotonic()
     config = config or VAMPConfig(max_iterations=2000)
@@ -361,15 +366,21 @@ def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
     cache_bytes = getattr(getattr(fitter, 'cfg', None), 'packed_device_cache_bytes', None)
     if cache_bytes is None:
         cache_bytes = packed_device_cache_budget(budget)
-    # REML is complete. Reuse its reservation for SS's smaller FP64 blocks
-    # instead of holding two copies of the same compressed genotypes.
-    for streamer in getattr(fitter, 'streamers', ()):
-        release = getattr(streamer, 'release_packed_device_cache', None)
-        if release is not None:
-            release()
-    products = StreamedGenotypeProducts(grm_index, n, normalizers, block_bytes=block_bytes,
-                                        device_cache_bytes=cache_bytes)
-    context = GroupedSSBackgroundContext(products, groups, normalizers)
+    if context is None:
+        # REML is complete. Reuse its reservation for SS's smaller FP64 blocks
+        # instead of holding two copies of the same compressed genotypes.
+        for streamer in getattr(fitter, 'streamers', ()):
+            release = getattr(streamer, 'release_packed_device_cache', None)
+            if release is not None:
+                release()
+        products = StreamedGenotypeProducts(grm_index, n, normalizers, block_bytes=block_bytes,
+                                            device_cache_bytes=cache_bytes)
+        context = GroupedSSBackgroundContext(products, groups, normalizers)
+    elif (context.products.n != n or context.products.p != p
+            or getattr(context.products, 'index', None) is not grm_index
+            or not np.array_equal(context.groups, groups)
+            or not np.array_equal(context.normalizers, normalizers)):
+        raise ValueError('Reused SS context must have the same training index and GRM partition')
     result = refine_lasso_background_ss(context, y=y, alpha=alpha, gamma=beta_cov,
         covariates=covariates, blup=initial, variance_components=theta, config=config)
     attempts = [dict(status=result.posterior.status, iterations=result.posterior.iterations,
@@ -385,6 +396,7 @@ def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
         attempts.append(dict(status=result.posterior.status, iterations=result.posterior.iterations,
                              seconds=result.posterior.seconds, config=asdict(retry)))
     result.numerical_attempts = attempts
+    result.context = context
     if result.posterior.status != ['converged']:
         raise RuntimeError('SS background refinement did not converge; outputs rejected')
     beta = result.posterior.mean[:, 0]

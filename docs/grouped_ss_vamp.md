@@ -1,8 +1,9 @@
 # Fixed-foreground grouped spike-and-slab EM-VAMP
 
-`grouped_ss_vamp.py` implements background inference with a fixed LASSO
-foreground. It does not update alpha, gamma, the REML components or noise.
-The sparse workflow consumes this kernel directly after its native fit.
+`grouped_ss_vamp.py` implements constrained SS EM-VAMP, shared by background
+inference and [support-alpha refinement](alpha_vamp.md). The background adapter
+fixes the current prediction alpha, gamma, REML components and noise.
+The sparse workflow consumes the kernel after its native fit and any alpha update.
 Native output metadata records the initialization, numerical attempts,
 variance constraint and fixed-parameter declarations.
 
@@ -163,10 +164,13 @@ Both sparse CLI entry points accept `--background-ss` and
 LASSO/variance fit, the pipeline computes its native BLUP and calls
 `background_ss.refine_sparse_fit_background` with the in-memory final
 support, prediction alpha, native gamma, theta, training phenotype and component
-BLUP vectors. With `--progressive-alpha`, validation selection and the
-combined-sample OLS refit both freeze their cohort's native conditional BLUP.
-Only the final combined fit runs SS, after OLS, on the residual formed with
-the updated alpha. It reuses the existing native BLUP for initialization.
+BLUP vectors. With `--alpha-vamp`, only the final combined fit runs two
+conditional alpha/background rounds. The first alpha fit holds native BLUP
+fixed; the second holds the first background SS mean fixed. Background SS
+uses the current alpha residual and the same native BLUP initialization in
+both rounds. The adapter reuses its streamed products and fixed trace
+quadrature through the preceding result's `context`; it does not carry EM
+parameters between fits. See [prior-Q alpha VAMP](alpha_vamp.md).
 The adapter reuses native training-standardized operators in logical GRM
 order and calculates the residual itself. A scoped FP64 context preserves
 the surrounding pipeline precision setting.
@@ -241,7 +245,7 @@ models on the same cohort can reuse a context and cached trace quadrature.
 
 ## Verification
 
-`tests/test_grouped_ss_vamp.py` checks scalar posteriors against mixture
+In the separate validation workspace, `tests/test_grouped_ss_vamp.py` checks scalar posteriors against mixture
 densities and numerical derivatives; constrained roots against an independent
 optimizer; chunk products and sample solves against dense CPU references;
 the trace identity; the Gaussian multigroup limit against exact BLUP;
@@ -250,7 +254,7 @@ case against its exact posterior with both zero and BLUP initializations;
 initial message inversion against independent SciPy roots; and rejection of
 invalid initial effect arrays. The native adapter checks all prior constraints
 and rejects unconverged results. Real-file end-to-end tests independently
-check that SS and OLS coefficients reproduce held-out prediction components
+check that SS and alpha VAMP coefficients reproduce held-out prediction components
 using training-only normalization, and verify the completed outputs and resume
 contract without supplying test phenotypes.
 `tests/test_ss_linear.py` independently checks positive-shift solves and

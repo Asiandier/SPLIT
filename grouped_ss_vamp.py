@@ -1,8 +1,10 @@
 """GPU EM-VAMP for a fixed residual and grouped SS priors.
 
 The prior constrains pi[g] * slab_variance[g] = theta[g] / M[g].
-The Gaussian likelihood uses all groups jointly. No foreground parameters,
-noise variance or hyperpriors are estimated here. Genotypes are SNP-major.
+The Gaussian likelihood uses all groups jointly, with fixed noise and no
+hyperpriors. The inferred effects can represent background SNPs or a selected
+alpha support; the latter can include known-zero outside-support EM counts.
+Genotypes are SNP-major.
 
 References: Rangan et al., arXiv:1610.03082 (VAMP); Fletcher and Schniter,
 arXiv:1602.08207 (EM-VAMP); Varadhan and Roland,
@@ -20,7 +22,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from .ss_linear import MatrixFreeSampleSolver
+from .ss_linear import MatrixFreeSampleSolver, SupportPrecisionSolver
 
 
 @jax.jit
@@ -206,10 +208,11 @@ class VAMPResult:
 
 
 def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
-                        normalizers, noise_variance, linear_solver: MatrixFreeSampleSolver,
+                        normalizers, noise_variance,
+                        linear_solver: MatrixFreeSampleSolver | SupportPrecisionSolver,
                         config: VAMPConfig | None = None,
                         callback: Callable[[dict], None] | None = None,
-                        initial_mean=None) -> VAMPResult:
+                        initial_mean=None, *, em_counts=None) -> VAMPResult:
     """Fit a batch of cases with identical active groups, without test data.
 
     theta is (G, cases), residual is (n, cases), noise is (cases,). A single
@@ -220,6 +223,8 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
     constrained zero-theta entries are masked to zero even if supplied nonzero.
     Stops on *undamped* message, module agreement, precision and constrained
     EM fixed-point errors, rather than merely small damped iterate changes.
+    em_counts optionally includes known-zero inclusion indicators outside the
+    modeled support. These affect EM and evidence, never Onsager averages.
     """
     config = config or VAMPConfig()
     if not jax.config.jax_enable_x64:
@@ -258,7 +263,14 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
             or groups_host.shape != (products.p,)
             or groups_host.min() < 0 or groups_host.max() >= ng):
         raise ValueError('groups must assign every SNP to an integer group in theta')
-    counts_host = np.bincount(groups_host, minlength=ng).astype(float)
+    modeled_counts_host = np.bincount(groups_host, minlength=ng).astype(float)
+    counts_host = modeled_counts_host.copy()
+    if em_counts is not None:
+        counts_host = np.asarray(em_counts, float)
+        if (counts_host.shape != (ng,) or not np.all(np.isfinite(counts_host))
+                or np.any(counts_host < modeled_counts_host)
+                or np.any(counts_host != np.floor(counts_host))):
+            raise ValueError('EM counts must cover all modeled and known-zero SNPs')
     norm_host = np.asarray(normalizers, float)
     noise_host = np.atleast_1d(np.asarray(noise_variance, float))
     if (y_host.shape != (products.n, batch) or groups_host.shape != (products.p,)
@@ -269,7 +281,7 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
             or not np.all(np.isfinite(norm_host))
             or np.any(t_host < 0) or not np.all(np.isfinite(t_host))):
         raise ValueError('Inconsistent dimensions or invalid model parameters')
-    if np.any(counts_host == 0):
+    if np.any(modeled_counts_host == 0):
         raise ValueError('Every modeled group must contain at least one SNP')
     if np.any((norm_host == 0) & np.any(t_host > 0, axis=1)):
         raise ValueError('Active groups require positive GRM normalizers')
@@ -286,6 +298,7 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
     d_host = t_host/np.where(norm_host > 0, norm_host, 1.)[:, None]
     d = jax.device_put(d_host)
     counts = jax.device_put(counts_host[:, None])
+    outside_counts = jax.device_put((counts_host-modeled_counts_host)[:, None])
     noise = jax.device_put(noise_host)
     pi = jnp.where(d > 0, config.initial_pi, 0.)
     slab = jnp.where(d > 0, d/jnp.maximum(pi, config.pi_min), 0.)
@@ -296,6 +309,9 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
     initialization = dict(method='zero', initial_pi=np.asarray(pi).T.tolist(),
                           initial_slab_variance=np.asarray(slab).T.tolist(),
                           initial_message_precision=np.asarray(gamma1).tolist())
+    natural_module = isinstance(linear_solver, SupportPrecisionSolver)
+    if natural_module:
+        linear_solver.prepare_natural_module(products, y, noise)
     if initial_mean is not None:
         target_host = np.asarray(initial_mean, float)
         if target_host.ndim == 1:
@@ -325,17 +341,21 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
         slab = jnp.where(d > 0, d/jnp.maximum(prob, config.pi_min), 0.)
         return spike_slab_denoise(r, gam[None, :], prob[group_ids], slab[group_ids])
 
+    def prior_evidence(evidence, prob):
+        outside_prob = jnp.where(outside_counts > 0, prob, 0.)
+        return reduce_group(evidence)+outside_counts*jnp.log1p(-outside_prob)
+
     @jax.jit
     def em_map(r, gam, prob):
         mean, var, pip, mu, s2, evidence = posterior(r, gam, prob)
         a = reduce_group(pip)
         b = reduce_group(pip*(s2+mu*mu))
         new_pi, _ = constrained_ss_m_step(a, b, counts, d, config.pi_min)
-        return new_pi, reduce_group(evidence)
+        return new_pi, prior_evidence(evidence, prob)
 
     @jax.jit
     def evidence_at(r, gam, prob):
-        return reduce_group(posterior(r, gam, prob)[-1])
+        return prior_evidence(posterior(r, gam, prob)[-1], prob)
 
     @jax.jit
     def learn_prior(r, gam, prob):
@@ -406,17 +426,24 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
             slab = jnp.where(d > 0, d/jnp.maximum(pi, config.pi_min), 0.)
         m1, _, _, alpha1, em_error = nonlinear(r1, gamma1, pi)
         alpha_host = np.asarray(alpha1)
-        if np.any(~np.isfinite(alpha_host)) or np.any(alpha_host <= 0) or np.any(alpha_host >= 1):
+        if (np.any(~np.isfinite(alpha_host)) or np.any(alpha_host <= 0)
+                or (not natural_module and np.any(alpha_host >= 1))):
             raise ArithmeticError(f'Invalid nonlinear Onsager divergence at {iteration}: {alpha_host}')
-        gamma2 = gamma1*(1-alpha1)/alpha1
-        r2 = jnp.where(active, (m1-alpha1[None, :]*r1)/(1-alpha1)[None, :], 0.)
-        rhs = y-linear_products.forward(r2)
-        solved, trace_fraction = linear_solver.solve_and_trace(rhs, gamma2*noise)
-        correction = jnp.where(active, linear_products.transpose(solved), 0.)
-        m2 = r2+correction
-        # Avoid subtracting nearly equal quantities when p >> n.
-        gamma_proposed = gamma2*trace_fraction/(1-trace_fraction)
-        r_proposed = r2+correction/trace_fraction[None, :]
+        if natural_module:
+            eta1, guarded = linear_solver.stabilize_eta(gamma1/alpha1, gamma1)
+            gamma2 = eta1-gamma1
+            h2 = eta1[None, :]*m1-gamma1[None, :]*r1
+            m2, gamma_proposed, r_proposed = linear_solver.natural_module(h2, gamma2)
+        else:
+            gamma2 = gamma1*(1-alpha1)/alpha1
+            r2 = jnp.where(active, (m1-alpha1[None, :]*r1)/(1-alpha1)[None, :], 0.)
+            rhs = y-linear_products.forward(r2)
+            solved, trace_fraction = linear_solver.solve_and_trace(rhs, gamma2*noise)
+            correction = jnp.where(active, linear_products.transpose(solved), 0.)
+            m2 = r2+correction
+            # Avoid subtracting nearly equal quantities when p >> n.
+            gamma_proposed = gamma2*trace_fraction/(1-trace_fraction)
+            r_proposed = r2+correction/trace_fraction[None, :]
         message_error = relative_norm(r_proposed, r1)
         module_error = relative_norm(m2, m1)
         precision_error = jnp.abs(gamma_proposed-gamma1)/gamma1
@@ -428,6 +455,8 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
         eligible = (iteration >= config.min_iterations and
                     (not config.learn_pi or iteration > config.em_warmup))
         good = np.max(errors[:3], axis=0) < config.tolerance
+        if natural_module:
+            good &= ~np.asarray(guarded)
         if config.learn_pi:
             good &= (errors[3] < config.em_tolerance) & (errors[4] < config.em_tolerance)
         stable = np.where(good & eligible, stable+1, 0)
@@ -452,6 +481,9 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
                        prior_variance_components=np.asarray(pi*slab*norm_host[:, None]).T.tolist(),
                        prior_constraint_max_relative_error=float(constraint.max()),
                        linear_solver=linear_solver.last_diagnostics)
+            if natural_module:
+                row['precision_guarded'] = np.asarray(guarded).tolist()
+                row['precision_safeguard_count'] = linear_solver.precision_safeguard_count
             trace.append(row)
             if callback:
                 callback(row)
