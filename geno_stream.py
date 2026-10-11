@@ -2745,6 +2745,16 @@ class GenoBlockStreamer:
             normalize=normalize, eff_m=self._eff_m_const,
         )
 
+    def xv(self, effects: jnp.ndarray) -> jnp.ndarray:
+        """Training-standardized genotype forward product, without a design copy."""
+        self._prepare_kv_pass()
+        effects = _ensure_on_device(effects, self.dev)
+        from .kv_impl import xv_impl_streamed
+        return xv_impl_streamed(effects, self._snp_starts_dev, self._true_widths_dev,
+            self._means_by_call, self._inv_by_call, n=self.n, m=self.m,
+            n_calls=self._n_calls, pop_block=self._pop_cached,
+            missing_val=int(self._missing_val))
+
     def extract_standardized_columns(self, snp_indices: np.ndarray) -> np.ndarray:
         uniq_idx, inverse, call_ids, starts = self._prepare_standardized_column_requests(
             snp_indices,

@@ -17,7 +17,7 @@ Native GRMs use `K_g=A_g@A_g.T/M_g`. The constraint is
 `Cov(A_g beta_g | A)=theta_g K_g`. This does not fix the variance of the
 posterior mean prediction or of the approximate posterior distribution.
 Zero-theta groups have exactly zero background effects and are omitted from
-Onsager averages and the sample Gram. Other groups still use **all group
+Onsager averages and the sample-space operator. Other groups still use **all group
 SNPs** as the Bernoulli denominator, including the original LASSO support.
 
 ## Constrained EM
@@ -58,26 +58,59 @@ violate the rotational assumptions of VAMP theory.
 
 ## GPU computation
 
-One exact genotype-derived sample eigensystem is cached per active group
-pattern. Each has size `n*n`, not `p*p`.
+`ss_linear.py` implements a matrix-free linear module, reused per active group
+pattern and numerical configuration. The native adapter exposes streamed
+`A @ v`, `A.T @ u`, `G @ u` and diagonal products using the existing packed
+or sparse genotype cache; it does not construct the standardized full design.
 With `G=A_active@A_active.T`, `lambda=gamma2*sigma_e_squared`,
 
 ```
 u = (G + lambda I)^(-1) @ (r - A @ r2)
 m2 = r2 + A.T @ u
-t = sum(eigenvalues/(eigenvalues+lambda))/p_active
+t = trace(G @ (G + lambda I)^(-1))/p_active
 gamma1_candidate = gamma2*t/(1-t)
 r1_candidate = r2 + A.T@u/t
 ```
 
-The exact eigenspectrum supplies the Onsager trace, with no trace probes.
-Eigenvectors stay on the device after GPU decomposition; their constructor
-does not transfer the full matrix to the host and back. Sample-Gram chunks
-reuse a donated accumulator and one shared compiled kernel across contexts.
+PCG computes `u` in FP64 with a Jacobi preconditioner, a warm start and
+verification against the true residual of the same streamed operator.
+The default relative tolerance is `1e-9`, with at most 400 iterations. An
+unresolved solve raises an error rather than accepting inexact coefficients.
+
+The Onsager trace uses fixed randomly signed Walsh columns sampled without
+replacement from a power-of-two population enclosing the sample dimension.
+Each sign probe has norm squared `n`, and the complete population satisfies
+`mean(z z.T)=I`. A complete population is used when its size is at most 128;
+larger cohorts default to 32 probes. This is an unbiased trace sampling scheme
+before quadrature error. A fixed seed makes the approximation a consistent
+function of the shift throughout EM-VAMP.
+
+One Lanczos pass per probe caches only small nodes and weights. Shift
+invariance lets every later VAMP iteration evaluate `x/(x+lambda)` on these
+nodes without additional trace-specific genotype scans. Two-pass
+reorthogonalization stabilizes the recurrence. Gauss quadrature and
+zero-anchored Gauss-Radau bracket the positive-shift trace functional. Their
+mean relative gap must be at most `1e-6`; otherwise the fit rejects the result
+and asks for more Lanczos steps. The finite-population sampling standard error
+is reported separately: a small quadrature gap does not establish an exact
+trace or remove sampling uncertainty. Increase probes to reduce that source
+of error. The default Lanczos depth is 64.
+
+Trace setup batches at most eight probes, retaining only one batch's basis.
+Its additional workspace is `O(n * depth * batch_width)`; PCG uses `O(n * cases)`
+vectors, and SS messages and moments use `O(p * cases)` vectors. Small cached
+quadratures cost `O(probes * depth)`; their eigendecompositions have dimension
+at most `depth+1`. No `n*n` matrix, sample eigendecomposition or `p*p` matrix is
+formed. Native packed genotype calls are subdivided when needed to bound FP64
+decode buffers. The trace workspace defaults to 256 MiB, adjusted to hold one
+probe and capped at one eighth of the native GPU budget. An insufficient
+one-probe budget fails explicitly. The original packed/sparse host cache is
+still required; matrix-free inference does not eliminate genotype I/O.
+
 Messages are damped in natural coordinates `(gamma1, gamma1*r1)`.
-FP32 genotypes remain resident; 4096-SNP chunks are cast to FP64 for both
-products. Enable `jax_enable_x64` before fitting. A whole FP64 genotype
-conversion and transpose would require considerably more device memory.
+Products decode bounded genotype blocks with FP64 arithmetic and retain
+native training standardization statistics and logical SNP order. Enable
+`jax_enable_x64` before using the standalone inference API.
 
 Stopping requires undamped message residual, agreement of the nonlinear
 and linear posterior means, precision residual, the constrained EM-map
@@ -118,11 +151,13 @@ eventual fixed point.
 ## Native sparse pipeline integration
 
 Both sparse CLI entry points accept `--background-ss` and
-`--background-ss-max-iterations` (default 2000). After the final valid
+`--background-ss-max-iterations` (default 2000), plus
+`--background-ss-pcg-tol`, `--background-ss-trace-probes` and
+`--background-ss-lanczos-steps`. After the final valid
 LASSO/variance fit, the pipeline computes its native BLUP and calls
 `background_ss.refine_sparse_fit_background` with the in-memory final
 support, alpha, gamma, theta, training phenotype and component BLUP vectors.
-The adapter constructs the training-standardized design in logical GRM
+The adapter reuses native training-standardized operators in logical GRM
 order and calculates the residual itself. A scoped FP64 context preserves
 the surrounding pipeline precision setting.
 
@@ -131,7 +166,7 @@ normalizer M comes from the native GRM streamer and can exclude constant
 variants; P and M need not be equal. A constant-only group with M=0 is
 accepted only when its theta is zero. Zero-theta groups remain exactly zero
 even when a supplied initialization is nonzero. All-zero background models
-return analytically, with no spectral decomposition.
+return analytically, with no iterative linear solve or trace setup.
 
 The returned `EffectEstimates` contains SS background coefficients and
 training predictions, so existing effect exports and held-out genotype
@@ -152,22 +187,26 @@ Additional output files:
 - `<prefix>.background_ss.npz`: original BLUP, SS means/PIPs/variances,
   pi/slab variances, theta, group assignments, M and source SNP indices.
 - `<prefix>.background_ss.json`: method, initialization errors, iteration
-  count, fit time and fixed-parameter declarations.
+  count, fit time, fixed-parameter declarations, linear-solver residuals,
+  quadrature gaps, probe settings and sampling uncertainty.
 - The native summary, effect metadata and prediction metadata identify the
   estimator as `constrained_ss_em_vamp`. The historical prediction column
   `lasso_background_blup` holds the SS background when this flag is enabled.
 
 For repeated models on one cohort, construct and retain a
-`GroupedSSBackgroundContext` instead of materializing the design for each
-fit. The arrays below use native training-standardized phenotype and SNP
-scales. Batches must share their active group pattern.
+`GroupedSSBackgroundContext` with a reusable streamed product object. A small
+resident SNP-major array remains supported by the numerical API. The inputs
+below use native training-standardized phenotype and SNP scales. Batches must
+share their active group pattern.
 
 ```python
 import jax
 from GPU_REML import GroupedSSBackgroundContext, refine_lasso_background_ss
+from GPU_REML.background_ss import StreamedGenotypeProducts
 
 jax.config.update('jax_enable_x64', True)
-context = GroupedSSBackgroundContext(x_snp_major, groups, native_grm_normalizers)
+products = StreamedGenotypeProducts(grm_index, n_train, native_grm_normalizers)
+context = GroupedSSBackgroundContext(products, groups, native_grm_normalizers)
 result = refine_lasso_background_ss(
     context, y=y_train, alpha=lasso_alpha, gamma=lasso_gamma,
     covariates=c_train, blup=native_blup_beta,
@@ -177,17 +216,18 @@ assert result.posterior.status == ['converged']
 beta_background = result.posterior.mean[:, 0]
 ```
 
-The exact sample spectrum and resident training design require sufficient
-GPU memory. The present BLUP initialization is designed for p much larger
+The present BLUP initialization is designed for p much larger
 than n; initialization outside the admissible VAMP divergence range is
 rejected. No universal convergence guarantee is claimed for arbitrary LD
 or dense models with p smaller than n.
 
-On a fresh cohort, constructing the full training design and exact sample
-Gram/eigenspectrum adds setup work before VAMP iterations. The native
+On a fresh cohort, Lanczos trace setup scans the streamed genotype operator
+before VAMP iterations. Each PCG iteration then applies that operator, so this
+implementation can cost more genotype passes than a small-cohort dense solver.
+Memory scalability alone does not establish biobank throughput. The native
 metadata separates total refinement time from posterior fit time, and
 records setup plus foreground/component products separately. Repeated
-models on the same cohort can reuse a context and cached spectra.
+models on the same cohort can reuse a context and cached trace quadrature.
 
 ## Verification
 
@@ -203,12 +243,17 @@ and rejects unconverged results. Real-file end-to-end tests independently
 check that SS and OLS coefficients reproduce held-out prediction components
 using training-only normalization, and verify the completed outputs and resume
 contract without supplying test phenotypes.
+`tests/test_ss_linear.py` independently checks positive-shift solves and
+complete-population traces against dense references, stochastic trace errors,
+bounded block requests, missing-value forward/transpose adjoints for dense and
+sparse sources, and explicit rejection of unresolved PCG or quadrature.
 
 References:
 
 - VAMP: https://arxiv.org/abs/1610.03082
 - EM-VAMP: https://arxiv.org/abs/1602.08207
 - Genomic VAMP: https://pmc.ncbi.nlm.nih.gov/articles/PMC13174228/
+- Genomic SLQ: https://pmc.ncbi.nlm.nih.gov/articles/PMC6668092/
 - SQUAREM: https://onlinelibrary.wiley.com/doi/10.1111/j.1467-9469.2007.00585.x
 
 This is a new JAX implementation with a grouped constrained prior, not a

@@ -1385,6 +1385,25 @@ class SparseGenoBlockStreamer(GenoBlockStreamer):
 
         return acc[:, 0] if squeeze else acc
 
+    def xv(self, effects: jnp.ndarray) -> jnp.ndarray:
+        """Forward product using the resident sparse shards and training statistics."""
+        self._prepare_kv_pass()
+        effects = _ensure_on_device(effects, self.dev)
+        squeeze = effects.ndim == 1
+        if squeeze:
+            effects = effects[:, None]
+        if effects.ndim != 2 or effects.shape[0] != self.m:
+            raise ValueError('Genotype forward product requires effects with shape (m, rhs)')
+        from .kv_impl import sparse_xv_shard
+        total = jnp.zeros((self.n, effects.shape[1]), effects.dtype)
+        for host, ex in self._iter_sparse_exec_pairs('xtv'):
+            start, size = int(host['_host_snp_off']), int(host['_host_m'])
+            total += sparse_xv_shard(effects[start:start+size], n=self.n,
+                mean=ex['mean'], inv=ex['inv'], csc_all_rows=ex['csc_all_rows'],
+                csc_all_cols=ex['csc_all_cols'], csc_all_vals=ex['csc_all_vals'])
+            total.block_until_ready()
+        return total[:, 0] if squeeze else total
+
     def xtv(self, V: jnp.ndarray, normalize: bool = False) -> jnp.ndarray:
         self._prepare_kv_pass()
         V = _ensure_on_device(V, self.dev)

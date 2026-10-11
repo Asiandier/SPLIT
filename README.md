@@ -627,10 +627,14 @@ variance components and original BLUP remain the reference.
 The GPU background SS implementation is `grouped_ss_vamp.py`; its model,
 constrained EM update, sample-space VAMP solver, numerical checks and limits
 are described in [grouped SS EM-VAMP](docs/grouped_ss_vamp.md).
-This optional refinement keeps the genotype design resident and caches an
-exact sample Gram eigensystem. Its memory scales as `O(n*p + n*n)` and its
-one-time eigendecomposition as `O(n^3)`; these requirements are separate from
-the streamed, matrix-free REML engine. It never forms a `p*p` LD matrix.
+This refinement shares the native streamed genotype operators with REML.
+PCG solves shifted sample-space systems, and fixed-probe Lanczos quadrature
+caches only small tridiagonal eigensystems for the VAMP Onsager trace.
+It constructs neither a full standardized genotype design nor an `n*n` sample
+Gram or `p*p` LD matrix. Additional workspaces scale linearly with sample and
+SNP counts for fixed probe batch width and Lanczos depth; the original packed
+host genotype cache remains part of the native streaming workflow.
+The statistical model and background variance constraints are unchanged.
 
 Add `--background-ss` to the sparse pipeline command to run this refinement
 automatically after the final LASSO refit. The pipeline supplies the final
@@ -639,6 +643,15 @@ posterior means then feed the existing effect writer and prediction path.
 `--background-ss-max-iterations` defaults to 2000. With `--background-ss` alone,
 the high level `run_sparse_pipeline` command refines only the final combined
 sample fit. It adds no validation tuning step.
+
+Numerical settings are `--background-ss-pcg-tol` (default `1e-9`),
+`--background-ss-trace-probes` (32), and `--background-ss-lanczos-steps` (64).
+Metadata reports verified PCG residuals, Gauss/Radau quadrature gaps and trace
+sampling standard errors separately. Small cohorts use the complete trace
+probe population; larger cohorts use a stochastic trace approximation.
+Insufficient solves or quadrature accuracy raise an error. This removes the
+dense-memory bottleneck; actual biobank runtime still depends on the number
+of streamed genotype passes and numerical conditioning.
 
 The additional `<prefix>.background_ss.npz` and `.background_ss.json` retain
 the original BLUP initialization, posterior moments, group parameters and

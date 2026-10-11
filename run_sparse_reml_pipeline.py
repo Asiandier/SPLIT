@@ -854,6 +854,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--background-ss', action='store_true',
                    help='Refine the final LASSO background with variance-constrained SS EM-VAMP, initialized from native BLUP.')
     p.add_argument('--background-ss-max-iterations', type=int, default=2000)
+    p.add_argument('--background-ss-pcg-tol', type=float, default=1e-9)
+    p.add_argument('--background-ss-trace-probes', type=int, default=32)
+    p.add_argument('--background-ss-lanczos-steps', type=int, default=64)
     progressive = p.add_mutually_exclusive_group()
     progressive.add_argument('--progressive-alpha-select', action='store_true',
         help='After background SS, select a strongest-LASSO OLS prefix by full validation corr-squared.')
@@ -3143,6 +3146,9 @@ def main() -> None:
         args.background_ss = True
     if args.background_ss_max_iterations < 1:
         raise SystemExit('background-ss-max-iterations must be positive.')
+    if (not 0 < args.background_ss_pcg_tol < 1
+            or args.background_ss_trace_probes < 1 or args.background_ss_lanczos_steps < 1):
+        raise SystemExit('Invalid background SS matrix-free numerical settings.')
     if args.progressive_alpha_k is not None and args.progressive_alpha_k < 0:
         raise SystemExit('progressive-alpha-k must be nonnegative.')
     if args.progressive_alpha_select and (args.lasso_fixed_lam_ratio is not None
@@ -5342,7 +5348,10 @@ def main() -> None:
             fitter=fitter, grm_index=grm_index, y=y_np, covariates=covar_np,
             support=support, beta_active=beta_lasso_active, beta_cov=beta_cov_lasso,
             theta=theta_lasso_ml, background_effects=background_effects,
-            config=ss_core.VAMPConfig(max_iterations=args.background_ss_max_iterations))
+            config=ss_core.VAMPConfig(max_iterations=args.background_ss_max_iterations,
+                linear_pcg_tolerance=args.background_ss_pcg_tol,
+                trace_probes=args.background_ss_trace_probes,
+                trace_lanczos_steps=args.background_ss_lanczos_steps))
         ss_file = out_prefix+'.background_ss.npz'
         ss_metadata = out_prefix+'.background_ss.json'
         ss_posterior = ss_result.posterior
@@ -5365,6 +5374,7 @@ def main() -> None:
             setup_and_products_seconds=ss_result.setup_and_products_seconds,
             initialization=ss_posterior.initialization,
             numerical_attempts=ss_result.numerical_attempts,
+            linear_solver=ss_posterior.linear_solver,
             pcg_diagnostics='Original BLUP initialization PCG; SS convergence is recorded separately.',
             paths={'posterior':ss_file, 'metadata':ss_metadata})
         atomic_json(ss_metadata, _json_safe_value(background_ss_summary))

@@ -439,6 +439,36 @@ def xtv_impl_streamed(
     return out[:, 0] if squeeze else out
 
 
+@jax.jit
+def _xv_call_accumulate(acc, packed, width, means, inv, effects, start, missing):
+    indices = start+jnp.arange(means.shape[0], dtype=start.dtype)
+    block = jnp.take(effects, indices, axis=0, mode='fill', fill_value=0)
+    return acc+_zxb_multi_one_call_jit(packed, width, means, inv, block, missing)
+
+
+def xv_impl_streamed(effects, snp_starts, true_widths, means_by_call, inv_by_call,
+                     *, n, m, n_calls, pop_block, missing_val=3):
+    """Stream X @ effects using training normalization and caller precision."""
+    squeeze = effects.ndim == 1
+    if squeeze:
+        effects = effects[:, None]
+    if effects.ndim != 2 or effects.shape[0] != m:
+        raise ValueError('Genotype forward product requires effects with shape (m, rhs)')
+    dev = next(iter(effects.devices()))
+    total = jnp.zeros((n, effects.shape[1]), effects.dtype)
+    missing = jnp.asarray(missing_val, jnp.uint8)
+    if n_calls:
+        pending = _device_put_block(pop_block(0), dev)
+        for call in range(n_calls):
+            packed = pending
+            if call+1 < n_calls:
+                pending = _device_put_block(pop_block(call+1), dev)
+            total = _xv_call_accumulate(total, packed, true_widths[call],
+                means_by_call[call], inv_by_call[call], effects, snp_starts[call], missing)
+            del packed
+    return total[:, 0] if squeeze else total
+
+
 def xtv_impl_multi_streamed(
     V: Array,
     streamers: Sequence[object],
@@ -818,6 +848,18 @@ def _sparse_kv_global_mono(
 
 
 _sparse_xtv_global_mono_jit = jax.jit(_sparse_xtv_global_mono, static_argnames=("m",))
+
+
+@partial(jax.jit, static_argnames=('n',))
+def sparse_xv_shard(effects, *, n, mean, inv, csc_all_rows, csc_all_cols, csc_all_vals):
+    """Forward sparse genotype product, including centering and missing imputation."""
+    fp = effects.dtype
+    mean, inv = mean.astype(fp), inv.astype(fp)
+    values = _sparse_values_as_fp(csc_all_vals, csc_all_cols, mean, fp)
+    weighted = inv[:, None]*effects
+    raw = _segment_sum_or_zeros(values[:, None]*weighted[csc_all_cols],
+        csc_all_rows, num_segments=n, dtype=fp)
+    return raw-(mean@weighted)[None, :]
 
 
 def sparse_xtv_shard(

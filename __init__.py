@@ -11,7 +11,7 @@ _EXPORTS: dict[str, str] = {
     "VAMPConfig": ".grouped_ss_vamp",
     "VAMPResult": ".grouped_ss_vamp",
     "GenotypeProducts": ".grouped_ss_vamp",
-    "SampleSpectrum": ".grouped_ss_vamp",
+    "MatrixFreeSampleSolver": ".ss_linear",
     "fit_grouped_ss_vamp": ".grouped_ss_vamp",
     "GenoBlockSource": ".geno_source",
     "BedGenoSource": ".geno_source",

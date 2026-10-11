@@ -443,6 +443,11 @@ def _low_level_command(
             command.extend(['--progressive-alpha-k', str(int(progressive_k))])
         else:
             raise ValueError('Progressive alpha final refit requires a validation-selected prefix count')
+    if getattr(args, 'progressive_alpha', False) or (final_outputs and getattr(args, 'background_ss', False)):
+        for option, value in [('pcg-tol', getattr(args, 'background_ss_pcg_tol', 1e-9)),
+                              ('trace-probes', getattr(args, 'background_ss_trace_probes', 32)),
+                              ('lanczos-steps', getattr(args, 'background_ss_lanczos_steps', 64))]:
+            command.extend([f'--background-ss-{option}', str(value)])
     if final_outputs:
         if getattr(args, 'background_ss', False) and not getattr(args, 'progressive_alpha', False):
             command.extend(['--background-ss', '--background-ss-max-iterations', str(args.background_ss_max_iterations)])
@@ -1026,6 +1031,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--background-ss', action='store_true',
                         help='Apply BLUP-initialized constrained SS after the final combined-sample LASSO refit.')
     parser.add_argument('--background-ss-max-iterations', type=int, default=2000)
+    parser.add_argument('--background-ss-pcg-tol', type=float, default=1e-9)
+    parser.add_argument('--background-ss-trace-probes', type=int, default=32)
+    parser.add_argument('--background-ss-lanczos-steps', type=int, default=64)
     parser.add_argument('--progressive-alpha', action='store_true',
         help='Run background SS on training samples, select a joint OLS prefix by validation corr-squared, then refit SS and that prefix count on combined samples.')
     parser.add_argument("--out-prefix", required=True)
@@ -1088,6 +1096,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error("Prediction covariate/keep inputs require prediction genotype.")
     positive_integer_names = (
         "background_ss_max_iterations",
+        "background_ss_trace_probes",
+        "background_ss_lanczos_steps",
         "ld_window_kb",
         "ld_rank_bins",
         "n_lambda",
@@ -1113,6 +1123,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     for name in positive_integer_names:
         if int(getattr(args, name)) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive.")
+    if not 0 < args.background_ss_pcg_tol < 1:
+        parser.error('--background-ss-pcg-tol must lie in (0, 1).')
     if args.score_reference_samples < 255:
         parser.error("--score-reference-samples must be at least 255.")
     if 1 / (args.score_reference_samples + 1) > args.split_alpha:
@@ -1247,7 +1259,9 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
             }
         ),
         "compute_effects": bool(args.compute_effects),
-        **({'background_ss': True, 'background_ss_max_iterations': int(args.background_ss_max_iterations)}
+        **({'background_ss': True, 'background_ss_max_iterations': int(args.background_ss_max_iterations),
+            'background_ss_numerics': dict(pcg_tolerance=args.background_ss_pcg_tol,
+                trace_probes=args.background_ss_trace_probes, lanczos_steps=args.background_ss_lanczos_steps)}
            if args.background_ss else {}),
         **({'progressive_alpha': dict(method='progressive_ols_alpha', selection_metric='full_prediction_corr2',
               transfer='prefix count only; combined sample native LASSO ranking',

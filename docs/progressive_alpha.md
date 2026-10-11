@@ -11,6 +11,8 @@ the sample sizes are supplied by the keep files.
    EM-VAMP posterior with native gamma and LASSO alpha fixed. Preserve the
    background constraints `pi_g * slab_variance_g = theta_g / M_g` and the existing
    no-hyperprior design; native variance components and noise remain fixed.
+   The SS linear module reuses streamed genotype products, with PCG solves
+   and cached Lanczos trace quadrature; it constructs no sample Gram matrix.
 3. Freeze this background and gamma. Rank the support by decreasing absolute
    native LASSO alpha, breaking ties by source SNP index. Jointly refit each
    growing prefix with ordinary least squares while holding all other alpha

@@ -16,7 +16,7 @@ GPU_REML is organized around one contract: a covariance component must expose
 | Downstream models | `lasso_cd.py`, `gwas.py` | Reuse the fitted covariance for sparse GLS and marginal GWAS. |
 | Sparse mean information | `sparse_information.py` | Selected-span log determinant, score correction and paired sparse-variance correction, without sample-square matrices. |
 | Adaptive partition | `run_sparse_pipeline.py`, `adaptive_ld.py`, `score_process.py` | Orchestrate the path, stream shared boundary contractions, and calibrate trace-defined quadratic scores. |
-| Sparse prediction refinement | `background_ss.py`, `grouped_ss_vamp.py`, `progressive_alpha.py`, `sparse_prediction.py` | Refine native BLUP with constrained SS, select and refit joint OLS prefixes, then predict through the existing streaming operators. |
+| Sparse prediction refinement | `background_ss.py`, `grouped_ss_vamp.py`, `ss_linear.py`, `progressive_alpha.py`, `sparse_prediction.py` | Refine native BLUP with constrained matrix-free SS, select and refit joint OLS prefixes, then predict through the existing streaming operators. |
 
 ## Fit Lifecycle
 
@@ -79,6 +79,11 @@ GPU_REML is organized around one contract: a covariance component must expose
 
 ## Performance-Critical Paths
 
+- Background SS shares native genotype operators. Shifted PCG solves verify
+  true residuals, and cached fixed-probe Lanczos quadrature supplies all later
+  Onsager traces. Bounded genotype decode and Krylov batches replace full
+  standardized designs and sample-square Gram eigensystems. Quadrature gaps
+  and trace sampling uncertainty are recorded separately.
 - `K_i @ Vrand` is persistent state. Score traces use symmetry to avoid applying
   every `K_i` to all projected probes on every iteration.
 - Single-GRM identity-residual SLQ uses Krylov shift/scale invariance. It scans

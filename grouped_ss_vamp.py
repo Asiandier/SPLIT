@@ -20,6 +20,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from .ss_linear import MatrixFreeSampleSolver
+
 
 @jax.jit
 def constrained_ss_m_step(a, b, counts, d, pi_min=1e-8):
@@ -145,45 +147,17 @@ class GenotypeProducts:
     def transpose(self, residual):
         return self._transpose(self.x, residual)
 
+    def gram_operator(self, active):
+        mask = jnp.asarray(active)[:, None]
+        return lambda value: self.forward(jnp.where(mask, self.transpose(value), 0.))
 
-class SampleSpectrum:
-    """Exact sample-space LMMSE solve and trace, reused over VAMP iterations."""
-    def __init__(self, eigenvalues, eigenvectors, active_snp_count):
-        values = np.asarray(eigenvalues, float)
-        vectors = jnp.asarray(eigenvectors, dtype=jnp.float64)
-        if (values.ndim != 1 or len(values) == 0
-                or vectors.shape != (len(values), len(values))):
-            raise ValueError('Invalid eigensystem dimensions')
-        if not np.all(np.isfinite(values)) or not bool(jnp.all(jnp.isfinite(vectors))):
-            raise ValueError('Sample eigensystem must be finite')
-        if values.min() < -1e-9*max(1., values.max()):
-            raise ValueError('Sample Gram must be positive semidefinite')
-        self.values = jax.device_put(np.maximum(values, 0))
-        self.vectors = jax.device_put(vectors)
-        self.p = int(active_snp_count)
-        self.n = len(values)
-        if self.p <= 0:
-            raise ValueError('Need at least one active SNP')
-
-    @classmethod
-    def from_genotype(cls, snp_major, active=None):
-        x = np.asarray(snp_major, float)
-        if active is not None:
-            x = x[np.asarray(active, bool)]
-        eig, vec = np.linalg.eigh(x.T@x)
-        return cls(eig, vec, len(x))
-
-    def solve_and_trace(self, rhs, shift):
-        return _spectral_solve(self.values, self.vectors, rhs, shift, self.p)
-
-
-@jax.jit
-def _spectral_solve(eig, vec, rhs, shift, p):
-    projected = jnp.matmul(vec.T, rhs, precision=jax.lax.Precision.HIGHEST)
-    inverse = 1/(eig[:, None]+shift[None, :])
-    solved = jnp.matmul(vec, projected*inverse, precision=jax.lax.Precision.HIGHEST)
-    trace_fraction = jnp.sum(eig[:, None]*inverse, axis=0)/p
-    return solved, trace_fraction
+    def gram_diagonal(self, active):
+        total = jnp.zeros(self.n, jnp.float64)
+        for start in range(0, self.p, self.chunk_size):
+            stop = min(start+self.chunk_size, self.p)
+            block = self.x[start:stop].astype(jnp.float64)
+            total += jnp.sum(jnp.where(jnp.asarray(active[start:stop])[:, None], block*block, 0.), axis=0)
+        return total
 
 
 @dataclass(frozen=True)
@@ -205,6 +179,14 @@ class VAMPConfig:
     log_every: int = 10
     learn_pi: bool = True
     slab_variance_min: float = 1e-16
+    linear_pcg_tolerance: float = 1e-9
+    linear_pcg_max_iterations: int = 400
+    trace_probes: int = 32
+    trace_lanczos_steps: int = 64
+    trace_workspace_bytes: int = 256*1024**2
+    trace_exact_probe_limit: int = 128
+    trace_seed: int = 20261011
+    trace_tolerance: float = 1e-6
 
 
 @dataclass
@@ -220,10 +202,11 @@ class VAMPResult:
     iterations: int
     precision: np.ndarray
     initialization: dict | None = None
+    linear_solver: dict | None = None
 
 
 def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
-                        normalizers, noise_variance, spectrum: SampleSpectrum,
+                        normalizers, noise_variance, linear_solver: MatrixFreeSampleSolver,
                         config: VAMPConfig | None = None,
                         callback: Callable[[dict], None] | None = None,
                         initial_mean=None) -> VAMPResult:
@@ -295,8 +278,9 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
         raise ValueError('Cases in one batch must have identical active groups')
     active_host = active_groups[groups_host, 0]
     p_active = int(active_host.sum())
-    if spectrum.p != p_active or spectrum.n != products.n:
-        raise ValueError('Eigensystem must cover exactly the active SNP groups')
+    if (linear_solver.p != p_active or linear_solver.n != products.n
+            or not np.array_equal(linear_solver.active, active_host)):
+        raise ValueError('Linear solver must cover exactly the active SNP groups')
     y, group_ids = jax.device_put(y_host), jax.device_put(groups_host)
     active = jax.device_put(active_host[:, None])
     d_host = t_host/np.where(norm_host > 0, norm_host, 1.)[:, None]
@@ -427,7 +411,7 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
         gamma2 = gamma1*(1-alpha1)/alpha1
         r2 = jnp.where(active, (m1-alpha1[None, :]*r1)/(1-alpha1)[None, :], 0.)
         rhs = y-products.forward(r2)
-        solved, trace_fraction = spectrum.solve_and_trace(rhs, gamma2*noise)
+        solved, trace_fraction = linear_solver.solve_and_trace(rhs, gamma2*noise)
         correction = jnp.where(active, products.transpose(solved), 0.)
         m2 = r2+correction
         # Avoid subtracting nearly equal quantities when p >> n.
@@ -466,7 +450,8 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
                        pi_change=errors[4].tolist(), converged=done.tolist(),
                        slab_variance=np.asarray(slab).T.tolist(), slab_change=errors[5].tolist(),
                        prior_variance_components=np.asarray(pi*slab*norm_host[:, None]).T.tolist(),
-                       prior_constraint_max_relative_error=float(constraint.max()))
+                       prior_constraint_max_relative_error=float(constraint.max()),
+                       linear_solver=linear_solver.last_diagnostics)
             trace.append(row)
             if callback:
                 callback(row)
@@ -476,4 +461,5 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
     status = ['converged' if flag else 'max_iterations' for flag in done]
     return VAMPResult(np.asarray(mean), np.asarray(variance), np.asarray(pip), np.asarray(pi),
                       np.asarray(slab),
-                      status, trace, time.monotonic()-start, iteration, np.asarray(gamma1), initialization)
+                      status, trace, time.monotonic()-start, iteration, np.asarray(gamma1), initialization,
+                      linear_solver.diagnostics())

@@ -1,24 +1,147 @@
 """Constrained SS background refinement of finalized native LASSO outputs.
 
-The context owns reusable genotype products and eigensystems. All supplied
+The context owns reusable genotype products and trace quadrature. All supplied
 phenotypes, designs and coefficients must be on the model's training scale.
 No foreground, covariance component or noise parameter is re-estimated.
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from functools import partial
 import time
 import numpy as np
 import jax
 import jax.numpy as jnp
-from .grouped_ss_vamp import GenotypeProducts, SampleSpectrum, VAMPConfig, VAMPResult, fit_grouped_ss_vamp
+from .grouped_ss_vamp import GenotypeProducts, VAMPConfig, VAMPResult, fit_grouped_ss_vamp
+from .ss_linear import MatrixFreeSampleSolver
 
 
-@partial(jax.jit, donate_argnums=(0,))
-def _add_sample_gram(total, block, active):
-    """Accumulate one FP64 Gram block while reusing its large buffer."""
-    z = jnp.where(active[:, None], block, 0.).astype(jnp.float64)
-    return total+jnp.matmul(z.T, z, precision=jax.lax.Precision.HIGHEST)
+class StreamedGenotypeProducts:
+    """Native forward/transpose/kernel operators in logical SNP order.
+
+    Custom index implementations may supply standardized columns instead;
+    that fallback retains only one memory-bounded genotype block.
+    """
+    def __init__(self, index, n, normalizers, *, block_bytes=64*1024**2):
+        self.index, self.n, self.p = index, int(n), int(index.m_total)
+        self.streamer = getattr(index, 'streamer', None)
+        self.normalizers = np.asarray(normalizers, float)
+        self.offsets = np.r_[0, np.cumsum(index.m_per_grm)]
+        self.chunk_size = min(4096, max(1, block_bytes//max(16*self.n, 1)))
+        self.packed_calls = None
+        if (self.streamer is not None and getattr(self.streamer, '_packed_buf', None) is not None
+                and self.streamer._max_unpack_width > self.chunk_size):
+            # SS uses FP64 products. Subdivide the existing packed cache so a
+            # call planned for the FP32 REML stage cannot create an oversized
+            # FP64 decode workspace. Source order and training statistics stay
+            # exactly those of the native streamer.
+            width = max(4, self.chunk_size//4*4)
+            calls = []
+            for call, (start, size) in enumerate(zip(self.streamer._call_snp_starts,
+                                                    self.streamer._call_true_widths)):
+                for offset in range(0, int(size), width):
+                    actual = min(width, int(size)-offset)
+                    calls.append((call, offset//4, (offset+actual+3)//4,
+                                  int(start)+offset, actual))
+            self.packed_calls = calls
+            self.packed_width = min(width, int(self.streamer._max_unpack_width))
+            means = np.zeros((len(calls), self.packed_width), np.float32)
+            inverse = np.zeros_like(means)
+            for k, (_, _, _, start, actual) in enumerate(calls):
+                means[k, :actual] = self.streamer._means_host[start:start+actual]
+                inverse[k, :actual] = self.streamer._inv_sds_host[start:start+actual]
+            self.means = jax.device_put(means, self.streamer.dev)
+            self.inverse = jax.device_put(inverse, self.streamer.dev)
+            self.starts = jax.device_put(np.array([c[3] for c in calls], np.int32), self.streamer.dev)
+            self.widths = jax.device_put(np.array([c[4] for c in calls], np.int32), self.streamer.dev)
+
+    def _packed(self, k):
+        call, first, last, _, _ = self.packed_calls[k]
+        return self.streamer._packed_block_host(call)[:, first:last]
+
+    def _blocks(self, active=None):
+        for start in range(0, self.p, self.chunk_size):
+            stop = min(start+self.chunk_size, self.p)
+            if active is not None and not np.any(active[start:stop]):
+                continue
+            block = self.index.extract_standardized_columns(np.arange(start, stop))
+            yield start, stop, jnp.asarray(block, jnp.float64)
+
+    def forward(self, effects):
+        effects = jnp.asarray(effects)
+        if self.packed_calls is not None:
+            from .kv_impl import xv_impl_streamed
+            return xv_impl_streamed(effects, self.starts, self.widths, self.means, self.inverse,
+                n=self.n, m=self.p, n_calls=len(self.packed_calls), pop_block=self._packed,
+                missing_val=int(self.streamer._missing_val))
+        if self.streamer is not None and hasattr(self.streamer, 'xv'):
+            return self.streamer.xv(effects)
+        total = jnp.zeros((self.n, effects.shape[1]), effects.dtype)
+        for start, stop, block in self._blocks():
+            total += jnp.matmul(block, effects[start:stop], precision=jax.lax.Precision.HIGHEST)
+        return total
+
+    def transpose(self, residual):
+        residual = jnp.asarray(residual)
+        if self.packed_calls is not None:
+            from .kv_impl import xtv_impl_streamed
+            return xtv_impl_streamed(residual, self.p, self.starts, self.widths,
+                self.means, self.inverse, n_calls=len(self.packed_calls),
+                pop_block=self._packed, missing_val=int(self.streamer._missing_val))
+        if self.streamer is not None:
+            return self.streamer.xtv(residual, normalize=False)
+        total = jnp.zeros((self.p, residual.shape[1]), residual.dtype)
+        for start, stop, block in self._blocks():
+            values = jnp.matmul(block.T, residual, precision=jax.lax.Precision.HIGHEST)
+            total = total.at[start:stop].set(values)
+        return total
+
+    def gram_operator(self, active):
+        active = np.asarray(active, bool)
+        if self.packed_calls is not None:
+            from .kv_impl import _device_put_block, _kv_one_call_jit
+            selected, inverse = [], []
+            for k, (_, _, _, start, actual) in enumerate(self.packed_calls):
+                if np.any(active[start:start+actual]):
+                    mask = np.zeros(self.packed_width, bool)
+                    mask[:actual] = active[start:start+actual]
+                    selected.append(k); inverse.append(self.inverse[k]*jnp.asarray(mask))
+            missing = jnp.asarray(self.streamer._missing_val, jnp.uint8)
+            def packed_operator(value):
+                total = jnp.zeros_like(value)
+                if selected:
+                    pending = _device_put_block(self._packed(selected[0]), self.streamer.dev)
+                    for position, k in enumerate(selected):
+                        packed = pending
+                        if position+1 < len(selected):
+                            pending = _device_put_block(self._packed(selected[position+1]), self.streamer.dev)
+                        total = _kv_one_call_jit(packed, self.widths[k], self.means[k],
+                            inverse[position], value, missing, total)
+                        del packed
+                return total
+            return packed_operator
+        if self.streamer is not None:
+            if np.all(active):
+                return lambda value:self.streamer.kv(value, normalize=False)
+            group_mask = active[self.offsets[:-1]]
+            if (bool(getattr(self.streamer, 'has_component_partition', False))
+                    and np.array_equal(active, np.repeat(group_mask, np.diff(self.offsets)))):
+                weights = jnp.asarray(self.normalizers*active[self.offsets[:-1]])
+                return lambda value:self.streamer.weighted_component_hv(weights, None, value)
+        def operator(value):
+            total = jnp.zeros_like(value)
+            for start, stop, block in self._blocks(active):
+                block = jnp.where(jnp.asarray(active[start:stop])[None, :], block, 0.)
+                inner = jnp.matmul(block.T, value, precision=jax.lax.Precision.HIGHEST)
+                total += jnp.matmul(block, inner, precision=jax.lax.Precision.HIGHEST)
+            return total
+        return operator
+
+    def gram_diagonal(self, active):
+        if self.streamer is not None and np.all(active) and hasattr(self.streamer, 'exact_diag'):
+            return self.streamer.exact_diag().astype(jnp.float64)*self.streamer._eff_m_const
+        total = jnp.zeros(self.n, jnp.float64)
+        for start, stop, block in self._blocks(active):
+            total += jnp.sum(jnp.where(jnp.asarray(active[start:stop])[None, :], block*block, 0.), axis=1)
+        return total
 
 
 @dataclass
@@ -39,9 +162,10 @@ class BackgroundSSResult:
 
 
 class GroupedSSBackgroundContext:
-    """Reuse one standardized SNP-major design across native model outputs."""
-    def __init__(self, snp_major, groups, normalizers=None, spectra=None):
-        self.products = snp_major if isinstance(snp_major, GenotypeProducts) else GenotypeProducts(snp_major)
+    """Reuse genotype operators and fixed trace quadrature across native outputs."""
+    def __init__(self, snp_major, groups, normalizers=None):
+        self.products = (snp_major if hasattr(snp_major, 'gram_operator')
+                         else GenotypeProducts(snp_major))
         self.groups = np.asarray(groups)
         if (not np.issubdtype(self.groups.dtype, np.integer)
                 or self.groups.shape != (self.products.p,) or self.groups.min() < 0):
@@ -52,26 +176,20 @@ class GroupedSSBackgroundContext:
         if (np.any(counts == 0) or self.normalizers.shape != (self.n_groups,)
                 or np.any(self.normalizers < 0) or not np.all(np.isfinite(self.normalizers))):
             raise ValueError('Invalid GRM group normalizers')
-        self.spectra = {} if spectra is None else dict(spectra)
+        self.solvers = {}
 
-    def spectrum(self, active_groups):
-        key = tuple(active_groups)
-        if key not in self.spectra:
-            # Exact FP64 sample Gram from resident FP32 genotypes, without a
-            # p*p LD matrix or a full FP64 genotype copy.
-            n, p = self.products.n, self.products.p
-            gram = jnp.zeros((n, n), jnp.float64)
-            mask = jax.device_put(np.isin(self.groups, key))
-
-            for start in range(0, p, self.products.chunk_size):
-                end = min(start+self.products.chunk_size, p)
-                gram = _add_sample_gram(gram, self.products.x[start:end], mask[start:end])
-            eig, vectors = jnp.linalg.eigh((gram+gram.T)*.5)
-            self.spectra[key] = SampleSpectrum(eig, vectors, int(np.isin(self.groups, key).sum()))
-        spectrum = self.spectra[key]
-        if spectrum.n != self.products.n or spectrum.p != int(np.isin(self.groups, key).sum()):
-            raise ValueError('Cached spectrum does not match active training SNPs')
-        return spectrum
+    def linear_solver(self, active_groups, config):
+        options = dict(pcg_tolerance=config.linear_pcg_tolerance,
+            pcg_max_iterations=config.linear_pcg_max_iterations,
+            probes=config.trace_probes, lanczos_steps=config.trace_lanczos_steps,
+            workspace_bytes=config.trace_workspace_bytes, seed=config.trace_seed,
+            exact_probe_limit=config.trace_exact_probe_limit,
+            trace_tolerance=config.trace_tolerance)
+        key = (tuple(active_groups), tuple(options.values()))
+        if key not in self.solvers:
+            self.solvers[key] = MatrixFreeSampleSolver(self.products,
+                np.isin(self.groups, active_groups), **options)
+        return self.solvers[key]
 
 
 def _matrix(value, rows, batch, name):
@@ -120,7 +238,7 @@ def refine_lasso_background_ss(context, *, y, alpha, gamma, covariates,
     active_groups = np.flatnonzero(active[:, 0]).tolist()
     if active_groups:
         posterior = fit_grouped_ss_vamp(context.products, residual, context.groups,
-            theta[:-1], context.normalizers, theta[-1], context.spectrum(active_groups),
+            theta[:-1], context.normalizers, theta[-1], context.linear_solver(active_groups, config),
             config, callback, initial_mean=initial)
     else:
         zeros = np.zeros_like(initial)
@@ -138,7 +256,7 @@ def refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
                                  config=None):
     """Automatic adapter for the final sparse pipeline's in-memory outputs.
 
-    Materializes standardized training columns in logical GRM order, which is
+    Reuses native streamed training products in logical GRM order, which is
     also the order of the native component BLUP vectors. Returns refined
     EffectEstimates directly usable by existing effect writers/predictors.
     """
@@ -154,14 +272,11 @@ def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
                                   beta_active, beta_cov, theta, background_effects, config):
     from dataclasses import asdict, replace
     began = time.monotonic()
+    config = config or VAMPConfig(max_iterations=2000)
     counts = np.asarray(grm_index.m_per_grm, int)
     if len(background_effects.snp_effects) != len(counts):
         raise ValueError('Native BLUP components do not match the GRM partition')
     n, p = len(y), int(grm_index.m_total)
-    x = np.empty((p, n), np.float32)
-    for offset in range(0, p, 4096):
-        end = min(offset+4096, p)
-        x[offset:end] = grm_index.extract_standardized_columns(np.arange(offset, end)).T
     groups = np.repeat(np.arange(len(counts)), counts)
     alpha = np.zeros(p); alpha[np.asarray(support, int)] = np.asarray(beta_active, float)
     initial = np.concatenate([np.asarray(v, float) for v in background_effects.snp_effects])
@@ -172,15 +287,24 @@ def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
         normalizers = np.asarray(partitioned._component_eff_m_host, float)
     else:
         normalizers = np.array([float(np.asarray(streamer._eff_m_const)) for streamer in fitter.streamers])
-    context = GroupedSSBackgroundContext(x, groups, normalizers)
-    config = config or VAMPConfig(max_iterations=2000)
+    budget = getattr(getattr(fitter, 'cfg', None), 'gpu_budget_bytes', None)
+    block_bytes = 512*1024**2
+    if budget is not None:
+        block_bytes = min(block_bytes, max(1, int(budget)//16))
+        depth = min(config.trace_lanczos_steps, n)
+        minimum_workspace = 8*(n*(2*depth+32)+8*(depth+1)**2)
+        workspace = min(max(config.trace_workspace_bytes, minimum_workspace),
+                        max(1, int(budget)//8))
+        config = replace(config, trace_workspace_bytes=workspace)
+    products = StreamedGenotypeProducts(grm_index, n, normalizers, block_bytes=block_bytes)
+    context = GroupedSSBackgroundContext(products, groups, normalizers)
     result = refine_lasso_background_ss(context, y=y, alpha=alpha, gamma=beta_cov,
         covariates=covariates, blup=initial, variance_components=theta, config=config)
     attempts = [dict(status=result.posterior.status, iterations=result.posterior.iterations,
                      seconds=result.posterior.seconds, config=asdict(config))]
     if result.posterior.status != ['converged']:
         # Weakly identified pi can amplify curvature below stopping accuracy.
-        # Retain the model and tolerances, reuse the spectrum, and restart from
+        # Retain the model and tolerances, reuse trace quadrature, and restart from
         # the same BLUP with conservative numerical settings only.
         retry = replace(config, damping=min(config.damping, .1), em_damping=min(config.em_damping, .025),
                         em_acceleration_floor=max(config.em_acceleration_floor, config.em_tolerance))
@@ -192,15 +316,18 @@ def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
     if result.posterior.status != ['converged']:
         raise RuntimeError('SS background refinement did not converge; outputs rejected')
     beta = result.posterior.mean[:, 0]
-    # One genotype pass for all components, rather than one complete scan
-    # per group. These columns use the same posterior means as prediction.
-    component_effects = jnp.where(jnp.asarray(groups)[:, None] == jnp.arange(len(counts))[None, :],
-                                  jnp.asarray(beta)[:, None], 0.)
-    component_predictions = context.products.forward(component_effects)
-    component_predictions.block_until_ready()
-    components = tuple(component_predictions[:, g] for g in range(len(counts)))
+    # Batch components to bound the SNP-effect workspace even for large
+    # partitions. The usual four groups still share one genotype scan.
+    components = []
+    for first in range(0, len(counts), 8):
+        ids = jnp.arange(first, min(first+8, len(counts)))
+        component_effects = jnp.where(jnp.asarray(groups)[:, None] == ids[None, :],
+                                      jnp.asarray(beta)[:, None], 0.)
+        predictions = context.products.forward(component_effects)
+        predictions.block_until_ready()
+        components.extend(predictions[:, g] for g in range(len(ids)))
     refined = replace(background_effects,
-        random_effect=jax.device_put(result.background[:, 0]), random_effect_components=components,
+        random_effect=jax.device_put(result.background[:, 0]), random_effect_components=tuple(components),
         snp_effects=tuple(jax.device_put(beta[groups == g]) for g in range(len(counts))))
     result.total_seconds = time.monotonic()-began
     result.setup_and_products_seconds = result.total_seconds-sum(a['seconds'] for a in attempts)
