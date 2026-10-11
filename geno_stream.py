@@ -9,7 +9,9 @@ Architecture
     O(np/4) heap allocation.
 
 2.  **Streaming**: the packed cache is served from a read-only mmap over the
-    tmpfile. The OS page cache decides what stays resident in RAM.
+    tmpfile. The OS page cache decides what stays resident in RAM. A complete
+    source may also use a budgeted two-bit GPU cache for repeated products;
+    larger sources keep the bounded host staging ring.
 
 3.  **call_width** (= w) controls runtime GPU block geometry. For
     arbitrary single-source regrouping, build-time source scans can use a
@@ -557,7 +559,6 @@ def _build_source_scatter_plan(
     m: int,
     cache_to_source_variant_indices: np.ndarray,
     call_snp_starts: np.ndarray,
-    call_true_widths: np.ndarray,
     packed_call_widths: np.ndarray,
     packed_offsets: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -566,8 +567,6 @@ def _build_source_scatter_plan(
     source_to_cache[cache_to_source] = np.arange(cache_to_source.size, dtype=np.int64)
     valid = source_to_cache >= 0
 
-    source_call_idx = np.zeros((int(m),), dtype=np.int32)
-    source_local_col = np.zeros((int(m),), dtype=np.int32)
     source_byte_idx = np.zeros((int(m),), dtype=np.int32)
     source_bit_shift = np.zeros((int(m),), dtype=np.uint8)
     source_call_offsets = np.zeros((int(m),), dtype=np.int64)
@@ -583,8 +582,6 @@ def _build_source_scatter_plan(
             source_to_cache[valid]
             - np.asarray(call_snp_starts, dtype=np.int64)[call_idx_valid]
         ).astype(np.int32)
-        source_call_idx[valid] = call_idx_valid
-        source_local_col[valid] = local_col_valid
         source_byte_idx[valid] = (local_col_valid >> 2).astype(np.int32)
         source_bit_shift[valid] = ((local_col_valid & 3) << 1).astype(np.uint8)
         source_call_offsets[valid] = np.asarray(packed_offsets[:-1], dtype=np.int64)[call_idx_valid]
@@ -1320,8 +1317,6 @@ class GenoBlockStreamer:
         self._n_calls = self._n_blocks  # bpc=1 → one block per call
         self._n_components = len(self._component_block_sizes)
 
-        self._call_block_starts = np.arange(self._n_calls, dtype=np.int32)
-
         self._call_true_widths = self._block_sizes.copy()
         self._packed_call_widths = ((self._call_true_widths + 3) // 4).astype(np.int32)
 
@@ -1349,7 +1344,6 @@ class GenoBlockStreamer:
                 self.source_m,
                 self._cache_to_source_variant_indices,
                 self._call_snp_starts,
-                self._call_true_widths,
                 self._packed_call_widths,
                 self._packed_offsets_host,
             )
@@ -1360,7 +1354,6 @@ class GenoBlockStreamer:
             self._source_packed_byte_indices = None
             self._source_packed_bit_shifts = None
 
-        self._max_call_width = int(self._call_true_widths.max()) if self._n_calls > 0 else 1
         self._max_packed_width = int(self._packed_call_widths.max()) if self._n_calls > 0 else 1
         self._max_unpack_width = max(1, 4 * self._max_packed_width)
 
@@ -1370,6 +1363,7 @@ class GenoBlockStreamer:
         self._packed_mmap = None
         self._packed_buf = None
         self._tmpfile_fd = None
+        self._device_packed_blocks = None
 
         from .geno_source import BedGenoSource
         if isinstance(self._source, BedGenoSource):
@@ -2507,6 +2501,7 @@ class GenoBlockStreamer:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
+        self._device_packed_blocks = None
         for attr in (
             "_eff_m_const", "_means_by_call", "_inv_by_call",
             "_snp_starts_dev", "_true_widths_dev",
@@ -2602,8 +2597,41 @@ class GenoBlockStreamer:
     # Block accessor (staging)
     # ------------------------------------------------------------------
 
-    def _pop_cached(self, call_idx) -> np.ndarray:
+    def cache_packed_on_device(self, budget_bytes: int) -> int:
+        """Cache only a complete packed source that fits its reserved budget.
+
+        Larger sources retain the bounded host ring. Uploading one block at a
+        time bounds setup staging; standardized genotypes are never retained.
+        """
+        if self._device_packed_blocks is not None:
+            return sum(block.nbytes for block in self._device_packed_blocks)
+        if (self.dev.platform != 'gpu' or self._packed_buf is None
+                or not 0 < self._packed_buf.nbytes <= budget_bytes):
+            return 0
+        from .kv_impl import _device_put_block
+        blocks = []
+        for call in range(self._n_calls):
+            block = _device_put_block(self._packed_block_host(call), self.dev)
+            block.block_until_ready()
+            blocks.append(block)
+        # The ring owns pinned host buffers and a transfer worker. It is no
+        # longer needed while the complete packed cache is device-resident.
+        if self._ring is not None:
+            self._ring.close()
+            self._ring = None
+        self._device_packed_blocks = blocks
+        size = sum(block.nbytes for block in blocks)
+        logger.info('[GenoBlockStreamer] packed GPU cache: %.1f MiB', size/2**20)
+        return size
+
+    def release_packed_device_cache(self) -> None:
+        """Free a phase-specific cache; the host mmap remains a valid source."""
+        self._device_packed_blocks = None
+
+    def _pop_cached(self, call_idx) -> np.ndarray | jax.Array:
         c = int(call_idx)
+        if self._device_packed_blocks is not None:
+            return self._device_packed_blocks[c]
         pw = int(self._packed_call_widths[c])
         if self._ring is not None:
             return self._ring.get(c).reshape(self.n, pw)

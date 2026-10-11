@@ -242,95 +242,6 @@ def _extract_sparse_csr_from_packed_numba(
 
 
 @njit(cache=True, parallel=True)
-def _extract_sparse_csr_from_raw_bed_numba(
-    bed_raw: np.ndarray,
-    snp_start: int,
-    snp_count: int,
-    bytes_per_snp: int,
-    sample_byte_offsets: np.ndarray,
-    sample_bit_shifts: np.ndarray,
-):
-    n_keep = sample_byte_offsets.shape[0]
-    hdr = np.int64(3)
-    row_count_het = np.zeros(n_keep, dtype=np.int32)
-    row_count_hom = np.zeros(n_keep, dtype=np.int32)
-    row_count_miss = np.zeros(n_keep, dtype=np.int32)
-    has_missing_u8 = np.zeros(n_keep, dtype=np.uint8)
-
-    for i in prange(n_keep):
-        s_boff = np.int64(sample_byte_offsets[i])
-        s_bshift = np.uint8(sample_bit_shifts[i])
-        cnt_het = 0
-        cnt_hom = 0
-        cnt_miss = 0
-        has_missing = np.uint8(0)
-        for j in range(snp_count):
-            row_base = hdr + np.int64(snp_start + j) * np.int64(bytes_per_snp)
-            g = (bed_raw[row_base + s_boff] >> s_bshift) & np.uint8(3)
-            if g == np.uint8(2):
-                cnt_het += 1
-            elif g == np.uint8(0):
-                cnt_hom += 1
-            elif g == np.uint8(1):
-                cnt_miss += 1
-                has_missing = np.uint8(1)
-        row_count_het[i] = cnt_het
-        row_count_hom[i] = cnt_hom
-        row_count_miss[i] = cnt_miss
-        has_missing_u8[i] = has_missing
-
-    (
-        csr_het_rows,
-        csr_het_cols,
-        csr_hom_rows,
-        csr_hom_cols,
-        csr_miss_rows,
-        csr_miss_cols,
-        csr_het_pos,
-        csr_hom_pos,
-        csr_miss_pos,
-        nnz_het,
-        nnz_hom,
-        nnz_miss,
-    ) = _alloc_sparse_csr_outputs(row_count_het, row_count_hom, row_count_miss)
-
-    for i in prange(n_keep):
-        s_boff = np.int64(sample_byte_offsets[i])
-        s_bshift = np.uint8(sample_bit_shifts[i])
-        p_het = csr_het_pos[i]
-        p_hom = csr_hom_pos[i]
-        p_miss = csr_miss_pos[i]
-        for j in range(snp_count):
-            row_base = hdr + np.int64(snp_start + j) * np.int64(bytes_per_snp)
-            g = (bed_raw[row_base + s_boff] >> s_bshift) & np.uint8(3)
-            if g == np.uint8(2):
-                csr_het_rows[p_het] = i
-                csr_het_cols[p_het] = j
-                p_het += 1
-            elif g == np.uint8(0):
-                csr_hom_rows[p_hom] = i
-                csr_hom_cols[p_hom] = j
-                p_hom += 1
-            elif g == np.uint8(1):
-                csr_miss_rows[p_miss] = i
-                csr_miss_cols[p_miss] = j
-                p_miss += 1
-
-    return (
-        csr_het_rows,
-        csr_het_cols,
-        csr_hom_rows,
-        csr_hom_cols,
-        csr_miss_rows,
-        csr_miss_cols,
-        nnz_het,
-        nnz_hom,
-        nnz_miss,
-        has_missing_u8,
-    )
-
-
-@njit(cache=True, parallel=True)
 def _extract_sparse_csr_from_varmaj_numba(
     block_vm: np.ndarray,
     missing_val: int,
@@ -573,7 +484,6 @@ def _raw_bed_fill_csc_all_numba(
     sample_byte_offsets: np.ndarray,
     sample_bit_shifts: np.ndarray,
     pos_all: np.ndarray,
-    mean: np.ndarray,
     csc_all_rows: np.ndarray,
     csc_all_cols: np.ndarray,
     csc_all_vals: np.ndarray,
@@ -764,7 +674,6 @@ def _build_sparse_meta_from_raw_bed_single_pass(
         sample_byte_offsets,
         sample_bit_shifts,
         pos_all,
-        mean,
         csc_all_rows,
         csc_all_cols,
         csc_all_vals,
@@ -800,13 +709,10 @@ def _build_sparse_meta_from_raw_bed_single_pass(
 
 
 class SparseGenoBlockStreamer(GenoBlockStreamer):
-    """Sparse-path streamer with real host-side sparse metadata build.
+    """Stream rare genotypes through compact host-side sparse shards.
 
-    Current status:
-    - reuses the mature v6 dense tmpfile + mmap build path
-    - collects CSC/CSR + het/hom metadata during the first build pass
-    - keeps each block in a compact per-block sparse representation
-    - runs `kv()` through compact per-block sparse kernels without padded scans
+    Reuse source alignment and standardization from the dense streamer, build
+    sparse coordinates directly, and apply products without a packed cache.
     """
 
     def __init__(self, *args, **kwargs):
@@ -816,16 +722,10 @@ class SparseGenoBlockStreamer(GenoBlockStreamer):
         self._sparse_block_meta: list[dict[str, object]] = []
         self._sparse_block_summary: list[dict[str, object]] = []
         self._sparse_kv_shard_hosts: list[dict[str, object]] = []
-        self._sparse_extract_elapsed = 0.0
-        self._sparse_total_nnz_het = 0
-        self._sparse_total_nnz_hom = 0
         self._sparse_max_nnz_het = 0
         self._sparse_max_nnz_hom = 0
-        self._sparse_extract_t0 = time.perf_counter()
         self._sparse_shard_target_cols = 0
         self._sparse_device_mode = "stream_prefetch"
-        self._sparse_exec_total_nbytes = 0
-        self._sparse_exec_max_shard_nbytes = 0
         super().__init__(*args, **kwargs)
         if getattr(self, "_ring", None) is not None:
             try:
@@ -893,7 +793,6 @@ class SparseGenoBlockStreamer(GenoBlockStreamer):
             for meta in self._sparse_block_meta
         ]
         self._sparse_block_meta = []
-        self._sparse_extract_elapsed = time.perf_counter() - self._sparse_extract_t0
         self._sparse_metadata_ready = True
         self._block_backend_plan = self._build_block_backend_plan()
         self._has_sparse_backend = True
@@ -1178,8 +1077,6 @@ class SparseGenoBlockStreamer(GenoBlockStreamer):
         shard_nbytes = [_sparse_exec_nbytes(host) for host in self._sparse_kv_shard_hosts]
         total_nbytes = int(sum(shard_nbytes))
         max_shard_nbytes = int(max(shard_nbytes, default=0))
-        self._sparse_exec_total_nbytes = total_nbytes
-        self._sparse_exec_max_shard_nbytes = max_shard_nbytes
         self._sparse_device_mode = "stream_prefetch"
         logger.info(
             "[SparseStreamer] shard plan: target_cols=%d shard_count=%d mixed=%s budget_gib=%s "
@@ -1271,8 +1168,6 @@ class SparseGenoBlockStreamer(GenoBlockStreamer):
 
         nh = int(meta["nnz_het"])
         nd = int(meta["nnz_hom"])
-        self._sparse_total_nnz_het += nh
-        self._sparse_total_nnz_hom += nd
         self._sparse_max_nnz_het = max(self._sparse_max_nnz_het, nh)
         self._sparse_max_nnz_hom = max(self._sparse_max_nnz_hom, nd)
 

@@ -28,6 +28,8 @@ Array = jnp.ndarray
 
 def _device_put_block(block: np.ndarray, dev) -> Array:
     """Copy host blocks before GPU H2D to avoid view-backed transfer corruption."""
+    if isinstance(block, jax.Array):
+        return jax.device_put(block, dev)
     if getattr(dev, "platform", None) == "cpu":
         return jax.device_put(block, dev)
     if isinstance(block, _PinnedHostBuffer):
@@ -132,30 +134,6 @@ def _kv_one_call_scaled_jit(
     return acc + scale * jnp.matmul(
         diff,
         inv_sq[:, None] * inner,
-        precision=jax.lax.Precision.HIGHEST,
-    )
-
-
-@partial(jax.jit, donate_argnums=(7,))
-def _kv_one_call_snp_weighted_jit(
-    g_dev_packed: Array,
-    true_width: Array,
-    means_call: Array,
-    inv_call: Array,
-    weights_call: Array,
-    V: Array,
-    miss_u8: Array,
-    acc: Array,
-) -> Array:
-    """Accumulate one call-block contribution with per-SNP kernel weights."""
-    diff, inv_f = _unpack_impute_center(
-        g_dev_packed, true_width, means_call, inv_call, V, miss_u8)
-    inner = jnp.matmul(diff.T, V, precision=jax.lax.Precision.HIGHEST)
-    inv_sq = inv_f * inv_f
-    weighted_inv_sq = weights_call[: diff.shape[1]].astype(V.dtype) * inv_sq
-    return acc + jnp.matmul(
-        diff,
-        weighted_inv_sq[:, None] * inner,
         precision=jax.lax.Precision.HIGHEST,
     )
 
@@ -326,59 +304,6 @@ def kv_impl_streamed(
     return acc[:, 0] if squeeze else acc
 
 
-def kv_impl_snp_weighted_streamed(
-    V: Array,
-    true_widths: Array,
-    means_by_call: Array,
-    inv_by_call: Array,
-    weights_by_call: Array,
-    denom: Array,
-    *,
-    n: int,
-    n_calls: int,
-    pop_block: Callable[[int], np.ndarray],
-    missing_val: int = 3,
-) -> Array:
-    """
-    Streaming ``Z diag(w) Z.T V / denom`` for one soft grouping component.
-
-    ``weights_by_call`` is padded to the streamer's unpack width; padding is
-    harmless because invalid columns have zero inverse standard deviation.
-    """
-    squeeze = V.ndim == 1
-    if squeeze:
-        V = V[:, None]
-
-    fp = V.dtype
-    dev = next(iter(V.devices()))
-    miss_u8 = jnp.asarray(np.uint8(missing_val), dtype=jnp.uint8)
-
-    acc = jnp.zeros((n, V.shape[1]), dtype=fp)
-    if n_calls == 0:
-        return acc[:, 0] if squeeze else acc
-
-    g_dev_next = _device_put_block(pop_block(0), dev)
-    for c in range(n_calls):
-        g_dev_cur = g_dev_next
-        if c + 1 < n_calls:
-            g_dev_next = _device_put_block(pop_block(c + 1), dev)
-        acc = _kv_one_call_snp_weighted_jit(
-            g_dev_cur,
-            true_widths[c],
-            means_by_call[c],
-            inv_by_call[c],
-            weights_by_call[c],
-            V,
-            miss_u8,
-            acc,
-        )
-        del g_dev_cur
-
-    denom = denom.astype(fp)
-    acc = acc / denom
-    return acc[:, 0] if squeeze else acc
-
-
 def xtv_impl_streamed(
     V: Array,
     m: int,
@@ -444,6 +369,66 @@ def _xv_call_accumulate(acc, packed, width, means, inv, effects, start, missing)
     indices = start+jnp.arange(means.shape[0], dtype=start.dtype)
     block = jnp.take(effects, indices, axis=0, mode='fill', fill_value=0)
     return acc+_zxb_multi_one_call_jit(packed, width, means, inv, block, missing)
+
+
+@partial(jax.jit, donate_argnums=(0,))
+def _store_packed_call(cache, block, index):
+    zero = jnp.zeros((), dtype=index.dtype)
+    return jax.lax.dynamic_update_slice(cache, block[None, :, :], (index, zero, zero))
+
+
+@jax.jit
+def packed_cache_gram(cache, widths, means, inverse, selected, value, missing):
+    """Bounded decode workspace, with the packed-block loop on the device."""
+    squeeze = value.ndim == 1
+    if squeeze:
+        value = value[:, None]
+    def body(position, total):
+        call = selected[position]
+        return _kv_one_call_jit(cache[call], widths[call], means[call],
+                                inverse[call], value, missing, total)
+    initial = jnp.zeros_like(value)
+    result = initial if selected.shape[0] == 0 else jax.lax.fori_loop(0, selected.shape[0], body, initial)
+    return result[:, 0] if squeeze else result
+
+
+@jax.jit
+def packed_cache_forward(cache, starts, widths, means, inverse, selected, effects, missing):
+    squeeze = effects.ndim == 1
+    if squeeze:
+        effects = effects[:, None]
+    def body(position, total):
+        call = selected[position]
+        return _xv_call_accumulate(total, cache[call], widths[call], means[call],
+                                  inverse[call], effects, starts[call], missing)
+    initial = jnp.zeros((cache.shape[1], effects.shape[1]), effects.dtype)
+    result = initial if selected.shape[0] == 0 else jax.lax.fori_loop(0, selected.shape[0], body, initial)
+    return result[:, 0] if squeeze else result
+
+
+@partial(jax.jit, static_argnames=('p',))
+def packed_cache_transpose(cache, starts, widths, means, inverse, selected, value, missing, *, p):
+    squeeze = value.ndim == 1
+    if squeeze:
+        value = value[:, None]
+    def body(position, total):
+        call = selected[position]
+        block = _xtv_one_call_jit(cache[call], widths[call], means[call], inverse[call], value, missing)
+        return _xtv_scatter_jit(total, block, starts[call])
+    initial = jnp.zeros((p+means.shape[1], value.shape[1]), value.dtype)
+    result = initial if selected.shape[0] == 0 else jax.lax.fori_loop(0, selected.shape[0], body, initial)
+    return result[:p, 0] if squeeze else result[:p]
+
+
+@jax.jit
+def packed_cache_diagonal(cache, widths, means, inverse, selected, missing):
+    initial = jnp.zeros(cache.shape[1], jnp.float64)
+    def body(position, total):
+        call = selected[position]
+        diff, inv = _unpack_impute_center(cache[call], widths[call], means[call],
+                                          inverse[call], initial, missing)
+        return total+jnp.sum((diff*inv[None, :])**2, axis=1)
+    return initial if selected.shape[0] == 0 else jax.lax.fori_loop(0, selected.shape[0], body, initial)
 
 
 def xv_impl_streamed(effects, snp_starts, true_widths, means_by_call, inv_by_call,
@@ -524,31 +509,6 @@ def xtv_impl_multi_streamed(
             out_g = jax.lax.cond(eff > 0, lambda o: o / eff, lambda o: o, out_g)
         results.append(out_g[:, 0] if squeeze else out_g)
     return tuple(results)
-
-
-def xtv_impl_multi_streamed_concat(
-    V: Array,
-    streamers: Sequence[object],
-    call_plan: Sequence[tuple[int, int]],
-    *,
-    missing_val: int = 3,
-    normalize: bool = False,
-) -> Array:
-    """Concatenate multi-stream X^T·V outputs in streamer order."""
-    parts = xtv_impl_multi_streamed(
-        V,
-        streamers,
-        call_plan,
-        missing_val=missing_val,
-        normalize=normalize,
-    )
-    if not parts:
-        squeeze = V.ndim == 1
-        empty = jnp.zeros((0,), dtype=V.dtype) if squeeze else jnp.zeros((0, V.shape[1]), dtype=V.dtype)
-        return empty
-    if len(parts) == 1:
-        return parts[0]
-    return jnp.concatenate(parts, axis=0)
 
 
 def zxb_impl_streamed(

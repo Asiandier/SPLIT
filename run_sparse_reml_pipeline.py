@@ -62,7 +62,6 @@ _lasso_mod = importlib.import_module(f"{pkg_name}.lasso_cd")
 _pcg_mod = importlib.import_module(f"{pkg_name}.pcg")
 _information_mod = importlib.import_module(f"{pkg_name}.sparse_information")
 _core_mod = importlib.import_module(f"{pkg_name}.sparse_core")
-_precond_mod = importlib.import_module(f"{pkg_name}.precond")
 _common_mod = importlib.import_module(f"{pkg_name}.pipeline_common")
 _io_utils_mod = importlib.import_module(f"{pkg_name}.io_utils")
 _component_spec_mod = importlib.import_module(f"{pkg_name}.component_spec")
@@ -515,7 +514,6 @@ class _PredictionFitContext:
     grm_index: MultiGRMIndex
     covar: np.ndarray | None
     sample_ids: list[str]
-    dropped_ids: list[str]
     _close_callback: object
     _closed: bool = False
 
@@ -626,6 +624,7 @@ def _build_prediction_fit_context(
         minq_iter=args.minq_iter,
         slq_samples=args.slq_samples,
         slq_m=args.slq_m,
+        slq_quadrature_tol=args.slq_quadrature_tol,
         precond_rank=0,
         max_pcg_iters=args.max_pcg_iters,
         pcg_ridge=args.pcg_ridge,
@@ -660,7 +659,6 @@ def _build_prediction_fit_context(
         grm_index=prediction_grm_index,
         covar=prediction_covar,
         sample_ids=list(prediction_ids),
-        dropped_ids=list(prediction_dropped),
         _close_callback=close_callback,
     )
 
@@ -892,6 +890,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-rand-vec", type=int, default=100)
     p.add_argument("--slq-samples", type=int, default=100)
     p.add_argument("--slq-m", type=int, default=int(env("SLQ_M", "50")))
+    p.add_argument("--slq-quadrature-tol", type=float, default=float(env("SLQ_QUADRATURE_TOL", "1e-6")),
+                   help="Log quadrature error bound per sample; 0 uses fixed SLQ depth.")
     p.add_argument("--minq-iter", type=int, default=int(env("MINQ_ITER", "50")))
     p.add_argument(
         "--export-ai",
@@ -2847,9 +2847,11 @@ def _fit_complete_weighted_lasso_path_basil(
             "trace": basil_trace,
         },
     }
+    # Share the compact final matrix. Views into the original solve batches
+    # would keep rejected columns (and a duplicate final matrix) alive.
     final_hinv_z = {
-        int(marker): outer_hinv_z[int(marker)]
-        for marker in final_candidate.tolist()
+        int(marker): Hinv_Z_final[:, column]
+        for column, marker in enumerate(final_candidate.tolist())
     }
     return {
         "lasso_path": lasso_path,
@@ -2997,28 +2999,6 @@ def _allow_mapped_lasso_path_warm_start(
     )
 
 
-def _complete_path_active_union(
-    *,
-    candidate: np.ndarray,
-    beta_path: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return candidate markers active at one or more lambda path points."""
-    candidate_arr = np.asarray(candidate, dtype=np.int64).reshape(-1)
-    beta_arr = np.asarray(beta_path, dtype=np.float64)
-    if beta_arr.ndim != 2 or beta_arr.shape[1] != candidate_arr.size:
-        raise ValueError("Complete Lasso path does not align with candidate.")
-    if not np.all(np.isfinite(beta_arr)):
-        raise ValueError("Complete Lasso path coefficients must be finite.")
-    keep_local = np.flatnonzero(np.any(beta_arr != 0.0, axis=0)).astype(
-        np.int64
-    )
-    # Preserve a nonempty numerical basis for the downstream Lasso warm-state
-    # schema in the degenerate all-zero path.  No pruning is needed there.
-    if keep_local.size == 0:
-        keep_local = np.arange(candidate_arr.size, dtype=np.int64)
-    return candidate_arr[keep_local], keep_local
-
-
 def _buffered_kkt_expansion_indices(
     *,
     score_abs: np.ndarray,
@@ -3142,6 +3122,8 @@ def _parse_variance_components_init(
 
 def main() -> None:
     args = parse_args()
+    if not np.isfinite(args.slq_quadrature_tol) or args.slq_quadrature_tol < 0:
+        raise SystemExit('--slq-quadrature-tol must be finite and nonnegative.')
     progressive_requested = args.progressive_alpha_select or args.progressive_alpha_k is not None
     if args.progressive_alpha_select:
         args.background_ss = False
@@ -3512,9 +3494,11 @@ def main() -> None:
             cpu_threads=cpu_threads,
             keep_host_stats=True,
             gpu_budget_bytes=gpu_budget_bytes,
+            packed_device_cache_bytes=plan.packed_device_cache_bytes,
             ring_depth=plan.ring_depth,
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter,
             slq_samples=args.slq_samples, slq_m=args.slq_m,
+            slq_quadrature_tol=args.slq_quadrature_tol,
             precond_rank=plan.precond_rank,
             reml_pcg_tol=args.pcg_tol,
             effect_pcg_tol=args.pcg_tol,
@@ -3534,9 +3518,11 @@ def main() -> None:
             cpu_threads=cpu_threads,
             keep_host_stats=True,
             gpu_budget_bytes=gpu_budget_bytes,
+            packed_device_cache_bytes=plan.packed_device_cache_bytes,
             ring_depth=plan.ring_depth,
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter,
             slq_samples=args.slq_samples, slq_m=args.slq_m,
+            slq_quadrature_tol=args.slq_quadrature_tol,
             precond_rank=plan.precond_rank,
             reml_pcg_tol=args.pcg_tol,
             effect_pcg_tol=args.pcg_tol,
@@ -4048,6 +4034,7 @@ def main() -> None:
                 candidate_pcg = dict(basil_result["candidate_pcg"])
                 path_global_kkt = dict(basil_result["global_kkt"])
                 validation_bundle = dict(basil_result["validation"])
+                del basil_result
                 validation_metrics = list(validation_bundle["metrics"])
                 selected_index = _select_converged_validation_path_index(
                     list(lasso_path["path"]), validation_metrics
@@ -4310,8 +4297,8 @@ def main() -> None:
             # Retain only the current monotone candidate as a warm start for
             # the next covariance update and optional final-refit state.
             warm_z_dict = {
-                int(marker): outer_hinv_z_dict[int(marker)]
-                for marker in candidate.tolist()
+                int(marker): sol_z_np[:, column]
+                for column, marker in enumerate(candidate.tolist())
             }
 
             beta_snp_path0, warm_lasso_columns = _remap_lasso_beta_path(
@@ -4726,6 +4713,7 @@ def main() -> None:
         # Only a candidate that passed the full outside-marker KKT check is
         # carried into the next covariance update.
         candidate_cache = candidate.copy()
+        outer_hinv_z_dict.clear()
 
         if args.verbose:
             logger.info(

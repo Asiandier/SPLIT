@@ -85,16 +85,18 @@ larger cohorts default to 32 probes. This is an unbiased trace sampling scheme
 before quadrature error. A fixed seed makes the approximation a consistent
 function of the shift throughout EM-VAMP.
 
-One Lanczos pass per probe caches only small nodes and weights. Shift
+An initial Lanczos pass per probe caches only small nodes and weights. Shift
 invariance lets every later VAMP iteration evaluate `x/(x+lambda)` on these
 nodes without additional trace-specific genotype scans. Two-pass
 reorthogonalization stabilizes the recurrence. Gauss quadrature and
 zero-anchored Gauss-Radau bracket the positive-shift trace functional. Their
-mean relative gap must be at most `1e-6`; otherwise the fit rejects the result
-and asks for more Lanczos steps. The finite-population sampling standard error
+mean relative gap must be at most `1e-6`. Setup starts at up to 32 steps;
+if a shift fails this bound, the solver rebuilds the same fixed probes with
+twice the depth, up to the configured maximum (64 by default). Failure at
+that maximum rejects the result and asks for more steps. The finite-population sampling standard error
 is reported separately: a small quadrature gap does not establish an exact
 trace or remove sampling uncertainty. Increase probes to reduce that source
-of error. The default Lanczos depth is 64.
+of error. Diagnostics report the actual depth, maximum depth and rebuild count.
 
 Trace setup batches at most eight probes, retaining only one batch's basis.
 Its additional workspace is `O(n * depth * batch_width)`; PCG uses `O(n * cases)`
@@ -106,6 +108,10 @@ decode buffers. The trace workspace defaults to 256 MiB, adjusted to hold one
 probe and capped at one eighth of the native GPU budget. An insufficient
 one-probe budget fails explicitly. The original packed/sparse host cache is
 still required; matrix-free inference does not eliminate genotype I/O.
+When the complete two-bit genotype cache fits the reserved GPU budget, SS
+reuses that reservation after releasing the native REML cache. Compiled loops
+decode one bounded block at a time and skip inactive groups. Sources larger
+than the cache budget retain streaming products.
 
 Messages are damped in natural coordinates `(gamma1, gamma1*r1)`.
 Products decode bounded genotype blocks with FP64 arithmetic and retain

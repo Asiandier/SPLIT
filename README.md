@@ -55,8 +55,9 @@ $$
 K_g v = \frac{Z_g (Z_g^T v)}{m_{\mathrm{eff},g}}
 $$
 
-Genotype blocks are decoded on the host, streamed to the GPU, and multiplied in
-batches. Evaluating and optimizing the REML likelihood without explicit GRMs
+Genotype blocks are packed on the host, streamed to the GPU, and decoded for
+batched products. A bounded cache retains packed blocks on the GPU when they
+fit the planned memory budget. Evaluating and optimizing the REML likelihood without explicit GRMs
 leads to the main numerical machinery in GPU_REML: block PCG solves, Hutchinson
 trace estimates, SLQ log-determinant estimates, constrained AI/Fisher updates,
 and projected-core preconditioning.
@@ -559,6 +560,11 @@ fit lifecycle.
   retention. Lower this budget to leave more VRAM for other processes. For memory diagnostics,
   `XLA_PYTHON_CLIENT_ALLOCATOR=platform` releases allocations eagerly, at a
   potential performance cost.
+  Up to one eighth of the budget (capped at 2 GiB) is reserved for reusable
+  two-bit genotype blocks. A complete source must fit its share to be cached;
+  larger sources continue to stream. Background SS reuses this reservation
+  with smaller decode blocks and device-side loops. Neither cache stores a
+  dense standardized genotype matrix or sample Gram matrix.
 - `--ring-depth`: number of CPU-side staging buffers used for genotype
   streaming. This is the main knob for controlling CPU memory peak during data
   movement. Larger values can give smoother host-to-GPU streaming but allocate
@@ -569,6 +575,12 @@ fit lifecycle.
   agreement on the target GPU.
 - `--pcg-tol`: ordinary PCG tolerance used by screening, candidate construction,
   and outer iterations; the default is `5e-3`.
+- `--slq-quadrature-tol`: per-sample log-quadrature error target for multi-GRM
+  SLQ, default `1e-6`. Gauss–Radau bounds permit stopping before `--slq-m`,
+  which remains the maximum depth; `0` retains fixed-depth evaluation.
+  The random probes are unchanged, and the gradient differentiates the
+  actual recurrence used for the likelihood. This controls quadrature error,
+  independently of the Monte Carlo error controlled by `--slq-samples`.
 - `--kkt-tol` and `--kkt-rel-tol`: absolute and lambda-scaled tolerances for
   the signed score-KKT conditions.  Their effective minimum is
   `max(1e-4, 2*pcg_tol)`, so the certificate does not demand more precision

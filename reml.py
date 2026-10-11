@@ -98,6 +98,8 @@ class REMLContext:
     slq_reference_runtime: Optional[ProjectedCoreRuntime] = None
     mean_information: object | None = None
     slq_workspace_bytes: int = 256 * 1024**2
+    slq_reference_inverse_lower: float | None = None
+    slq_quadrature_tolerance: float = 1e-6
 
 
 @dataclass
@@ -335,35 +337,6 @@ def _slq_tridiag_logdet_jit(
     return jnp.sum(ests) / nsamples_f
 
 
-def _slq_logdet(
-    Hv_fn: Callable,
-    n_dim: int,
-    key: "jax.random.PRNGKey",
-    nsamples: int = 30,
-    m: int = 50,
-) -> Array:
-    """
-    Stochastic Lanczos Quadrature for logdet(H).
-
-    Hv_fn is called in Python scope — concrete arrays, no tracing.
-    The Lanczos recurrence arithmetic is fused into `_lanczos_step_jit`
-    (one JIT dispatch per Lanczos step instead of 5–7 separate dispatches).
-    """
-    cache = _build_affine_slq_cache(
-        Hv_fn,
-        n_dim,
-        key,
-        nsamples=nsamples,
-        m=m,
-    )
-    return _slq_tridiag_logdet_jit(
-        cache.alphas_k,
-        cache.betas_k,
-        cache.z_norm_sq,
-        cache.nsamples_f,
-    )
-
-
 def _build_affine_slq_cache(
     K_fn: Callable,
     n_dim: int,
@@ -529,6 +502,22 @@ def _multi_slq_logdet_and_score(
     reference_logdet = (
         projected_core_logdet(reference, ctx.n) if reference is not None else 0.0
     )
+    # H >= min(diag(R)) I for nonnegative genetic variance components.
+    # For W H W, use min(diag(R))*lambda_min(W)^2. Bound W directly
+    # instead of assuming the stored low-rank basis is perfectly orthogonal.
+    residual = (pvec[ctx.G] if ctx.residual_diag_stack is None else
+                jnp.min(jnp.tensordot(pvec[ctx.G:], ctx.residual_diag_stack, axes=1)))
+    lower = float(residual)
+    if reference is not None and ctx.slq_quadrature_tolerance > 0:
+        if ctx.slq_reference_inverse_lower is None:
+            gram = jnp.matmul(reference.U.T, reference.U, precision=jax.lax.Precision.HIGHEST)
+            norm_bound = 1.01*float(jnp.max(jnp.sum(jnp.abs(gram), axis=1)))
+            base = float(reference.d)**-.5
+            correction = min(0., float(jnp.max(reference.eigvals))**-.5-base)
+            ctx.slq_reference_inverse_lower = .9*max(0., base+correction*norm_bound)**2
+        lower *= ctx.slq_reference_inverse_lower
+    lower = .9*lower if lower > 0 and bool(jnp.all(pvec[:ctx.G] >= 0)) else None
+    slq_diagnostics = {}
     value, gradient = _slq_value_and_grad(
         Bv, pullback, ctx.n, key, nsamples=nsamples, m=m,
         workspace_bytes=ctx.slq_workspace_bytes, dtype=pvec.dtype,
@@ -536,7 +525,11 @@ def _multi_slq_logdet_and_score(
             None if accept_logdet is None
             else lambda value: accept_logdet(value + reference_logdet)
         ),
+        lower_bound=lower, quadrature_tolerance=ctx.slq_quadrature_tolerance,
+        diagnostics=slq_diagnostics,
     )
+    logger.debug('[SLQ] maximum depth=%d actual batches=%s', m,
+                 slq_diagnostics.get('batch_depths'))
     return value + reference_logdet, gradient
 
 
@@ -1288,6 +1281,7 @@ def fit_reml(
     probe_cache: REMLProbeCache | None = None,
     mean_information=None,
     slq_workspace_bytes: int = 256 * 1024**2,
+    slq_quadrature_tolerance: float = 1e-6,
 ):
     """Fit single-trait Gaussian REML with AI/Fisher updates.
 
@@ -1331,6 +1325,8 @@ def fit_reml(
         raise ValueError("fit_reml requires slq_m > 0.")
     if slq_workspace_bytes < 1:
         raise ValueError("fit_reml requires slq_workspace_bytes > 0.")
+    if not np.isfinite(slq_quadrature_tolerance) or slq_quadrature_tolerance < 0:
+        raise ValueError('SLQ quadrature tolerance must be finite and nonnegative.')
     if not 0.0 <= h2_init <= 1.0:
         raise ValueError("h2_init must lie in [0, 1].")
     genetic_trace_atoms = (
@@ -1616,6 +1612,7 @@ def fit_reml(
         slq_reference_runtime=slq_reference_runtime,
         mean_information=mean_information,
         slq_workspace_bytes=int(slq_workspace_bytes),
+        slq_quadrature_tolerance=slq_quadrature_tolerance,
     )
     # The fixed SLQ runtime only needs the original basis and its factorization;
     # release the original component-core configuration once the context owns

@@ -20,15 +20,19 @@ class StreamedGenotypeProducts:
     Custom index implementations may supply standardized columns instead;
     that fallback retains only one memory-bounded genotype block.
     """
-    def __init__(self, index, n, normalizers, *, block_bytes=64*1024**2):
+    def __init__(self, index, n, normalizers, *, block_bytes=64*1024**2,
+                 device_cache_bytes=0):
         self.index, self.n, self.p = index, int(n), int(index.m_total)
         self.streamer = getattr(index, 'streamer', None)
         self.normalizers = np.asarray(normalizers, float)
         self.offsets = np.r_[0, np.cumsum(index.m_per_grm)]
         self.chunk_size = min(4096, max(1, block_bytes//max(16*self.n, 1)))
         self.packed_calls = None
+        self._device_packed = None
+        self.device_cache_bytes = 0
         if (self.streamer is not None and getattr(self.streamer, '_packed_buf', None) is not None
-                and self.streamer._max_unpack_width > self.chunk_size):
+                and getattr(self.streamer, '_means_host', None) is not None
+                and getattr(self.streamer, '_inv_sds_host', None) is not None):
             # SS uses FP64 products. Subdivide the existing packed cache so a
             # call planned for the FP32 REML stage cannot create an oversized
             # FP64 decode workspace. Source order and training statistics stay
@@ -52,6 +56,45 @@ class StreamedGenotypeProducts:
             self.inverse = jax.device_put(inverse, self.streamer.dev)
             self.starts = jax.device_put(np.array([c[3] for c in calls], np.int32), self.streamer.dev)
             self.widths = jax.device_put(np.array([c[4] for c in calls], np.int32), self.streamer.dev)
+            self._all_calls = jnp.arange(len(calls), dtype=jnp.int32)
+            self._missing = jnp.asarray(self.streamer._missing_val, jnp.uint8)
+            needed = len(calls)*self.n*(self.packed_width//4)
+            if (getattr(self.streamer.dev, 'platform', None) == 'gpu'
+                    and 0 < needed <= device_cache_bytes):
+                from .kv_impl import _device_put_block, _store_packed_call
+                with jax.default_device(self.streamer.dev):
+                    cache = jnp.zeros((len(calls), self.n, self.packed_width//4), jnp.uint8)
+                # One upload at a time bounds setup memory at cache + one block.
+                for k in range(len(calls)):
+                    block = self._packed(k)
+                    if block.shape[1] < self.packed_width//4:
+                        block = np.pad(block, ((0, 0), (0, self.packed_width//4-block.shape[1])))
+                    cache = _store_packed_call(cache, _device_put_block(block, self.streamer.dev),
+                                               jnp.asarray(k, jnp.int32))
+                    cache.block_until_ready()
+                self._device_packed = cache
+                self.device_cache_bytes = needed
+
+    def _active_calls(self, active):
+        selected, masks = [], np.zeros((len(self.packed_calls), self.packed_width), bool)
+        for k, (_, _, _, start, actual) in enumerate(self.packed_calls):
+            masks[k, :actual] = active[start:start+actual]
+            if np.any(masks[k]):
+                selected.append(k)
+        return jnp.asarray(selected, jnp.int32), self.inverse*jnp.asarray(masks)
+
+    def restricted(self, active):
+        """Restrict VAMP linear products; general foreground products stay unmasked."""
+        if self._device_packed is None:
+            return self
+        from types import SimpleNamespace
+        from .kv_impl import packed_cache_forward, packed_cache_transpose
+        selected, inverse = self._active_calls(np.asarray(active, bool))
+        return SimpleNamespace(
+            forward=lambda effects: packed_cache_forward(self._device_packed, self.starts,
+                self.widths, self.means, inverse, selected, effects, self._missing),
+            transpose=lambda value: packed_cache_transpose(self._device_packed, self.starts,
+                self.widths, self.means, inverse, selected, value, self._missing, p=self.p))
 
     def _packed(self, k):
         call, first, last, _, _ = self.packed_calls[k]
@@ -67,6 +110,10 @@ class StreamedGenotypeProducts:
 
     def forward(self, effects):
         effects = jnp.asarray(effects)
+        if self._device_packed is not None:
+            from .kv_impl import packed_cache_forward
+            return packed_cache_forward(self._device_packed, self.starts, self.widths,
+                self.means, self.inverse, self._all_calls, effects, self._missing)
         if self.packed_calls is not None:
             from .kv_impl import xv_impl_streamed
             return xv_impl_streamed(effects, self.starts, self.widths, self.means, self.inverse,
@@ -81,6 +128,10 @@ class StreamedGenotypeProducts:
 
     def transpose(self, residual):
         residual = jnp.asarray(residual)
+        if self._device_packed is not None:
+            from .kv_impl import packed_cache_transpose
+            return packed_cache_transpose(self._device_packed, self.starts, self.widths,
+                self.means, self.inverse, self._all_calls, residual, self._missing, p=self.p)
         if self.packed_calls is not None:
             from .kv_impl import xtv_impl_streamed
             return xtv_impl_streamed(residual, self.p, self.starts, self.widths,
@@ -96,6 +147,11 @@ class StreamedGenotypeProducts:
 
     def gram_operator(self, active):
         active = np.asarray(active, bool)
+        if self._device_packed is not None:
+            from .kv_impl import packed_cache_gram
+            selected, inverse = self._active_calls(active)
+            return lambda value: packed_cache_gram(self._device_packed, self.widths,
+                self.means, inverse, selected, value, self._missing)
         if self.packed_calls is not None:
             from .kv_impl import _device_put_block, _kv_one_call_jit
             selected, inverse = [], []
@@ -136,6 +192,11 @@ class StreamedGenotypeProducts:
         return operator
 
     def gram_diagonal(self, active):
+        if self._device_packed is not None:
+            from .kv_impl import packed_cache_diagonal
+            selected, inverse = self._active_calls(np.asarray(active, bool))
+            return packed_cache_diagonal(self._device_packed, self.widths, self.means,
+                                          inverse, selected, self._missing)
         if self.streamer is not None and np.all(active) and hasattr(self.streamer, 'exact_diag'):
             return self.streamer.exact_diag().astype(jnp.float64)*self.streamer._eff_m_const
         total = jnp.zeros(self.n, jnp.float64)
@@ -296,7 +357,18 @@ def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
         workspace = min(max(config.trace_workspace_bytes, minimum_workspace),
                         max(1, int(budget)//8))
         config = replace(config, trace_workspace_bytes=workspace)
-    products = StreamedGenotypeProducts(grm_index, n, normalizers, block_bytes=block_bytes)
+    from .runtime_env import packed_device_cache_budget
+    cache_bytes = getattr(getattr(fitter, 'cfg', None), 'packed_device_cache_bytes', None)
+    if cache_bytes is None:
+        cache_bytes = packed_device_cache_budget(budget)
+    # REML is complete. Reuse its reservation for SS's smaller FP64 blocks
+    # instead of holding two copies of the same compressed genotypes.
+    for streamer in getattr(fitter, 'streamers', ()):
+        release = getattr(streamer, 'release_packed_device_cache', None)
+        if release is not None:
+            release()
+    products = StreamedGenotypeProducts(grm_index, n, normalizers, block_bytes=block_bytes,
+                                        device_cache_bytes=cache_bytes)
     context = GroupedSSBackgroundContext(products, groups, normalizers)
     result = refine_lasso_background_ss(context, y=y, alpha=alpha, gamma=beta_cov,
         covariates=covariates, blup=initial, variance_components=theta, config=config)

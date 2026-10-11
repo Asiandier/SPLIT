@@ -48,6 +48,7 @@ class FitConfig:
     smile_diag_mode: str = "mean"
     smile_strict_coverage: bool = True
     smile_w_device_cache_bytes: float | None = None
+    packed_device_cache_bytes: int | None = None
     smile_optimizer: str = "strict"
     smile_scoring_step_tol: float = 1e-4
     strict_max_linesearch_trials: int = 3
@@ -66,6 +67,7 @@ class FitConfig:
     seed: int = 0
     slq_samples: int = 4
     slq_m: int = 8
+    slq_quadrature_tol: float = 1e-6
     slq_mode: str = "projected_core_residual"
     precond_rank: int = 500
     pcg_ridge: float = 1e-6
@@ -412,7 +414,6 @@ class InfinitesimalREMLFitter:
         self._n_dense_streamers = 0
         self._has_sparse = False
         self._partitioned_streamer = None
-        self._smile_operator = None
         self._smile_operators = ()
         self._admix_sqrt_weights = None
         self._admix_weights = None
@@ -578,6 +579,16 @@ class InfinitesimalREMLFitter:
             else:
                 self.streamers = [_build_one(item) for item in build_items]
 
+        # Reserve one shared cache budget across all dense sources. The
+        # planner accounts for the same budget alongside kernel workspaces.
+        from .runtime_env import packed_device_cache_budget
+        cache_budget = (packed_device_cache_budget(cfg.gpu_budget_bytes)
+                        if cfg.packed_device_cache_bytes is None else int(cfg.packed_device_cache_bytes))
+        per_source_cache = cache_budget//max(1, len(self.streamers))
+        for streamer in self.streamers:
+            cache = getattr(streamer, 'cache_packed_on_device', None)
+            if cache is not None:
+                cache(per_source_cache)
         n_dense = len(self.streamers)
         self._n_dense_streamers = n_dense
         if use_component_partition and self.streamers:
@@ -663,8 +674,6 @@ class InfinitesimalREMLFitter:
         _validate_source_sample_order(self.streamers)
 
         self._sparse_streamers = tuple(self.streamers[self._n_dense_streamers:]) if self._has_sparse else ()
-        self._sparse_merged_global = None
-
         if use_smile:
             if self._n_dense_streamers != 1 or len(self.streamers) != 1:
                 raise ValueError("SMILE block-W mode requires exactly one dense genotype source.")
@@ -732,7 +741,6 @@ class InfinitesimalREMLFitter:
                         device_cache_max_bytes=smile_w_cache_bytes,
                     ),
                 )
-            self._smile_operator = self._smile_operators[0] if self._smile_operators else None
             logger.info(
                 "SMILE operator construction done in %.2fs; n_grm=%d n_blocks=%d "
                 "w_device_cache=%.2fGiB w_buckets=%d",
@@ -1829,7 +1837,6 @@ class InfinitesimalREMLFitter:
         self._has_sparse = False
         self._sparse_streamers = ()
         self._partitioned_streamer = None
-        self._smile_operator = None
         self._smile_operators = ()
 
     def fit_infinitesimal(
@@ -1908,6 +1915,7 @@ class InfinitesimalREMLFitter:
                 slq_m=self.cfg.slq_m,
                 slq_mode=self.cfg.slq_mode,
                 slq_workspace_bytes=default_workspace_bytes(self.cfg.gpu_budget_bytes),
+                slq_quadrature_tolerance=self.cfg.slq_quadrature_tol,
                 precond_conf=self.precond_conf,
                 slq_precond_conf=self.precond_conf,
                 precond_refresh_fn=self._make_pcg_precond_refresh_fn(ops),

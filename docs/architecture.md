@@ -7,11 +7,11 @@ GPU_REML is organized around one contract: a covariance component must expose
 
 | Layer | Main modules | Responsibility |
 | --- | --- | --- |
-| CLI and planning | `run_reml_pipeline.py`, `run_sparse_reml_pipeline.py`, `suggest_params_v3.py` | Parse user inputs, estimate memory peaks, choose call width/ring depth, and report results. |
+| CLI and planning | `run_reml_pipeline.py`, `run_sparse_pipeline.py`, `run_sparse_reml_pipeline.py`, `run_gwas_pipeline.py`, `suggest_params_v3.py` | Parse user inputs, estimate memory peaks, choose call width/ring depth, and report results. |
 | Data alignment | `data_utils.py`, `geno_source.py`, `component_spec.py`, `admixed_cov.py` | Align samples and variants, validate component definitions, and expose BED/PGEN sources. |
 | Streaming | `geno_stream.py`, `sparse_stream.py`, `block_backend.py` | Build packed host caches, retain standardization statistics, prefetch blocks, and manage pinned staging buffers. |
 | Matrix-free operators | `kv_impl.py`, `smile_block_w.py` | Decode blocks and implement standard, partitioned, multi-GRM, admixed, weighted, transpose, and prediction products. |
-| Numerical solver | `reml.py`, `pcg.py`, `precond.py` | Form the REML projection, Hutchinson scores, SLQ objective, AI matrix, constrained updates, and projected-core preconditioner. |
+| Numerical solver | `reml.py`, `slq.py`, `pcg.py`, `precond.py` | Form the REML projection, Hutchinson scores, SLQ objective, AI matrix, constrained updates, and projected-core preconditioner. |
 | Public model API | `reml_model.py` | Build compatible operator bundles, manage preconditioner lifecycle, fit replicates, estimate effects, and predict. |
 | Downstream models | `lasso_cd.py`, `gwas.py` | Reuse the fitted covariance for sparse GLS and marginal GWAS. |
 | Sparse mean information | `sparse_information.py` | Selected-span log determinant, score correction and paired sparse-variance correction, without sample-square matrices. |
@@ -84,6 +84,12 @@ GPU_REML is organized around one contract: a covariance component must expose
   Onsager traces. Bounded genotype decode and Krylov batches replace full
   standardized designs and sample-square Gram eigensystems. Quadrature gaps
   and trace sampling uncertainty are recorded separately.
+- Multi-GRM SLQ stops when its quadrature gap meets the configured tolerance,
+  while differentiating the same recurrence used for the objective. SS trace
+  quadrature starts at 32 steps and increases depth when its gap is unresolved.
+- A bounded packed GPU cache avoids repeated host transfers when a complete
+  source fits. SS uses compiled block loops over this cache; larger sources
+  retain the streaming path. Both phases share the planner's cache reservation.
 - `K_i @ Vrand` is persistent state. Score traces use symmetry to avoid applying
   every `K_i` to all projected probes on every iteration.
 - Single-GRM identity-residual SLQ uses Krylov shift/scale invariance. It scans

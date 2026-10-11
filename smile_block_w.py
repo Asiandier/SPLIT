@@ -500,7 +500,6 @@ class SmileBlockWeightedOperator:
         self.normalization = normalization
         self.normalizer = self._compute_global_normalizer(
             [block.trace_per_sample for block in blocks],
-            normalization=normalization,
         )
         if raw_diag is None:
             self._diag_host = np.asarray(
@@ -531,7 +530,7 @@ class SmileBlockWeightedOperator:
         if diag_mode not in ("full", "mean"):
             raise ValueError("diag_mode must be 'full' or 'mean'.")
         if block_size is None:
-            block_size = cls._auto_identity_block_size(streamer, normalization=normalization)
+            block_size = cls._auto_identity_block_size(streamer)
         block_size = int(block_size)
         if block_size <= 0:
             raise ValueError("block_size must be positive.")
@@ -589,7 +588,6 @@ class SmileBlockWeightedOperator:
         self.normalization = normalization
         self.normalizer = cls._compute_global_normalizer(
             [block.trace_per_sample for block in blocks],
-            normalization=normalization,
         )
         if raw_diag is None:
             self._diag_host = np.asarray(
@@ -605,11 +603,7 @@ class SmileBlockWeightedOperator:
         return self
 
     @staticmethod
-    def _auto_identity_block_size(
-        streamer,
-        *,
-        normalization: Normalization,
-    ) -> int:
+    def _auto_identity_block_size(streamer) -> int:
         bytes_per_value = np.dtype(np.float32).itemsize
         n = max(1, int(streamer.n))
         width = int(_IDENTITY_TRACE_SCAN_TARGET_BYTES // (n * bytes_per_value))
@@ -717,8 +711,6 @@ class SmileBlockWeightedOperator:
     @staticmethod
     def _compute_global_normalizer(
         trace_values: Sequence[float],
-        *,
-        normalization: Normalization,
     ) -> float:
         value = float(np.sum(np.asarray(trace_values, dtype=np.float64)))
         if not np.isfinite(value) or value <= 0.0:

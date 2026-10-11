@@ -144,9 +144,44 @@ def _batch_pullback(matvec_pullback, basis, products, beta, a_bar, b_bar):
     return gradient
 
 
+def _log_quadrature_gap(alpha, beta, lower_bound):
+    """Gauss / left-Radau log bounds per unit-norm probe, in FP64.
+
+    For log, Gauss is an upper bound and Radau at a positive spectral lower
+    bound is a lower bound. This controls quadrature error separately from
+    Monte Carlo error; probes and their number are never changed.
+    """
+    from scipy.linalg import eigh_tridiagonal
+    alphas, betas = np.asarray(alpha, dtype=float), np.asarray(beta, dtype=float)
+    largest_gap = 0.
+    for a, b in zip(alphas.T, betas.T):
+        zeros = np.flatnonzero(b == 0)
+        depth = int(zeros[0]+1) if zeros.size else len(a)
+        values, vectors = eigh_tridiagonal(a[:depth], b[:depth-1])
+        # If the operator violates the supplied bound (including roundoff),
+        # fall back to the requested depth rather than accepting a false bound.
+        if values[0] <= lower_bound:
+            return float('inf')
+        if zeros.size:
+            continue
+        gauss = np.sum(vectors[0]**2*np.log(values))
+        last_inverse = np.sum(vectors[-1]**2/(values-lower_bound))
+        endpoint = lower_bound+b[-1]**2*last_inverse
+        nodes, vec = eigh_tridiagonal(np.r_[a, endpoint], b)
+        if nodes[0] <= 0:
+            return float('inf')
+        radau = np.sum(vec[0]**2*np.log(nodes))
+        gap = gauss-radau
+        if not np.isfinite(gap) or gap < -1e-10*max(1., abs(gauss)):
+            return float('inf')
+        largest_gap = max(largest_gap, gap)
+    return largest_gap
+
+
 def logdet_value_and_grad(matvec, matvec_pullback, n, key, *, nsamples, m,
                          workspace_bytes=256*1024**2, dtype=jnp.float32,
-                         accept_value=None):
+                         accept_value=None, lower_bound=None,
+                         quadrature_tolerance=1e-6, diagnostics=None):
     """Return a fixed-probe SLQ value and its own parameter gradient.
 
     ``matvec_pullback(left, right)`` returns ``(matvec(left), gradient)``,
@@ -161,8 +196,24 @@ def logdet_value_and_grad(matvec, matvec_pullback, n, key, *, nsamples, m,
     If all forward states plus reverse workspace fit the budget estimate,
     defer reverse passes until acceptance. Otherwise retain the original
     streamed eager derivative, without extra caching or repeated forward matvecs.
+
+    If a positive spectral ``lower_bound`` is supplied, stop a batch when its
+    Gauss/Radau log gap is at most ``quadrature_tolerance`` per sample. ``m``
+    remains the maximum depth; tolerance zero requests that fixed depth.
+    Reverse exactly the recurrence actually used,
+    so the line-search objective and its local derivative remain consistent.
     """
+    if lower_bound is not None and (not np.isfinite(lower_bound) or lower_bound <= 0):
+        raise ValueError('SLQ spectral lower bound must be finite and positive')
+    if not np.isfinite(quadrature_tolerance) or quadrature_tolerance < 0:
+        raise ValueError('SLQ quadrature tolerance must be finite and nonnegative')
     depth = min(int(m), int(n))
+    # The bounds apply to log(x), not to the clipped spectral extension used
+    # by _quadrature near singularity. Preserve fixed-depth behavior unless
+    # the whole spectrum is certified above the original clipping floor.
+    spectral_floor = max(float(np.finfo(dtype).eps)*depth, 1e-6)
+    if lower_bound is not None and lower_bound <= spectral_floor:
+        lower_bound = None
     # Q, products, their adjoints and recurrence/VJP workspaces. Batching
     # bounds retained state independently of the total number of probes.
     layout = workspace_layout(n, nsamples, m, workspace_bytes, itemsize=np.dtype(dtype).itemsize)
@@ -183,6 +234,7 @@ def logdet_value_and_grad(matvec, matvec_pullback, n, key, *, nsamples, m,
         products = None if matvec_pullback is None else jnp.zeros((depth, n, count), dtype=dtype)
         alpha, beta = [], []
         previous_beta = jnp.zeros(count, dtype=dtype)
+        gap = None
         for index in range(depth):
             product = jnp.asarray(matvec(basis[index]), dtype=dtype)
             next_q, a, b = _step(basis, product, previous_beta, jnp.asarray(index))
@@ -191,8 +243,19 @@ def logdet_value_and_grad(matvec, matvec_pullback, n, key, *, nsamples, m,
             basis = _set_row(basis, index+1, next_q)
             alpha.append(a); beta.append(b)
             previous_beta = b
+            if (lower_bound is not None and quadrature_tolerance > 0
+                    and 8 <= index+1 < depth and (index+1) % 4 == 0):
+                gap = _log_quadrature_gap(jnp.stack(alpha), jnp.stack(beta), lower_bound)
+                if gap <= quadrature_tolerance:
+                    break
+        actual_depth = len(alpha)
+        if diagnostics is not None:
+            diagnostics.setdefault('batch_depths', []).append(actual_depth)
+            diagnostics.setdefault('log_quadrature_gaps', []).append(gap)
+        if products is not None:
+            products = products[:actual_depth]
         alphas = jnp.stack(alpha)
-        betas = jnp.stack(beta[:-1]) if depth > 1 else jnp.empty((0, count), dtype=dtype)
+        betas = jnp.stack(beta[:-1]) if actual_depth > 1 else jnp.empty((0, count), dtype=dtype)
         value, a_bar, b_small = _quadrature(alphas, betas, jnp.asarray(n/nsamples, dtype=dtype))
         total_value = total_value+value
         if matvec_pullback is None:

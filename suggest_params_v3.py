@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 
 from .slq import default_workspace_bytes, workspace_layout
+from .runtime_env import packed_device_cache_budget
 
 _GIB = 1024**3
 _W_ALIGN = 256
@@ -61,6 +62,7 @@ class PlanResult:
     gpu_precond_state_gib: float = 0.0
     gpu_allocator_pool_limit_gib: float = 0.0
     smile_w_device_cache_bytes: Optional[float] = None
+    packed_device_cache_bytes: Optional[int] = None
     source_build_chunk_width: int = 0
     source_build_chunks: int = 0
     source_build_est_gib: float = 0.0
@@ -146,7 +148,6 @@ def _kvrand_cache_bytes(n: int, n_grm: int, n_rand_vec: int) -> float:
 
 
 def _dense_streamer_state_bytes(
-    n: int,
     segment_sizes: Sequence[int],
     *,
     call_width: int,
@@ -540,11 +541,14 @@ def suggest_call_width(
 
     def _estimate_live_peaks(width: int) -> tuple[float, float, float, float, float, float, float, float]:
         streamer_state, geom = _dense_streamer_state_bytes(
-            n,
             segment_sizes,
             call_width=width,
             n_grm=G,
         )
+        # Upper bound across dense sources, including per-call byte padding.
+        # Reserving the cap is conservative if no complete source fits it.
+        packed_bytes = n*(total_p+3*geom.n_calls)//4
+        streamer_state += min(packed_bytes, packed_device_cache_budget(gpu_budget))
         precond_state = _fit_projected_core_state_bytes(n, G, precond_rank)
         build_basis = streamer_state + _basis_build_live_bytes(n, geom, precond_rank)
         if component_block_sizes is not None:
@@ -705,7 +709,7 @@ def suggest_call_width(
         )
 
     # ---- ring_depth: direct control, no CPU budget model ------------------
-    _, geom = _dense_streamer_state_bytes(n, segment_sizes, call_width=w, n_grm=G)
+    _, geom = _dense_streamer_state_bytes(segment_sizes, call_width=w, n_grm=G)
     n_calls = max(1, geom.n_calls)
     if ring_depth is not None:
         depth = max(_RING_DEPTH_MIN, min(_RING_DEPTH_MAX, int(ring_depth)))
@@ -752,6 +756,7 @@ def suggest_call_width(
         feasible=gpu_feasible, call_width=w, precond_rank=precond_rank,
         gpu_budget_gib=gpu_budget_gib,
         gpu_fixed_gib=gpu_fixed_gib,
+        packed_device_cache_bytes=packed_device_cache_budget(gpu_budget),
         gpu_scratch_gib=scratch / _GIB,
         target_width=target_width,
         ring_depth=depth,

@@ -839,10 +839,12 @@ def build_analysis_context(args: argparse.Namespace) -> AnalysisContext:
             else float(plan.gpu_budget_gib) * 1024**3
         ),
         ring_depth=plan.ring_depth,
+        packed_device_cache_bytes=plan.packed_device_cache_bytes,
         n_rand_vec=int(args.n_rand_vec),
         minq_iter=int(args.minq_iter),
         slq_samples=int(args.slq_samples),
         slq_m=int(args.slq_m),
+        slq_quadrature_tol=float(args.slq_quadrature_tol),
         precond_rank=plan.precond_rank,
         reml_pcg_tol=float(args.pcg_tol),
         response_is_standardized=True,
@@ -1043,6 +1045,10 @@ def _add_common_fit_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--n-rand-vec", type=int, default=100)
     parser.add_argument("--slq-samples", type=int, default=100)
     parser.add_argument("--slq-m", type=int, default=50)
+    parser.add_argument(
+        "--slq-quadrature-tol", type=float, default=1e-6,
+        help="Per-probe log quadrature tolerance; 0 uses the fixed SLQ depth.",
+    )
     parser.add_argument("--minq-iter", type=int, default=50)
     parser.add_argument("--pcg-tol", type=float, default=5e-3)
     parser.add_argument("--pcg-ridge", type=float, default=1e-6)
@@ -1075,6 +1081,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     frozen.add_argument("--theta-init-json", required=True)
     frozen.add_argument("--out", required=True)
     args = parser.parse_args(argv)
+    if not np.isfinite(args.slq_quadrature_tol) or args.slq_quadrature_tol < 0.0:
+        parser.error("--slq-quadrature-tol must be finite and nonnegative.")
     if (
         args.cpu_threads < 0
         or args.gpu_budget_gib < 0.0

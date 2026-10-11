@@ -50,17 +50,44 @@ class MatrixFreeSampleSolver:
         self.solve_calls = self.total_pcg_iterations = 0
         self.maximum_pcg_residual = self.maximum_quadrature_gap = 0.
         self.maximum_trace_relative_standard_error = 0.
+        self.maximum_lanczos_steps = min(lanczos_steps, self.n)
+        self._trace_options = (probes, workspace_bytes, seed, exact_probe_limit)
+        self.setup_diagnostics = dict(method='matrix_free_pcg_cached_lanczos',
+            gram_materialized=False, genotype_materialized=hasattr(products, 'x'),
+            trace_estimator='randomly_signed_Walsh_without_replacement',
+            maximum_lanczos_steps=self.maximum_lanczos_steps,
+            packed_device_cache_bytes=int(getattr(products, 'device_cache_bytes', 0)),
+            setup_seconds=0., quadrature_refinements=0)
+        if hasattr(products, 'chunk_size'):
+            self.setup_diagnostics['genotype_chunk_snps'] = int(products.chunk_size)
+        self._build_quadrature(min(32, self.maximum_lanczos_steps))
+
+    def _build_quadrature(self, depth):
+        """Rebuild fixed probes only when a requested shift needs more depth."""
         started = time.monotonic()
+        try:
+            self._build_quadrature_at_depth(depth)
+        except ArithmeticError:
+            self.setup_diagnostics['setup_seconds'] += time.monotonic()-started
+            if depth >= self.maximum_lanczos_steps:
+                raise
+            self.setup_diagnostics['quadrature_refinements'] += 1
+            self._build_quadrature(min(2*depth, self.maximum_lanczos_steps))
+        else:
+            self.setup_diagnostics['setup_seconds'] += time.monotonic()-started
+
+    def _build_quadrature_at_depth(self, depth):
+        probes, workspace_bytes, seed, exact_probe_limit = self._trace_options
         population = 1 << (self.n-1).bit_length()
         count = min(population, probes)
         if population <= exact_probe_limit:
             count = population
         if count == 1 and population > 1:
             raise ValueError('Need at least two SS trace probes to report sampling uncertainty')
-        depth = min(lanczos_steps, self.n)
         # Two-pass reorthogonalization retains one basis for the current
         # batch. Account for matvec, recurrence and small eigensystem buffers.
-        per_probe = 8*(self.n*(2*depth+32)+8*(depth+1)**2)
+        maximum = self.maximum_lanczos_steps
+        per_probe = 8*(self.n*(2*maximum+32)+8*(maximum+1)**2)
         if per_probe > workspace_bytes:
             raise MemoryError('SS trace workspace cannot hold one Lanczos probe; '
                               'reduce Lanczos steps or increase workspace_bytes')
@@ -125,16 +152,11 @@ class MatrixFreeSampleSolver:
         self.nodes, self.weights = nodes, weights
         self.radau_nodes, self.radau_weights = radau_nodes, radau_weights
         self.probe_count, self.population = count, population
-        self.setup_diagnostics = dict(method='matrix_free_pcg_cached_lanczos',
-            gram_materialized=False, genotype_materialized=hasattr(products, 'x'),
-            trace_estimator='randomly_signed_Walsh_without_replacement',
+        self.setup_diagnostics.update(
             trace_probes=count, trace_population=population,
             trace_sampling_exact=count == population, lanczos_steps=depth,
             trace_batch_width=width, trace_workspace_bytes=workspace_bytes,
-            trace_workspace_estimated_bytes=width*per_probe, seed=int(seed),
-            setup_seconds=time.monotonic()-started)
-        if hasattr(products, 'chunk_size'):
-            self.setup_diagnostics['genotype_chunk_snps'] = int(products.chunk_size)
+            trace_workspace_estimated_bytes=width*per_probe, seed=int(seed))
 
     def trace(self, shifts):
         shifts = np.asarray(shifts, float)
@@ -152,6 +174,11 @@ class MatrixFreeSampleSolver:
         if not np.all(np.isfinite(estimate)) or np.any(estimate <= 0) or np.any(estimate >= 1):
             raise ArithmeticError('Invalid SS linear Onsager trace; increase trace probes')
         if np.any(gap > self.trace_tolerance):
+            depth = self.setup_diagnostics['lanczos_steps']
+            if depth < self.maximum_lanczos_steps:
+                self.setup_diagnostics['quadrature_refinements'] += 1
+                self._build_quadrature(min(2*depth, self.maximum_lanczos_steps))
+                return self.trace(shifts)
             raise ArithmeticError(f'SS Lanczos trace quadrature unresolved: relative gap {gap}; '
                                   'increase lanczos_steps')
         correction = (self.population-self.probe_count)/(self.population-1) if self.population > 1 else 0.

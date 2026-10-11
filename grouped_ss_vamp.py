@@ -382,7 +382,7 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
 
     @jax.jit
     def nonlinear(r, gam, prob):
-        mean, var, pip, mu, s2, evidence = posterior(r, gam, prob)
+        mean, var, pip, mu, s2, _ = posterior(r, gam, prob)
         divergence = gam*jnp.sum(var, axis=0)/p_active
         new_pi, _ = constrained_ss_m_step(reduce_group(pip), reduce_group(pip*(s2+mu*mu)),
                                          counts, d, config.pi_min)
@@ -397,22 +397,22 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
         return jnp.sqrt(jnp.sum((a-b)**2, axis=0)/jnp.maximum(scale, 1e-30))
 
     trace = []
-    status = ['max_iterations']*batch
+    linear_products = products.restricted(np.any(np.asarray(active), axis=1)) if hasattr(products, 'restricted') else products
     for iteration in range(1, config.max_iterations+1):
         old_pi, old_slab = pi, slab
         if config.learn_pi and iteration > config.em_warmup:
             learned_pi = learn_prior(r1, gamma1, pi)
             pi = jnp.where(jax.device_put(done)[None, :], old_pi, learned_pi)
             slab = jnp.where(d > 0, d/jnp.maximum(pi, config.pi_min), 0.)
-        m1, var1, pip, alpha1, em_error = nonlinear(r1, gamma1, pi)
+        m1, _, _, alpha1, em_error = nonlinear(r1, gamma1, pi)
         alpha_host = np.asarray(alpha1)
         if np.any(~np.isfinite(alpha_host)) or np.any(alpha_host <= 0) or np.any(alpha_host >= 1):
             raise ArithmeticError(f'Invalid nonlinear Onsager divergence at {iteration}: {alpha_host}')
         gamma2 = gamma1*(1-alpha1)/alpha1
         r2 = jnp.where(active, (m1-alpha1[None, :]*r1)/(1-alpha1)[None, :], 0.)
-        rhs = y-products.forward(r2)
+        rhs = y-linear_products.forward(r2)
         solved, trace_fraction = linear_solver.solve_and_trace(rhs, gamma2*noise)
-        correction = jnp.where(active, products.transpose(solved), 0.)
+        correction = jnp.where(active, linear_products.transpose(solved), 0.)
         m2 = r2+correction
         # Avoid subtracting nearly equal quantities when p >> n.
         gamma_proposed = gamma2*trace_fraction/(1-trace_fraction)

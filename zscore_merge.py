@@ -24,12 +24,6 @@ except ImportError:  # pragma: no cover - direct script execution
     from component_spec import load_component_specs
 
 
-# Boundary variance-component test:
-#   0.5 * P(chi^2_1 >= T) = 0.05 -> T = qchisq(0.90, df=1).
-# The equivalent one-sided z cutoff is sqrt(T).
-DEFAULT_Z_CUTOFF = 1.6448536269514722
-
-
 def write_component_spec(path: Path, components: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as handle:
@@ -207,7 +201,6 @@ def merge_components(
     z: np.ndarray,
     z_cutoff: float,
     merge_mode: str,
-    args: argparse.Namespace,
 ) -> tuple[list[dict[str, object]], int, int]:
     if merge_mode == "global_weak":
         out = merge_global_weak(components, z, z_cutoff)
@@ -415,7 +408,6 @@ def run_from_pipeline_args(args: argparse.Namespace) -> dict[str, object]:
         z,
         float(args.z_cutoff),
         args.merge_mode,
-        args,
     )
     write_trace_row(
         trace_path,

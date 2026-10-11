@@ -361,6 +361,8 @@ def _low_level_command(
         str(int(args.slq_samples)),
         "--slq-m",
         str(int(args.slq_m)),
+        "--slq-quadrature-tol",
+        format(float(args.slq_quadrature_tol), ".8g"),
         "--minq-iter",
         str(int(args.minq_iter)),
         "--pcg-tol",
@@ -514,6 +516,8 @@ def _adaptive_stage_command(
         str(int(args.slq_samples)),
         "--slq-m",
         str(int(args.slq_m)),
+        "--slq-quadrature-tol",
+        format(float(args.slq_quadrature_tol), ".8g"),
         "--minq-iter",
         str(int(args.minq_iter)),
         "--pcg-tol",
@@ -1086,6 +1090,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--n-rand-vec", type=int, default=100)
     parser.add_argument("--slq-samples", type=int, default=100)
     parser.add_argument("--slq-m", type=int, default=50)
+    parser.add_argument("--slq-quadrature-tol", type=float, default=1e-6,
+                        help="Log quadrature error bound per sample; 0 uses fixed SLQ depth.")
     parser.add_argument("--minq-iter", type=int, default=50)
     parser.add_argument("--pcg-tol", type=float, default=5e-3)
     parser.add_argument("--pcg-ridge", type=float, default=1e-6)
@@ -1139,6 +1145,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive.")
     if not 0 < args.background_ss_pcg_tol < 1:
         parser.error('--background-ss-pcg-tol must lie in (0, 1).')
+    if not math.isfinite(args.slq_quadrature_tol) or args.slq_quadrature_tol < 0:
+        parser.error('--slq-quadrature-tol must be finite and nonnegative.')
     if args.score_reference_samples < 255:
         parser.error("--score-reference-samples must be at least 255.")
     if 1 / (args.score_reference_samples + 1) > args.split_alpha:
@@ -1303,6 +1311,7 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
             "n_rand_vec": int(args.n_rand_vec),
             "slq_samples": int(args.slq_samples),
             "slq_m": int(args.slq_m),
+            "slq_quadrature_tol": float(args.slq_quadrature_tol),
             "minq_iter": int(args.minq_iter),
             "pcg_tol": float(args.pcg_tol),
             "pcg_ridge": float(args.pcg_ridge),

@@ -330,6 +330,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=int(env("SEED", "0")))
     p.add_argument("--slq-samples", type=int, default=int(env("SLQ_SAMPLES", "4")))
     p.add_argument("--slq-m", type=int, default=int(env("SLQ_M", "8")))
+    p.add_argument("--slq-quadrature-tol", type=float, default=float(env("SLQ_QUADRATURE_TOL", "1e-6")),
+                   help="Log quadrature error bound per sample; 0 uses fixed SLQ depth.")
     p.add_argument(
         "--slq-mode",
         choices=["raw", "projected_core_residual"],
@@ -373,6 +375,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if not np.isfinite(args.slq_quadrature_tol) or args.slq_quadrature_tol < 0:
+        raise SystemExit('--slq-quadrature-tol must be finite and nonnegative.')
     if args.reml_pcg_tol <= 0.0:
         raise SystemExit("--reml-pcg-tol must be > 0.")
     if args.merge:
@@ -716,11 +720,13 @@ def main():
             call_width=call_width, keep_host_stats=prediction_active,
             cpu_threads=cpu_threads,
             gpu_budget_bytes=gpu_budget_bytes,
+            packed_device_cache_bytes=plan.packed_device_cache_bytes,
             ring_depth=plan.ring_depth,
             source_build_chunk_width=planned_source_build_chunk_width,
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter, seed=args.seed,
             reml_pcg_tol=args.reml_pcg_tol,
             slq_samples=args.slq_samples, slq_m=args.slq_m, slq_mode=args.slq_mode,
+            slq_quadrature_tol=args.slq_quadrature_tol,
             precond_rank=precond_rank,
             capture_reml_diagnostics=bool(args.export_ai),
             verbose=args.verbose)
@@ -746,11 +752,13 @@ def main():
             call_width=call_width, keep_host_stats=prediction_active,
             cpu_threads=cpu_threads,
             gpu_budget_bytes=gpu_budget_bytes,
+            packed_device_cache_bytes=plan.packed_device_cache_bytes,
             ring_depth=plan.ring_depth,
             source_build_chunk_width=planned_source_build_chunk_width,
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter, seed=args.seed,
             reml_pcg_tol=args.reml_pcg_tol,
             slq_samples=args.slq_samples, slq_m=args.slq_m, slq_mode=args.slq_mode,
+            slq_quadrature_tol=args.slq_quadrature_tol,
             precond_rank=precond_rank,
             capture_reml_diagnostics=bool(args.export_ai),
             verbose=args.verbose)
@@ -1011,6 +1019,7 @@ def main():
             slq_samples=args.slq_samples,
             slq_m=args.slq_m,
             slq_mode=args.slq_mode,
+            slq_quadrature_tol=args.slq_quadrature_tol,
             precond_rank=0,
             verbose=args.verbose,
         )

@@ -9,6 +9,12 @@ from __future__ import annotations
 import os
 
 
+def packed_device_cache_budget(gpu_budget_bytes=None) -> int:
+    """Reserve a bounded fraction for reusable two-bit genotype blocks."""
+    return (min(2 * 1024**3, max(0, int(gpu_budget_bytes)//8))
+            if gpu_budget_bytes is not None else 256 * 1024**2)
+
+
 def resolve_cpu_threads(explicit: int | None = None) -> tuple[int, str]:
     """Resolve one CPU budget without importing numerical libraries."""
     if explicit is not None:
@@ -42,4 +48,4 @@ def configure_runtime_env() -> None:
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 
-__all__ = ["configure_runtime_env", "resolve_cpu_threads"]
+__all__ = ["configure_runtime_env", "resolve_cpu_threads", "packed_device_cache_budget"]

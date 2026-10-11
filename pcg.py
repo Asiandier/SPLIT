@@ -119,8 +119,18 @@ def pcg_solve(
             raise FloatingPointError("Non-finite true residual in PCG.")
         return residual, norms, relative, relative_host
 
-    # Preserve a converged warm start exactly; its residual is already verified.
-    R, rnorm, res_final, relative_host = true_residual(solution)
+    if X0 is None:
+        # H is linear, so H @ 0 is exactly zero. Avoid a genome scan merely
+        # to verify the cold start; the returned solution is still verified.
+        R = B / rhs_scale
+        rnorm = jnp.linalg.norm(R, axis=0)
+        res_final = jnp.max(rnorm / b_norm)
+        relative_host = float(jax.device_get(res_final))
+        if not math.isfinite(relative_host):
+            raise FloatingPointError("Non-finite initial residual in PCG.")
+    else:
+        # Preserve a converged warm start exactly after checking its residual.
+        R, rnorm, res_final, relative_host = true_residual(solution)
     if relative_host <= tol or maxiter <= 0:
         return solution, res_final, 0
 
