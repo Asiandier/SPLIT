@@ -46,7 +46,7 @@ steps (floating point allowance `1e-10` per group). Otherwise the step is
 halved, eventually falling back to the two EM steps. Convex EM damping also
 retains the constraint. Extrapolation must follow the current EM direction
 and is limited to `[0.8*pi, 1.25*pi]` per inner step. Once the relative
-ordinary EM step is below `1e-9`, curvature extrapolation is disabled to
+ordinary EM step is below `max(em_tolerance, 1e-9)`, curvature extrapolation is disabled to
 avoid amplifying floating point noise; ordinary EM continues. Default outer
 hyperparameter damping is 0.05 and message damping is 0.2. These safeguards
 alter the numerical trajectory, not the eventual admissible prior family.

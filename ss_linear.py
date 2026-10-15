@@ -72,14 +72,23 @@ class SupportPrecisionSolver:
             return mean, precision, r, jnp.min(denominator, axis=0)
         self._natural_module = module
 
-    def stabilize_eta(self, eta, gamma):
+    def stabilize_eta_arrays(self, eta, gamma):
+        """Pure precision safeguard, usable inside a compiled iteration loop."""
         lower = gamma-self.values[0]/self.noise+1e-6*gamma
         guarded = eta < lower
-        self.precision_safeguard_count += int(np.asarray(guarded).sum())
         return jnp.maximum(eta, lower), guarded
 
+    def stabilize_eta(self, eta, gamma):
+        eta, guarded = self.stabilize_eta_arrays(eta, gamma)
+        self.precision_safeguard_count += int(np.asarray(guarded).sum())
+        return eta, guarded
+
+    def natural_module_arrays(self, h2, gamma2):
+        """JAX-only solve; callers must check minimum, precision and finiteness."""
+        return self._natural_module(h2, gamma2)
+
     def natural_module(self, h2, gamma2):
-        mean, precision, r, minimum = self._natural_module(h2, gamma2)
+        mean, precision, r, minimum = self.natural_module_arrays(h2, gamma2)
         if (np.any(np.asarray(minimum) <= 0) or np.any(np.asarray(precision) <= 0)
                 or not np.all(np.isfinite(np.asarray(mean)))):
             raise ArithmeticError('Nonpositive or nonfinite support linear posterior')

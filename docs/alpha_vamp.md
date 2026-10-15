@@ -63,6 +63,13 @@ and retains its FP64 eigensystem, including null directions. It constructs no
 n-by-n sample Gram. Its storage is O(s²), in addition to the already extracted
 O(ns) support design. Background continues to use streamed, matrix-free PCG
 and cached Lanczos trace quadrature.
+Support VAMP iterations run in compiled blocks between log points. Each step
+still checks the undamped residuals and precision safeguard, freezes completed
+batch members and stops immediately on convergence or invalid numerics. The
+host reads small diagnostics at block boundaries; messages remain on device.
+This removes per-step Python/device synchronization without changing the
+iteration budget, update equations or acceptance criteria. Logging every step
+still works, at the cost of that synchronization.
 The background adapter retains a `GroupedSSBackgroundContext` between the two
 rounds, reusing packed genotype products and the small trace quadrature cache.
 It discards the first background's coefficient posterior after retaining its
@@ -83,9 +90,41 @@ iterations are allowed, followed by five ordinary EM-VAMP verification steps.
 The root solver's success flag alone cannot authorize an output. The original
 undamped diagnostics must pass without a precision safeguard, and the EM steps
 must lie in the ordinary-EM fallback region of the guarded SQUAREM update.
-Metadata records the root attempt and verification. An unresolved fit is still
-rejected before final prediction. A budget below the configured minimum
-iterations or EM warmup does not activate this fallback.
+Metadata records the root attempt and verification. A budget below the
+configured minimum iterations or EM warmup does not activate the fallbacks.
+
+If the root attempt also fails, `ss_ec.solve_support_ec` solves the same
+support-space moment equations with double-loop expectation consistency (EC;
+[Opper and Winther, 2005](https://www.jmlr.org/papers/v6/opper05a.html)).
+This fallback reuses the exact support Gram eigensystem. Its CPU inner loop
+matches the prior and Gaussian modules' means and total second moments by
+minimizing a convex sum of log partition functions. Its outer loop updates
+the common Gaussian moments; once inference at the current pi resolves, it
+applies the same constrained M step, including the known-zero SNP count.
+The EC outer approximation restarts at zero mean and the prior variance;
+metadata distinguishes this restart from the original VAMP initialization.
+Fixed-pi fits keep pi fixed. The support, conditioning residual, Q_s, noise,
+pi bounds and prior variance equality are unchanged.
+
+EC candidates must pass the original undamped message, module, precision
+and (when learned) EM/pi-change checks, without a precision safeguard, on
+five consecutive EC iterates. These checks use the existing JAX denoiser,
+M step and Gaussian module in the original effect units. They do not replay
+the old iteration, which may be unstable at a valid fixed point. The inner
+Newton loop uses at most 100 steps with backtracking; the EC outer budget
+is another `--alpha-vamp-max-iterations` iterations. Numerical inner solves
+and the initial candidate screen are stricter than the final tolerances.
+Backtracking evaluates only partition functions and gradients; it builds the
+dense covariance and Hessian only for Newton steps. EM updates respect the
+configured warmup as well as requiring a resolved fixed-pi inference step.
+No validation or test prediction selects a solution. Earlier successful
+VAMP/root fits never invoke EC. An unresolved fit is still rejected.
+
+The EC report in `linear_solver.double_loop_ec` records the restart, time,
+outer/inner iterations, EM updates and consecutive native verification
+checks. Convergence establishes a fixed point of the same approximate
+inference equations, not a unique or globally optimal posterior solution;
+the double loop is not guaranteed to resolve every model or dataset.
 
 The method adds no alpha tuning stage. The two conditional rounds do not
 constitute an outer convergence test or imply joint posterior convergence.

@@ -421,25 +421,91 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
         scale = jnp.maximum(jnp.sum(a*a, axis=0), jnp.sum(b*b, axis=0))
         return jnp.sqrt(jnp.sum((a-b)**2, axis=0)/jnp.maximum(scale, 1e-30))
 
+    @jax.jit
+    def support_block(stop, iteration, r, gam, prob, stable, done):
+        """Run exact support steps between log points without host synchronization.
+
+        Check every undamped iterate, stop immediately on convergence/failure,
+        and freeze completed batch members. Only small diagnostics return to
+        the host at a log boundary; messages stay on device. Streamed background
+        products retain their host-driven loop below.
+        """
+        def body(state):
+            iteration, r, gam, prob, stable, done = state[:6]
+            iteration += 1
+            old_prob = prob
+            old_slab = jnp.where(d > 0, d/jnp.maximum(prob, config.pi_min), 0.)
+            if config.learn_pi:
+                prob = jax.lax.cond(iteration > config.em_warmup,
+                    lambda p: jnp.where(done[None, :], p, learn_prior(r, gam, p)),
+                    lambda p: p, prob)
+            slab = jnp.where(d > 0, d/jnp.maximum(prob, config.pi_min), 0.)
+            m1, _, _, alpha, em_error = nonlinear(r, gam, prob)
+            eta, guarded = linear_solver.stabilize_eta_arrays(gam/alpha, gam)
+            h2 = eta[None, :]*m1-gam[None, :]*r
+            m2, proposed_gamma, proposed_r, minimum = linear_solver.natural_module_arrays(h2, eta-gam)
+            errors = jnp.stack([relative_norm(proposed_r, r), relative_norm(m2, m1),
+                jnp.abs(proposed_gamma-gam)/gam, em_error,
+                jnp.max(jnp.where(d > 0, jnp.abs(prob-old_prob)/jnp.maximum(old_prob, config.pi_min), 0.), axis=0),
+                jnp.max(jnp.abs(slab-old_slab)/jnp.maximum(old_slab, config.slab_variance_min), axis=0)])
+            constraint = jnp.max(jnp.where(d > 0,
+                jnp.abs(prob*slab-d)/jnp.maximum(d, 1e-300), 0.))
+            failure = jnp.where(jnp.any(~jnp.isfinite(alpha) | (alpha <= 0)), 1,
+                jnp.where(jnp.any(minimum <= 0) | jnp.any(proposed_gamma <= 0)
+                          | jnp.any(~jnp.isfinite(m2)), 2,
+                jnp.where(jnp.any(~jnp.isfinite(errors)), 3,
+                jnp.where(constraint > 1e-12, 4, 0))))
+            eligible = ((iteration >= config.min_iterations) &
+                        ((not config.learn_pi) | (iteration > config.em_warmup)))
+            good = (jnp.max(errors[:3], axis=0) < config.tolerance) & ~guarded
+            if config.learn_pi:
+                good &= (errors[3] < config.em_tolerance) & (errors[4] < config.em_tolerance)
+            stable = jnp.where(good & eligible & (failure == 0), stable+1, 0)
+            done |= stable >= config.consecutive_converged
+            damp = jnp.where(done, 0., config.damping)
+            next_gamma = (1-damp)*gam+damp*proposed_gamma
+            r = ((1-damp)[None, :]*gam[None, :]*r
+                 +damp[None, :]*proposed_gamma[None, :]*proposed_r)/next_gamma[None, :]
+            return (iteration, r, next_gamma, prob, stable, done, alpha, errors,
+                    guarded, state[9]+jnp.sum(guarded), failure)
+
+        initial = (iteration, r, gam, prob, stable, done,
+                   jnp.zeros(batch), jnp.zeros((6, batch)), jnp.zeros(batch, bool),
+                   jnp.asarray(0, jnp.int64), jnp.asarray(0, jnp.int64))
+        return jax.lax.while_loop(
+            lambda state: (state[0] < stop) & ~jnp.all(state[5]) & (state[10] == 0),
+            body, initial)
+
     trace = []
     linear_products = products.restricted(np.any(np.asarray(active), axis=1)) if hasattr(products, 'restricted') else products
-    for iteration in range(1, config.max_iterations+1):
-        old_pi, old_slab = pi, slab
-        if config.learn_pi and iteration > config.em_warmup:
-            learned_pi = learn_prior(r1, gamma1, pi)
-            pi = jnp.where(jax.device_put(done)[None, :], old_pi, learned_pi)
-            slab = jnp.where(d > 0, d/jnp.maximum(pi, config.pi_min), 0.)
-        m1, _, _, alpha1, em_error = nonlinear(r1, gamma1, pi)
-        alpha_host = np.asarray(alpha1)
-        if (np.any(~np.isfinite(alpha_host)) or np.any(alpha_host <= 0)
-                or (not natural_module and np.any(alpha_host >= 1))):
-            raise ArithmeticError(f'Invalid nonlinear Onsager divergence at {iteration}: {alpha_host}')
+    iteration = 0
+    while iteration < config.max_iterations:
         if natural_module:
-            eta1, guarded = linear_solver.stabilize_eta(gamma1/alpha1, gamma1)
-            gamma2 = eta1-gamma1
-            h2 = eta1[None, :]*m1-gamma1[None, :]*r1
-            m2, gamma_proposed, r_proposed = linear_solver.natural_module(h2, gamma2)
+            stop = min(1 if iteration == 0 else (iteration//config.log_every+1)*config.log_every,
+                       config.max_iterations)
+            state = support_block(stop, iteration, r1, gamma1, pi, stable, done)
+            r1, gamma1, pi = state[1:4]
+            iteration, stable, done, alpha_host, errors, guarded, guard_count, failure = jax.device_get(
+                (state[0], *state[4:]))
+            iteration = int(iteration)
+            linear_solver.precision_safeguard_count += int(guard_count)
+            if failure:
+                reasons = {1: 'Invalid nonlinear Onsager divergence',
+                           2: 'Nonpositive or nonfinite support linear posterior',
+                           3: 'Nonfinite fixed-point diagnostics',
+                           4: 'Prior variance equality violated'}
+                raise ArithmeticError(f'{reasons[int(failure)]} at iteration {iteration}')
         else:
+            iteration += 1
+            old_pi, old_slab = pi, slab
+            if config.learn_pi and iteration > config.em_warmup:
+                learned_pi = learn_prior(r1, gamma1, pi)
+                pi = jnp.where(jax.device_put(done)[None, :], old_pi, learned_pi)
+                slab = jnp.where(d > 0, d/jnp.maximum(pi, config.pi_min), 0.)
+            m1, _, _, alpha1, em_error = nonlinear(r1, gamma1, pi)
+            alpha_host = np.asarray(alpha1)
+            if np.any(~np.isfinite(alpha_host)) or np.any(alpha_host <= 0) or np.any(alpha_host >= 1):
+                raise ArithmeticError(f'Invalid nonlinear Onsager divergence at {iteration}: {alpha_host}')
             gamma2 = gamma1*(1-alpha1)/alpha1
             r2 = jnp.where(active, (m1-alpha1[None, :]*r1)/(1-alpha1)[None, :], 0.)
             rhs = y-linear_products.forward(r2)
@@ -449,34 +515,32 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
             # Avoid subtracting nearly equal quantities when p >> n.
             gamma_proposed = gamma2*trace_fraction/(1-trace_fraction)
             r_proposed = r2+correction/trace_fraction[None, :]
-        message_error = relative_norm(r_proposed, r1)
-        module_error = relative_norm(m2, m1)
-        precision_error = jnp.abs(gamma_proposed-gamma1)/gamma1
-        pi_change = jnp.max(jnp.where(d > 0, jnp.abs(pi-old_pi)/jnp.maximum(old_pi, config.pi_min), 0.), axis=0)
-        slab_change = jnp.max(jnp.abs(slab-old_slab)/jnp.maximum(old_slab, config.slab_variance_min), axis=0)
-        errors = np.asarray(jnp.stack([message_error, module_error, precision_error, em_error, pi_change, slab_change]))
-        if not np.all(np.isfinite(errors)):
-            raise ArithmeticError(f'Nonfinite fixed-point diagnostics at iteration {iteration}')
-        eligible = (iteration >= config.min_iterations and
-                    (not config.learn_pi or iteration > config.em_warmup))
-        good = np.max(errors[:3], axis=0) < config.tolerance
-        if natural_module:
-            good &= ~np.asarray(guarded)
-        if config.learn_pi:
-            good &= (errors[3] < config.em_tolerance) & (errors[4] < config.em_tolerance)
-        stable = np.where(good & eligible, stable+1, 0)
-        done |= stable >= config.consecutive_converged
-        # Freeze finished cases in a batch to retain their actual fixed point.
-        damp = jnp.where(jax.device_put(done), 0., config.damping)
-        gamma_next = (1-damp)*gamma1+damp*gamma_proposed
-        r1 = ((1-damp)[None, :]*gamma1[None, :]*r1
-              +damp[None, :]*gamma_proposed[None, :]*r_proposed)/gamma_next[None, :]
-        gamma1 = gamma_next
+            message_error = relative_norm(r_proposed, r1)
+            module_error = relative_norm(m2, m1)
+            precision_error = jnp.abs(gamma_proposed-gamma1)/gamma1
+            pi_change = jnp.max(jnp.where(d > 0, jnp.abs(pi-old_pi)/jnp.maximum(old_pi, config.pi_min), 0.), axis=0)
+            slab_change = jnp.max(jnp.abs(slab-old_slab)/jnp.maximum(old_slab, config.slab_variance_min), axis=0)
+            errors = np.asarray(jnp.stack([message_error, module_error, precision_error, em_error, pi_change, slab_change]))
+            if not np.all(np.isfinite(errors)):
+                raise ArithmeticError(f'Nonfinite fixed-point diagnostics at iteration {iteration}')
+            eligible = (iteration >= config.min_iterations and
+                        (not config.learn_pi or iteration > config.em_warmup))
+            good = np.max(errors[:3], axis=0) < config.tolerance
+            if config.learn_pi:
+                good &= (errors[3] < config.em_tolerance) & (errors[4] < config.em_tolerance)
+            stable = np.where(good & eligible, stable+1, 0)
+            done |= stable >= config.consecutive_converged
+            # Freeze finished cases in a batch to retain their actual fixed point.
+            damp = jnp.where(jax.device_put(done), 0., config.damping)
+            gamma_next = (1-damp)*gamma1+damp*gamma_proposed
+            r1 = ((1-damp)[None, :]*gamma1[None, :]*r1
+                  +damp[None, :]*gamma_proposed[None, :]*r_proposed)/gamma_next[None, :]
+            gamma1 = gamma_next
         slab = jnp.where(d > 0, d/jnp.maximum(pi, config.pi_min), 0.)
         constraint = np.asarray(jnp.where(d > 0, jnp.abs(pi*slab-d)/jnp.maximum(d, 1e-300), 0.))
         if constraint.max() > 1e-12:
             raise ArithmeticError('Prior variance equality violated')
-        if iteration == 1 or iteration % config.log_every == 0 or done.all():
+        if iteration == 1 or iteration % config.log_every == 0 or done.all() or iteration == config.max_iterations:
             row = dict(iteration=iteration, seconds=time.monotonic()-start, pi=np.asarray(pi).T.tolist(),
                        gamma1=np.asarray(gamma1).tolist(), alpha1=alpha_host.tolist(),
                        message_error=errors[0].tolist(), module_error=errors[1].tolist(),
