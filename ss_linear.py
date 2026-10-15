@@ -10,6 +10,15 @@ from .pcg import pcg_solve
 from .slq import _set_row, _step
 
 
+@jax.jit
+def _coarse_precondition(value, diagonal, shift, modes, coarse):
+    """SPD coarse solve plus projected Jacobi solve on its complement."""
+    projected = modes.T@value
+    fine = (value-modes@projected)/(diagonal[:, None]+shift[None, :])
+    return (fine-modes@(modes.T@fine)
+            + modes@(projected/(coarse[:, None]+shift[None, :])))
+
+
 class SupportPrecisionSolver:
     """Exact SNP-space Gaussian module for a small selected support.
 
@@ -106,7 +115,9 @@ class MatrixFreeSampleSolver:
     Fixed, randomly signed Walsh probes are sampled without replacement.
     A complete small probe population gives the trace without sampling error;
     large cohorts use a fixed-size sample. Only bounded Lanczos workspaces and
-    small quadrature nodes survive setup. No sample Gram is constructed.
+    small quadrature nodes and at most eight Ritz vectors survive setup.
+    The Ritz vectors only precondition PCG; they do not approximate the solve
+    or change its residual criterion. No sample Gram is constructed.
     """
     def __init__(self, products, active, *, pcg_tolerance=1e-9,
                  pcg_max_iterations=400, probes=32, lanczos_steps=64,
@@ -181,12 +192,17 @@ class MatrixFreeSampleSolver:
         if per_probe > workspace_bytes:
             raise MemoryError('SS trace workspace cannot hold one Lanczos probe; '
                               'reduce Lanczos steps or increase workspace_bytes')
-        width = min(count, 8, max(1, workspace_bytes//per_probe))
+        # Reserve construction/QR storage as well as the retained coarse basis.
+        # A minimal one-probe budget still works, using Jacobi alone.
+        coarse_rank_limit = min(8, (workspace_bytes-per_probe)//(24*self.n))
+        coarse_workspace = 24*self.n*coarse_rank_limit
+        width = min(count, 8, max(1, (workspace_bytes-coarse_workspace)//per_probe))
         rng = np.random.default_rng(seed)
         columns = rng.choice(population, size=count, replace=False).astype(np.uint64)
         signs = rng.choice(np.array([-1., 1.]), size=self.n)
         rows = np.arange(self.n, dtype=np.uint64)
         nodes, weights, radau_nodes, radau_weights = [], [], [], []
+        self.coarse_vectors = self.coarse_values = None
         for start in range(0, count, width):
             indices = columns[start:start+width]
             parity = rows[:, None] & indices[None, :]
@@ -206,7 +222,7 @@ class MatrixFreeSampleSolver:
                 previous = b
                 if np.all(beta[-1] == 0):
                     break
-            del basis, product, vectors
+            del product, vectors
             for c in range(len(indices)):
                 diagonal = np.array([a[c] for a in alpha])
                 off = np.array([b[c] for b in beta])
@@ -222,6 +238,19 @@ class MatrixFreeSampleSolver:
                 if eig.min() < -1e-10*scale:
                     raise ArithmeticError('SS sample operator is not positive semidefinite')
                 eig = np.maximum(eig, 0.)
+                if start == 0 and c == 0 and coarse_rank_limit:
+                    # A bounded coarse correction reuses the first trace
+                    # Krylov basis. It changes only the PCG preconditioner.
+                    # Only well-resolved large Ritz values are useful here.
+                    largest_diagonal = float(jnp.max(self.diagonal))
+                    residual = off[actual-1]*np.abs(vec[-1])
+                    selected = np.flatnonzero((eig > 1.25*largest_diagonal)
+                        & (residual <= .01*np.maximum(eig, 1.)))[-coarse_rank_limit:]
+                    if len(selected):
+                        modes = basis[:actual, :, c].T@jnp.asarray(vec[:, selected])
+                        modes, _ = jnp.linalg.qr(modes, mode='reduced')
+                        self.coarse_vectors = modes
+                        self.coarse_values = jnp.asarray(eig[selected])
                 nodes.append(eig); weights.append(vec[0]**2)
                 if actual < depth or off[actual-1] == 0:
                     radau_nodes.append(eig); radau_weights.append(vec[0]**2)
@@ -239,14 +268,17 @@ class MatrixFreeSampleSolver:
                     augmented[-1, -1] = off[actual-1]**2*inverse_last
                     re, rv = np.linalg.eigh(augmented)
                     radau_nodes.append(np.maximum(re, 0.)); radau_weights.append(rv[0]**2)
+            del basis
         self.nodes, self.weights = nodes, weights
         self.radau_nodes, self.radau_weights = radau_nodes, radau_weights
         self.probe_count, self.population = count, population
         self.setup_diagnostics.update(
+            coarse_rank=0 if self.coarse_vectors is None else int(self.coarse_vectors.shape[1]),
+            coarse_storage_bytes=0 if self.coarse_vectors is None else int(self.coarse_vectors.nbytes),
             trace_probes=count, trace_population=population,
             trace_sampling_exact=count == population, lanczos_steps=depth,
             trace_batch_width=width, trace_workspace_bytes=workspace_bytes,
-            trace_workspace_estimated_bytes=width*per_probe, seed=int(seed))
+            trace_workspace_estimated_bytes=width*per_probe+coarse_workspace, seed=int(seed))
 
     def trace(self, shifts):
         shifts = np.asarray(shifts, float)
@@ -287,8 +319,11 @@ class MatrixFreeSampleSolver:
         shift = jnp.asarray(shifts)
         def operator(value):
             return self.matvec(value)+value*shift[None, :]
+        modes, coarse = self.coarse_vectors, self.coarse_values
         def precondition(value):
-            return value/(self.diagonal[:, None]+shift[None, :])
+            if modes is None:
+                return value/(self.diagonal[:, None]+shift[None, :])
+            return _coarse_precondition(value, self.diagonal, shift, modes, coarse)
         warm = self._warm if self._warm is not None and self._warm.shape == rhs.shape else None
         solved, relative, iterations = pcg_solve(operator, rhs, M=precondition,
             tol=self.pcg_tolerance, maxiter=self.pcg_max_iterations, X0=warm)

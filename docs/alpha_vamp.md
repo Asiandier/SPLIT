@@ -81,28 +81,31 @@ precision safeguard is recorded; a safeguarded iterate cannot satisfy stopping.
 Message, module, precision and constrained EM fixed-point errors must satisfy
 1e-4 for five consecutive iterations. Message and EM damping are both .2.
 `--alpha-vamp-max-iterations` defaults to 10000 damped iterations, an iteration
-ceiling rather than a mandatory count. If these iterations oscillate,
-`ss_fixed_point.polish_support_fixed_point` makes a bounded Newton-Krylov
-attempt at the same support-space EM-VAMP equations, starting from the final
-iterate. It reuses the denoiser, constrained M step and support linear solver;
-the prior, likelihood and stopping tolerances remain fixed. At most 100 root
-iterations are allowed, followed by five ordinary EM-VAMP verification steps.
-The root solver's success flag alone cannot authorize an output. The original
-undamped diagnostics must pass without a precision safeguard, and the EM steps
-must lie in the ordinary-EM fallback region of the guarded SQUAREM update.
-Metadata records the root attempt and verification. A budget below the
-configured minimum iterations or EM warmup does not activate the fallbacks.
-
-If the root attempt also fails, `ss_ec.solve_support_ec` solves the same
-support-space moment equations with double-loop expectation consistency (EC;
+ceiling rather than a mandatory count. If these iterations do not converge,
+`ss_ec.solve_support_ec` directly solves the same support-space moment equations
+with double-loop expectation consistency (EC;
 [Opper and Winther, 2005](https://www.jmlr.org/papers/v6/opper05a.html)).
+A budget below the configured minimum iterations or EM warmup does not
+activate the fallback.
 This fallback reuses the exact support Gram eigensystem. Its CPU inner loop
 matches the prior and Gaussian modules' means and total second moments by
 minimizing a convex sum of log partition functions. Its outer loop updates
 the common Gaussian moments; once inference at the current pi resolves, it
 applies the same constrained M step, including the known-zero SNP count.
-The EC outer approximation restarts at zero mean and the prior variance;
-metadata distinguishes this restart from the original VAMP initialization.
+EC restarts from the original VAMP initialization recorded by the shared
+kernel: r1=0, pi0=s/P (subject to the numerical floor), tau0²=Q_s/(L*pi0),
+and gamma1,0=n/max(sigma_e²+Q_s, 1e-12). It does not use the failed final
+iterate or separately choose a starting message precision. These shared
+parameters also give identical initial nonlinear SS moments.
+EC additionally needs a likelihood-side Gaussian cavity, initialized at zero
+with variance d=Q_s/L, the prior second moment. Thus, in EC's scaled units
+alpha=sqrt(d)*z, h=h0=0, gamma=d*gamma1,0, and eta=1+gamma. Both cavities
+are integrable without clipping the original VAMP precision. This auxiliary
+Gaussian is specific to EC; its moments are reconciled by the inner loop.
+Initializing it with the extremely small zero-channel SS variance instead
+can make the outer loop impractically slow for sparse pi.
+Metadata records the shared parameters, initial nonlinear variance and
+additional Gaussian precisions.
 Fixed-pi fits keep pi fixed. The support, conditioning residual, Q_s, noise,
 pi bounds and prior variance equality are unchanged.
 
@@ -118,7 +121,7 @@ Backtracking evaluates only partition functions and gradients; it builds the
 dense covariance and Hessian only for Newton steps. EM updates respect the
 configured warmup as well as requiring a resolved fixed-pi inference step.
 No validation or test prediction selects a solution. Earlier successful
-VAMP/root fits never invoke EC. An unresolved fit is still rejected.
+VAMP fits never invoke EC. An unresolved fit is still rejected.
 
 The EC report in `linear_solver.double_loop_ec` records the restart, time,
 outer/inner iterations, EM updates and consecutive native verification

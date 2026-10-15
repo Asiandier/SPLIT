@@ -177,9 +177,10 @@ def _verify_native(solver, h, gamma, pi, d, total_snps, pi_change, config):
 
 def solve_support_ec(posterior, solver, products, residual, *, prior_second_moment,
                      total_snps, config, callback=None):
-    """Fallback after unresolved VAMP/root iterations; leave successes untouched.
+    """Fallback after unresolved damped VAMP iterations; leave successes untouched.
 
-    Restart the EC outer approximation at zero mean and the prior variance.
+    Restart from VAMP's recorded initial channel. EC's additional Gaussian
+    cavity uses the prior second moment; no shared parameter is reinitialized.
     Five (or config.consecutive_converged) successive EC iterates must pass
     the native equations. Replaying the old iteration is not a certificate:
     its fixed point can be unstable even when the equations are satisfied.
@@ -190,10 +191,21 @@ def solve_support_ec(posterior, solver, products, residual, *, prior_second_mome
     if (s < 1 or posterior.mean.shape != (s, 1) or posterior.pi.shape != (1, 1)
             or not np.isfinite(d) or d <= 0 or total_snps < s):
         raise ValueError('EC fallback requires one positive-variance support model')
+    initial = posterior.initialization or {}
+    if initial.get('method') != 'zero':
+        raise ValueError('Support EC requires the recorded zero-message VAMP initialization')
+    pi = float(np.asarray(initial['initial_pi'])[0, 0])
+    slab = float(np.asarray(initial['initial_slab_variance'])[0, 0])
+    precision = float(np.asarray(initial['initial_message_precision'])[0])
+    if (not np.all(np.isfinite([pi, slab, precision]))
+            or not config.pi_min <= pi <= 1 or slab <= 0 or precision <= 0
+            or not np.isclose(pi*slab, d, rtol=1e-12, atol=0.)):
+        raise ValueError('Invalid recorded VAMP initialization for support EC')
     started = time.monotonic()
     report = dict(method='double_loop_support_EC', status='max_iterations',
         prior_and_likelihood_unchanged=True, max_outer_iterations=config.max_iterations,
-        max_inner_iterations=100, initialization='zero_mean_prior_variance',
+        max_inner_iterations=100, initialization='same_as_vamp',
+        initial_pi=pi, initial_slab_variance=slab, initial_message_precision=precision,
         verification='native_undamped_equations_on_consecutive_EC_iterates')
     rows, checks = [], []
     iteration = inner_iterations = em_updates = 0
@@ -204,12 +216,19 @@ def solve_support_ec(posterior, solver, products, residual, *, prior_second_mome
         xy = np.asarray(products.transpose(jnp.asarray(residual)[:, None]))[:, 0]
         model = _SupportEC(np.asarray(solver.values)*d/noise, solver.vectors,
                            xy*np.sqrt(d)/noise, total_snps, config.pi_min)
-        h0, h, eta = np.zeros(s), np.zeros(s), 1.
-        pi = config.initial_pi if config.learn_pi else float(posterior.pi[0, 0])
-        report['initial_pi'] = pi
+        # beta=sqrt(d)*z: copy the original channel, not the failed iterate.
+        # EC additionally needs a likelihood-side Gaussian cavity. Initialize
+        # it at zero with variance d (precision 1 in z units). Then both
+        # cavities integrate without clipping the shared VAMP precision.
+        mean, variance, *_ = spike_slab_denoise(
+            jnp.zeros((s, 1)), jnp.asarray([[precision]]), pi, slab)
+        average_variance = float(jnp.mean(variance))
+        h, gamma = np.zeros(s), d*precision
+        eta = 1.+gamma
+        h0 = eta*np.asarray(mean[:, 0])/np.sqrt(d)
+        report.update(initial_mean=0., initial_nonlinear_variance=average_variance,
+                      initial_linear_precision=1/d, initial_common_precision=eta/d)
         previous_pi = pi
-        gamma = min(d*solver.n/max(noise+d*solver.trace_normalizer, 1e-12),
-                    .5*(eta+model.eig[0]))
         tolerance = .01*min(config.tolerance, config.em_tolerance) if config.learn_pi else .01*config.tolerance
         for iteration in range(1, config.max_iterations+1):
             h, gamma, p, q, inner_count = model.inner_solve(
@@ -285,6 +304,8 @@ def solve_support_ec(posterior, solver, products, residual, *, prior_second_mome
         result = replace(result, mean=arrays[0], variance=arrays[1], pip=arrays[2],
             pi=np.array([[pi]]), slab_variance=np.array([[d/pi]]), precision=np.array([gamma/d]),
             status=['converged'], initialization=dict(posterior.initialization or {},
-                ec_fallback=dict(method='zero_mean_prior_variance', initial_pi=report['initial_pi'],
-                                 prior_second_moment=d)))
+                ec_fallback=dict(method='same_as_vamp', initial_pi=report['initial_pi'],
+                    initial_slab_variance=slab, initial_message_precision=precision,
+                    initial_nonlinear_variance=average_variance,
+                    initial_linear_precision=1/d, prior_second_moment=d)))
     return result

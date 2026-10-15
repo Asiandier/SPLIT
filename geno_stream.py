@@ -70,6 +70,8 @@ def _get_libcudart():
             lib.cudaHostRegister.restype = ctypes.c_int
             lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
             lib.cudaHostUnregister.restype = ctypes.c_int
+            lib.cudaGetLastError.argtypes = []
+            lib.cudaGetLastError.restype = ctypes.c_int
             _libcudart_handle = lib
         except (OSError, AttributeError, TypeError):
             logger.debug("CUDA runtime library initialization failed; pinned host buffers disabled.", exc_info=True)
@@ -99,17 +101,25 @@ def _pin_buffer(arr: np.ndarray, dev) -> bool:
     if not arr.data.contiguous:
         return False
     ordinal = _cuda_device_ordinal(dev)
+    if ordinal is None:
+        return False
     lib = _get_libcudart()
-    if lib is None or ordinal is None:
+    if lib is None:
         return False
     try:
         if lib.cudaSetDevice(ctypes.c_int(int(ordinal))) != 0:
+            lib.cudaGetLastError()
             return False
         rc = lib.cudaHostRegister(
             ctypes.c_void_p(arr.ctypes.data),
             ctypes.c_size_t(arr.nbytes),
             ctypes.c_uint(0),
         )
+        if rc != 0:
+            # Pinning is optional. Consume this failed runtime call's error
+            # before falling back, so a later JAX kernel does not inherit it.
+            lib.cudaGetLastError()
+            logger.debug("CUDA host buffer registration returned %d; using pageable memory.", rc)
         return rc == 0
     except (OSError, AttributeError, TypeError, ValueError):
         logger.debug("CUDA host buffer registration failed.", exc_info=True)
@@ -119,12 +129,13 @@ def _pin_buffer(arr: np.ndarray, dev) -> bool:
 def _unpin_buffer(arr: np.ndarray, dev) -> None:
     import ctypes
     ordinal = _cuda_device_ordinal(dev)
+    if ordinal is None:
+        return
     lib = _get_libcudart()
     if lib is None:
         return
     try:
-        if ordinal is not None:
-            lib.cudaSetDevice(ctypes.c_int(int(ordinal)))
+        lib.cudaSetDevice(ctypes.c_int(int(ordinal)))
         lib.cudaHostUnregister(ctypes.c_void_p(arr.ctypes.data))
     except (OSError, AttributeError, TypeError, ValueError):
         logger.debug("CUDA host buffer unregistration failed.", exc_info=True)
@@ -325,7 +336,11 @@ class _EvictRing:
         self._transfer_thread = None
         if self._bufs is not None:
             for buf in self._bufs:
-                _unpin_buffer(buf, self._dev)
+                # Only successful registrations are wrapped as pinned buffers.
+                # Unregistering CPU or failed-registration buffers leaves a
+                # CUDA error that can break subsequent JAX GPU operations.
+                if isinstance(buf, _PinnedHostBuffer):
+                    _unpin_buffer(buf, self._dev)
         self._bufs = None
 
 

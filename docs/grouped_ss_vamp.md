@@ -73,10 +73,28 @@ gamma1_candidate = gamma2*t/(1-t)
 r1_candidate = r2 + A.T@u/t
 ```
 
-PCG computes `u` in FP64 with a Jacobi preconditioner, a warm start and
+PCG computes `u` in FP64 with a bounded coarse correction to Jacobi, a warm start and
 verification against the true residual of the same streamed operator.
 The default relative tolerance is `1e-9`, with at most 400 iterations. An
 unresolved solve raises an error rather than accepting inexact coefficients.
+
+The coarse correction reuses the first trace probe's Lanczos basis. At most
+eight well-resolved large Ritz modes are retained, with orthonormal vectors
+`U` and positive Ritz values `Lambda`. Writing `P=I-U@U.T` and
+`D=diag(G)+lambda`, the applied inverse preconditioner is
+
+```
+M_inverse = P @ diag(1/D) @ P + U @ diag(1/(Lambda+lambda)) @ U.T
+```
+
+This is symmetric positive definite for every positive shift. Approximate
+Ritz vectors affect convergence speed, while the true residual check still
+controls the solution accuracy. Modes must exceed `1.25*max(diag(G))` and
+have Lanczos residual at most `0.01*max(Ritz_value,1)`. The rank is further
+limited by the trace workspace budget; no suitable modes or no spare budget
+gives ordinary Jacobi. No additional genotype products are required to build
+the coarse basis. Diagnostics report `coarse_rank` and `coarse_storage_bytes`.
+The prior, EM updates, Onsager trace and fixed-point stopping rules are unchanged.
 
 The Onsager trace uses fixed randomly signed Walsh columns sampled without
 replacement from a power-of-two population enclosing the sample dimension.
@@ -86,7 +104,7 @@ larger cohorts default to 32 probes. This is an unbiased trace sampling scheme
 before quadrature error. A fixed seed makes the approximation a consistent
 function of the shift throughout EM-VAMP.
 
-An initial Lanczos pass per probe caches only small nodes and weights. Shift
+An initial Lanczos pass per probe caches small nodes and weights. Shift
 invariance lets every later VAMP iteration evaluate `x/(x+lambda)` on these
 nodes without additional trace-specific genotype scans. Two-pass
 reorthogonalization stabilizes the recurrence. Gauss quadrature and
@@ -103,7 +121,9 @@ Trace setup batches at most eight probes, retaining only one batch's basis.
 Its additional workspace is `O(n * depth * batch_width)`; PCG uses `O(n * cases)`
 vectors, and SS messages and moments use `O(p * cases)` vectors. Small cached
 quadratures cost `O(probes * depth)`; their eigendecompositions have dimension
-at most `depth+1`. No `n*n` matrix, sample eigendecomposition or `p*p` matrix is
+at most `depth+1`. The retained coarse basis costs at most `8*n` FP64 values
+(0.64 MB for 10,000 samples); its construction and QR buffers are reserved
+within the trace workspace budget. No `n*n` matrix, sample eigendecomposition or `p*p` matrix is
 formed. Native packed genotype calls are subdivided when needed to bound FP64
 decode buffers. The trace workspace defaults to 256 MiB, adjusted to hold one
 probe and capped at one eighth of the native GPU budget. An insufficient

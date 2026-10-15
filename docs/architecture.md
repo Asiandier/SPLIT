@@ -16,7 +16,7 @@ GPU_REML is organized around one contract: a covariance component must expose
 | Downstream models | `lasso_cd.py`, `gwas.py` | Reuse the fitted covariance for sparse GLS and marginal GWAS. |
 | Sparse mean information | `sparse_information.py` | Selected-span log determinant, score correction and paired sparse-variance correction, without sample-square matrices. |
 | Adaptive partition | `run_sparse_pipeline.py`, `adaptive_ld.py`, `score_process.py` | Orchestrate the path, stream shared boundary contractions, and calibrate trace-defined quadratic scores. |
-| Sparse prediction refinement | `alpha_vamp.py`, `background_ss.py`, `grouped_ss_vamp.py`, `ss_linear.py`, `ss_fixed_point.py`, `sparse_prediction.py` | Run two conditional prior-Q alpha/background SS rounds after the final refit, reuse streamed background products and trace quadrature, then predict through the existing operators. |
+| Sparse prediction refinement | `alpha_vamp.py`, `background_ss.py`, `grouped_ss_vamp.py`, `ss_linear.py`, `ss_ec.py`, `sparse_prediction.py` | Run two conditional prior-Q alpha/background SS rounds after the final refit, reuse streamed background products and trace quadrature, then predict through the existing operators. |
 
 ## Fit Lifecycle
 
@@ -81,7 +81,9 @@ GPU_REML is organized around one contract: a covariance component must expose
 
 - Background SS shares native genotype operators. Shifted PCG solves verify
   true residuals, and cached fixed-probe Lanczos quadrature supplies all later
-  Onsager traces. Bounded genotype decode and Krylov batches replace full
+  Onsager traces. Up to eight resolved Ritz vectors from the first trace
+  probe supply an SPD coarse correction to Jacobi without extra genotype
+  products or a change in solve tolerance. Bounded genotype decode and Krylov batches replace full
   standardized designs and sample-square Gram eigensystems. Quadrature gaps
   and trace sampling uncertainty are recorded separately.
 - Multi-GRM SLQ stops when its quadrature gap meets the configured tolerance,
@@ -109,6 +111,9 @@ GPU_REML is organized around one contract: a covariance component must expose
   materialize a wide standardized genotype block.
 - A pinned ring overlaps host reads, H2D copies, and GPU matmul. A slot is not
   writable again until its asynchronous device transfer has completed.
+  Cleanup unregisters only buffers the ring successfully pinned; CPU buffers
+  never call the CUDA runtime. Optional registration failures fall back to
+  pageable buffers without leaving a CUDA error for subsequent JAX operations.
 - Dense streamers keep one call-shaped device copy of the standardization
   statistics. Streamed KV kernels donate the consumed accumulator buffer to
   their output, and PCG releases matrix-sized residual/work buffers as soon as

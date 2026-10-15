@@ -79,15 +79,10 @@ def refine_alpha_vamp(*, design, y, covariates, gamma, background_score,
                 solver, config, callback, em_counts=np.array([total_snps]))
             if (posterior.status != ['converged'] and config.max_iterations >= config.min_iterations
                     and (not config.learn_pi or config.max_iterations > config.em_warmup)):
-                from .ss_fixed_point import polish_support_fixed_point
-                posterior = polish_support_fixed_point(posterior, solver,
+                from .ss_ec import solve_support_ec
+                posterior = solve_support_ec(posterior, solver, products, residual,
                     prior_second_moment=target/normalizer, total_snps=total_snps,
                     config=config, callback=callback)
-                if posterior.status != ['converged']:
-                    from .ss_ec import solve_support_ec
-                    posterior = solve_support_ec(posterior, solver, products, residual,
-                        prior_second_moment=target/normalizer, total_snps=total_snps,
-                        config=config, callback=callback)
             if posterior.status != ['converged']:
                 raise RuntimeError('Alpha prior-Q VAMP did not converge; outputs rejected')
     updated = posterior.mean[:, 0]
