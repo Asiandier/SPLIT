@@ -163,8 +163,8 @@ class _EvictRing:
 
     Staging buffers are registered as CUDA pinned memory so that
     jax.device_put can DMA directly without an internal copy.
-    Up to 4 workers read blocks in a strided pattern (worker k handles
-    blocks k, k+step, k+2*step, ...); each worker independently evicts
+    Up to 4 workers own disjoint ring slots (worker k owns slots
+    k, k+step, k+2*step, ...); each worker independently evicts
     pages TRAIL_BEHIND blocks behind its own position to preserve
     kernel readahead.
     """
@@ -177,6 +177,9 @@ class _EvictRing:
         self._np = packed_np
         self._offsets = packed_offsets
         self._n_calls = int(n_calls)
+        self._pass_start = 0
+        self._pass_stop = self._n_calls
+        self._next_call = None
         self._n = int(n)
         self._mpw = int(max_packed_width)
         self._dev = dev
@@ -200,6 +203,8 @@ class _EvictRing:
         self._ready = [threading.Event() for _ in range(self.DEPTH)]
         self._writable = [threading.Event() for _ in range(self.DEPTH)]
         self._stop = threading.Event()
+        self._error = None
+        self._error_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._transfer_done = [threading.Event() for _ in range(self.DEPTH)]
         self._transfer_queue: queue.Queue = queue.Queue()
@@ -224,8 +229,8 @@ class _EvictRing:
                 slot, device_array = item
                 try:
                     device_array.block_until_ready()
-                except Exception:
-                    logger.exception("Asynchronous genotype H2D transfer failed.")
+                except Exception as exc:
+                    self._record_error(exc)
                 finally:
                     self._transfer_done[slot].set()
             finally:
@@ -236,39 +241,80 @@ class _EvictRing:
         self._transfer_done[slot].clear()
         self._transfer_queue.put((slot, device_array))
 
-    def _wait_for_transfers(self) -> None:
+    def _record_error(self, exc: Exception) -> None:
+        with self._error_lock:
+            if self._error is None:
+                self._error = exc
+        self._stop.set()
+        # Wake both prefill and get(), including when the failed worker never
+        # populated its first slot. The consumer raises before using any data.
+        for ev in self._ready:
+            ev.set()
+
+    def _check_error(self) -> None:
+        if self._error is not None:
+            raise RuntimeError("Genotype ring reader or device transfer failed.") from self._error
+
+    def _wait_ready(self, slot: int) -> None:
+        # Poll only while blocked: an error can race with slot recycling and
+        # its wakeup event can otherwise be cleared by the consumer.
+        while not self._ready[slot].wait(timeout=0.1):
+            self._check_error()
+        self._check_error()
+
+    def _wait_for_transfers(self, *, check_errors: bool = True) -> None:
         for ev in self._transfer_done:
             ev.wait()
+        if check_errors:
+            self._check_error()
 
-    def start_pass(self, prefill: int = 2):
-        """Start worker and optionally pre-fill first N slots before returning."""
+    def start_pass(self, prefill: int = 2, *, call_start: int = 0,
+                   call_stop: int | None = None):
+        """Stream a contiguous call range into slots relative to its start."""
+        call_start = int(call_start)
+        call_stop = self._n_calls if call_stop is None else int(call_stop)
+        if not 0 <= call_start <= call_stop <= self._n_calls:
+            raise ValueError("Ring pass call range is outside the packed source.")
+        if self._bufs is None:
+            raise RuntimeError("Genotype ring is closed.")
         self.finish_pass()
         self._wait_for_transfers()
+        self._pass_start = call_start
+        self._pass_stop = call_stop
+        self._next_call = call_start
         self._stop.clear()
         for ev in self._ready:
             ev.clear()
         for ev in self._writable:
             ev.set()
         self._threads = []
-        n_workers = min(4, self._n_calls, self.DEPTH)
+        pass_calls = call_stop - call_start
+        n_workers = min(4, pass_calls, self.DEPTH)
         for tid in range(n_workers):
-            th = threading.Thread(target=self._worker, args=(tid, n_workers), daemon=True)
+            th = threading.Thread(target=self._worker, args=(call_start + tid, n_workers), daemon=True)
             th.start()
             self._threads.append(th)
 
-        # Pre-fill: wait for first N slots so get(0) never cold-stalls
-        for i in range(min(prefill, self._n_calls)):
-            self._ready[i % self.DEPTH].wait()
+        # Pre-fill only slots that can be populated before consumption.
+        for i in range(min(prefill, pass_calls, self.DEPTH)):
+            self._wait_ready(i)
 
     _TRAIL_BEHIND = 8  # evict this far behind worker — preserves readahead
 
     def _worker(self, start_c, step):
         """Copy blocks in strided pattern. Evict TRAIL_BEHIND blocks behind."""
+        try:
+            self._read_blocks(start_c, step)
+        except Exception as exc:
+            self._record_error(exc)
+
+    def _read_blocks(self, start_c, step):
         c = start_c
-        while c < self._n_calls:
+        first_slot = start_c - self._pass_start
+        while c < self._pass_stop:
             if self._stop.is_set():
                 return
-            slot = c % self.DEPTH
+            slot = (c - self._pass_start) % self.DEPTH
             while not self._stop.is_set():
                 if self._writable[slot].wait(timeout=0.1):
                     break
@@ -281,11 +327,14 @@ class _EvictRing:
             self._bufs[slot][:off1 - off0] = self._np[off0:off1]
 
             # Evict pages far behind — readahead window (~2MB) is untouched
-            if c >= self._TRAIL_BEHIND:
+            if c - self._pass_start >= self._TRAIL_BEHIND:
                 self._evict_block(c - self._TRAIL_BEHIND)
 
             self._ready[slot].set()
-            c += step
+            # Keep ownership of the same slots in every ring generation.
+            # A global c += step races with other workers when DEPTH is not
+            # a multiple of step. Preserve all four readers for odd depths.
+            c += step if slot + step < self.DEPTH else self.DEPTH - slot + first_slot
 
     def _evict_block(self, c):
         """DONTNEED one block's tmpfile pages (called from worker thread)."""
@@ -304,21 +353,35 @@ class _EvictRing:
 
     def get(self, c):
         c = int(c)
+        if self._bufs is None:
+            raise RuntimeError("Genotype ring is closed.")
+        self._check_error()
+        if not self._pass_start <= c < self._pass_stop:
+            raise IndexError("Call index is outside the active ring pass.")
+        if c != self._next_call:
+            raise ValueError(
+                f"Ring reads must be sequential: expected {self._next_call}, got {c}. "
+                "Start a new pass at the required call range."
+            )
+        position = c - self._pass_start
         # Release old ring slot (eviction handled by worker)
-        if c >= self.DEPTH:
-            old_slot = (c - self.DEPTH) % self.DEPTH
+        if position >= self.DEPTH:
+            old_slot = (position - self.DEPTH) % self.DEPTH
             self._transfer_done[old_slot].wait()
+            self._check_error()
             self._ready[old_slot].clear()
             self._writable[old_slot].set()
 
-        slot = c % self.DEPTH
-        self._ready[slot].wait()
+        slot = position % self.DEPTH
+        self._wait_ready(slot)
         off0 = int(self._offsets[c])
         off1 = int(self._offsets[c + 1])
+        self._next_call = c + 1
         return self._bufs[slot][:off1 - off0]
 
     def finish_pass(self):
         self._stop.set()
+        self._next_call = None
         for th in self._threads:
             th.join()
         self._threads = []
@@ -329,7 +392,7 @@ class _EvictRing:
         if self._bufs is None:
             return
         self.finish_pass()
-        self._wait_for_transfers()
+        self._wait_for_transfers(check_errors=False)
         self._transfer_queue.put(None)
         self._transfer_queue.join()
         self._transfer_thread.join()
@@ -1218,7 +1281,7 @@ class GenoBlockStreamer:
                     source_full_n is not None
                     and source_subset is not None
                     and source_mask.shape == (int(source_full_n),)
-                    and int(np.count_nonzero(source_mask)) == int(source.n)
+                    and np.array_equal(np.flatnonzero(source_mask), source_subset)
                 )
                 if already_applied:
                     # Built-in source objects may already have applied this
@@ -1242,6 +1305,18 @@ class GenoBlockStreamer:
         self._sample_mask = (
             np.asarray(sample_mask, dtype=bool) if sample_mask is not None else None
         )
+        # Preserve the final original-file row indices for raw BED decoding
+        # and for reopening a sparse source after its reader has been closed.
+        self._source_full_n = int(getattr(source, "_n_full", source.n))
+        source_subset = getattr(source, "_sample_idx", None)
+        self._source_sample_indices = (
+            None if source_subset is None else np.asarray(source_subset, dtype=np.int64).copy()
+        )
+        if self._sample_mask is not None:
+            if self._source_sample_indices is None:
+                self._source_sample_indices = np.flatnonzero(self._sample_mask)
+            else:
+                self._source_sample_indices = self._source_sample_indices[self._sample_mask]
         if self.sample_ids is not None and self._sample_mask is not None:
             sample_ids = tuple(self.sample_ids)
             if len(sample_ids) != self._sample_mask.size:
@@ -1320,6 +1395,9 @@ class GenoBlockStreamer:
                     f"standardization_override length mismatch: expected m={int(self.m)}, "
                     f"got means={means_override.size}, inv={inv_override.size}."
                 )
+            if (not np.isfinite(means_override).all()
+                    or not np.isfinite(inv_override).all() or np.any(inv_override < 0)):
+                raise ValueError("standardization_override must be finite with nonnegative inverse scales.")
             self._standardization_override = (means_override, inv_override)
 
         (
@@ -1387,17 +1465,18 @@ class GenoBlockStreamer:
                 self._build_tmpfile_bed(
                     bed_path,
                     self._source._n_full,
-                    self._source._sample_idx,
+                    self._source_sample_indices,
                 )
             )
-        elif hasattr(self._source, "read_block_variant_major"):
+        elif (hasattr(self._source, "read_block_variant_major")
+              or hasattr(self._source, "read_block")):
             means_flat, inv_sds_flat, eff, counts_flat = (
                 self._build_tmpfile_varmaj()
             )
         else:
             raise NotImplementedError(
                 "GenoBlockStreamer now requires either BedGenoSource or a "
-                "source implementing read_block_variant_major()."
+                "source implementing read_block_variant_major() or read_block()."
             )
 
         self._means_host = means_flat if self.keep_host_stats else None
@@ -2604,6 +2683,11 @@ class GenoBlockStreamer:
             block = self._source.read_block_variant_major(snp_start, snp_count)
         else:
             block = np.ascontiguousarray(self._source.read_block(snp_start, snp_count).T)
+        if block.shape != (snp_count, int(self._source.n)):
+            raise ValueError(
+                "Genotype source returned an invalid block shape: "
+                f"got {block.shape}, expected {(snp_count, int(self._source.n))}."
+            )
         if self._sample_mask is not None:
             block = np.ascontiguousarray(block[:, self._sample_mask])
         return block
@@ -2731,7 +2815,15 @@ class GenoBlockStreamer:
             raise IndexError(
                 f"component_idx={component_idx} out of range for {self._n_components} components."
             )
-        self._prepare_kv_pass()
+        if self._ring is not None:
+            # A component may start after the ring's capacity. Starting readers
+            # at call zero would leave them waiting to recycle unconsumed slots.
+            self._ring.start_pass(
+                call_start=int(self._component_call_offsets[component_idx]),
+                call_stop=int(self._component_call_offsets[component_idx + 1]),
+            )
+        else:
+            self._prepare_kv_pass()
         V = _ensure_on_device(V, self.dev)
         from .kv_impl import kv_impl_partitioned_component
         return kv_impl_partitioned_component(

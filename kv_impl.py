@@ -30,12 +30,13 @@ def _device_put_block(block: np.ndarray, dev) -> Array:
     """Copy host blocks before GPU H2D to avoid view-backed transfer corruption."""
     if isinstance(block, jax.Array):
         return jax.device_put(block, dev)
-    if getattr(dev, "platform", None) == "cpu":
-        return jax.device_put(block, dev)
-    if isinstance(block, _PinnedHostBuffer):
+    if isinstance(block, _PinnedHostBuffer) and getattr(dev, "platform", None) != "cpu":
         device_array = jax.device_put(np.asarray(block), dev)
         block.mark_device_transfer(device_array)
         return device_array
+    # CPU device_put can alias aligned NumPy storage. The ring may recycle
+    # this block while its device array is still used by queued arithmetic.
+    # Give JAX an independently owned copy on CPU as well as pageable GPU I/O.
     return jax.device_put(np.array(block, copy=True, order="C"), dev)
 
 

@@ -314,15 +314,17 @@ def _solve_small_spd(
         scale = 1.0
     eye = np.eye(p, dtype=np.float64)
 
-    for k in range(max_tries):
-        jitter = base_jitter * scale * (10.0 ** k)
+    for k in range(max_tries + 1):
+        # Solve the stated GLS equations first. Adding ridge unconditionally
+        # biases identifiable effects when fixed-effect columns are correlated.
+        jitter = 0.0 if k == 0 else base_jitter * scale * (10.0 ** (k - 1))
         A_try = A_np + jitter * eye
         try:
             L = np.linalg.cholesky(A_try)
         except np.linalg.LinAlgError:
             continue
         y = np.linalg.solve(L, b_np)
-        x = np.linalg.solve(L.T, y).astype(np.float32, copy=False)
+        x = np.linalg.solve(L.T, y)
         return jax.device_put(jnp.asarray(x, dtype=A.dtype), next(iter(A.devices())))
 
     raise FloatingPointError("Failed to stabilize GLS normal equations with jitter escalation.")

@@ -55,6 +55,8 @@ GPU_REML is organized around one contract: a covariance component must expose
   standardized column norms while building the cache. Ordinary GRMs expose
   this mean as a scalar rather than allocating an `n`-element constant vector.
 - All sources in a multi-GRM fit must have identical aligned sample order.
+  A further mask on an already subsetted source is composed in original-file
+  coordinates. Sparse column extraction reopens that same final sample set.
 - Prediction sources must reproduce training variant order, component layout,
   and standardization. Built-in BED/PGEN paths compare canonical
   `CHROM/POS/ID/REF/ALT` records from BIM/PVAR files; custom sources without a
@@ -111,6 +113,12 @@ GPU_REML is organized around one contract: a covariance component must expose
   materialize a wide standardized genotype block.
 - A pinned ring overlaps host reads, H2D copies, and GPU matmul. A slot is not
   writable again until its asynchronous device transfer has completed.
+  Component products start a pass at the component's actual call range;
+  consumers read that range sequentially. Each slot keeps one reader owner
+  across wraparound, including when the ring depth is not a multiple of four.
+  Reader and transfer failures propagate to the caller instead of leaving a
+  consumer blocked. CPU transfers copy reusable staging storage so JAX cannot
+  retain an alias to a subsequently overwritten slot.
   Cleanup unregisters only buffers the ring successfully pinned; CPU buffers
   never call the CUDA runtime. Optional registration failures fall back to
   pageable buffers without leaving a CUDA error for subsequent JAX operations.

@@ -716,6 +716,12 @@ class SparseGenoBlockStreamer(GenoBlockStreamer):
     """
 
     def __init__(self, *args, **kwargs):
+        if (kwargs.get("component_block_sizes") is not None
+                or kwargs.get("component_variant_indices") is not None):
+            raise ValueError(
+                "Sparse genotype component partitioning is not supported; "
+                "use separate sparse sources for separate components."
+            )
         self._gpu_budget_bytes = kwargs.pop("gpu_budget_bytes", None)
         self._mixed_dense_sparse = bool(kwargs.pop("mixed_dense_sparse", False))
         self._sparse_metadata_ready = False
@@ -813,16 +819,21 @@ class SparseGenoBlockStreamer(GenoBlockStreamer):
                 )
             from .geno_source import BedGenoSource, PgenGenoSource
 
+            subset = getattr(self, "_source_sample_indices", None)
+            sample_mask = None
+            if subset is not None:
+                sample_mask = np.zeros(self._source_full_n, dtype=bool)
+                sample_mask[subset] = True
             if fmt == "bed":
                 source = BedGenoSource(
                     prefix,
                     threads=getattr(self, "_build_threads", None),
-                    sample_mask=getattr(self, "_sample_mask", None),
+                    sample_mask=sample_mask,
                 )
             elif fmt == "pgen":
                 source = PgenGenoSource(
                     prefix,
-                    sample_mask=getattr(self, "_sample_mask", None),
+                    sample_mask=sample_mask,
                 )
             else:
                 raise RuntimeError(
@@ -861,20 +872,18 @@ class SparseGenoBlockStreamer(GenoBlockStreamer):
     ) -> np.ndarray:
         j0 = int(self._call_snp_starts[call_idx])
         if hasattr(source, "read_block_variant_major"):
-            block = np.asarray(source.read_block_variant_major(j0, width))
-            if block.shape == (width, self.n):
-                block = np.ascontiguousarray(block.T)
-            elif block.shape != (self.n, width):
-                raise RuntimeError(
-                    "Unexpected variant-major block shape for sparse column extraction: "
-                    f"got {block.shape}, expected {(width, self.n)} or {(self.n, width)}."
-                )
+            block = np.asarray(source.read_block_variant_major(j0, width)).T
         elif hasattr(source, "read_block"):
-            block = np.ascontiguousarray(source.read_block(j0, width).T)
+            block = np.asarray(source.read_block(j0, width))
         else:
             raise RuntimeError(
                 "SparseGenoBlockStreamer requires a source with read_block_variant_major() "
                 "or read_block() for column extraction."
+            )
+        if block.shape != (self.n, width):
+            raise RuntimeError(
+                "Unexpected genotype block shape for sparse column extraction: "
+                f"got {block.shape}, expected {(self.n, width)}."
             )
         return np.asarray(block[:, local_cols], dtype=np.float32, order="C")
 
