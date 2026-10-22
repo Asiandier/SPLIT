@@ -11,7 +11,9 @@ import time
 import jax
 import numpy as np
 
-from .grouped_ss_vamp import GenotypeProducts, VAMPConfig, VAMPResult, fit_grouped_ss_vamp
+from .grouped_ss_vamp import (
+    GenotypeProducts, VAMPConfig, VAMPResult, VAMPConvergenceError, fit_grouped_ss_vamp,
+)
 from .ss_linear import SupportPrecisionSolver
 
 
@@ -77,14 +79,9 @@ def refine_alpha_vamp(*, design, y, covariates, gamma, background_score,
             posterior = fit_grouped_ss_vamp(products, residual, np.zeros(s, int),
                 np.array([target]), np.array([normalizer]), np.array([noise_variance]),
                 solver, config, callback, em_counts=np.array([total_snps]))
-            if (posterior.status != ['converged'] and config.max_iterations >= config.min_iterations
-                    and (not config.learn_pi or config.max_iterations > config.em_warmup)):
-                from .ss_ec import solve_support_ec
-                posterior = solve_support_ec(posterior, solver, products, residual,
-                    prior_second_moment=target/normalizer, total_snps=total_snps,
-                    config=config, callback=callback)
             if posterior.status != ['converged']:
-                raise RuntimeError('Alpha prior-Q VAMP did not converge; outputs rejected')
+                raise VAMPConvergenceError('alpha', posterior,
+                    elapsed_seconds=time.monotonic()-started)
     updated = posterior.mean[:, 0]
     score = x@updated
     old_score = x@pilot

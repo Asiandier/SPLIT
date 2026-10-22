@@ -10,7 +10,9 @@ import time
 import numpy as np
 import jax
 import jax.numpy as jnp
-from .grouped_ss_vamp import GenotypeProducts, VAMPConfig, VAMPResult, fit_grouped_ss_vamp
+from .grouped_ss_vamp import (
+    GenotypeProducts, VAMPConfig, VAMPResult, VAMPConvergenceError, fit_grouped_ss_vamp,
+)
 from .ss_linear import MatrixFreeSampleSolver
 
 
@@ -398,7 +400,8 @@ def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
     result.numerical_attempts = attempts
     result.context = context
     if result.posterior.status != ['converged']:
-        raise RuntimeError('SS background refinement did not converge; outputs rejected')
+        raise VAMPConvergenceError('background', result.posterior,
+            elapsed_seconds=time.monotonic()-began, attempts=attempts)
     beta = result.posterior.mean[:, 0]
     # Batch components to bound the SNP-effect workspace even for large
     # partitions. The usual four groups still share one genotype scan.

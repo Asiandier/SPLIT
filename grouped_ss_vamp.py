@@ -25,6 +25,23 @@ import jax.numpy as jnp
 from .ss_linear import MatrixFreeSampleSolver, SupportPrecisionSolver
 
 
+class VAMPConvergenceError(RuntimeError):
+    """A completed VAMP attempt failed its numerical convergence checks.
+
+    Prediction orchestration may restore the native fit on this exception.
+    Invalid inputs, I/O errors and unrelated failures must still propagate.
+    """
+    def __init__(self, component, posterior, *, elapsed_seconds, attempts=None):
+        super().__init__(f'{component} VAMP did not converge: {posterior.status}')
+        self.component = component
+        self.diagnostics = dict(
+            component=component, status=list(posterior.status),
+            iterations=posterior.iterations, fit_seconds=posterior.seconds,
+            total_refinement_seconds=elapsed_seconds,
+            final_diagnostics=posterior.trace[-1] if posterior.trace else None,
+            linear_solver=posterior.linear_solver, numerical_attempts=attempts)
+
+
 @jax.jit
 def constrained_ss_m_step(a, b, counts, d, pi_min=1e-8):
     """Maximize fixed-q Q on pi*v=d; arrays broadcast over groups/cases.

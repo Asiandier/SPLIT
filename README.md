@@ -627,13 +627,18 @@ python -m pip wheel --no-deps --no-build-isolation \
 
 The adopted full prediction workflow is now available with
 `run_sparse_pipeline --alpha-vamp`: after the combined-sample LASSO/variance
-refit, run two conditional alpha/background SS rounds with a single alpha SS
+refit, attempt two conditional alpha/background SS rounds with a single alpha SS
 EM-VAMP model. The first alpha fit conditions on native conditional BLUP; the
 second conditions on the preceding background SS mean. Each background SS fit
 starts from the same native BLUP. Gamma, support and variance components stay
 fixed, and alpha's prior expected sparse variance is constrained to Q_s. Pi has no hyperprior;
 its EM count includes all SNPs, with outside-support indicators fixed zero.
 No alpha-specific validation selection or training-only SS is needed.
+If alpha VAMP fails to converge, the entire prediction update is discarded
+and the original weighted-LASSO alpha plus conditional BLUP is used. There is
+no EC fallback. The same restoration applies if background VAMP remains
+unconverged after its numerical retry. Native heritability estimates remain
+unchanged; metadata records the fallback and the time spent attempting refinement.
 See [prior-Q VAMP alpha](docs/alpha_vamp.md)
 for the model, command, inputs and outputs.
 
@@ -675,10 +680,11 @@ Insufficient solves or quadrature accuracy raise an error. This removes the
 dense-memory bottleneck; actual biobank runtime still depends on the number
 of streamed genotype passes and numerical conditioning.
 
-The additional `<prefix>.background_ss.npz` and `.background_ss.json` retain
+On convergence, `<prefix>.background_ss.npz` and `.background_ss.json` retain
 the original BLUP initialization, posterior moments, group parameters and
-convergence metadata. `beta_background` in the effect table is the refined
-SS mean when enabled. The legacy prediction column `lasso_background_blup`
-also contains that supplied SS background; its metadata identifies
-`background_estimator=constrained_ss_em_vamp`. See the documentation for
-the reusable in-memory adapter and batched inference API.
+convergence metadata. On fallback, only the JSON record is written.
+`beta_background` in the effect table and the legacy prediction column
+`lasso_background_blup` contain the refined SS mean on convergence, or the
+original BLUP on fallback. Metadata identifies the accepted estimator as
+`constrained_ss_em_vamp` or `gaussian_multi_blup`, respectively. See the
+documentation for the reusable in-memory adapter and batched inference API.

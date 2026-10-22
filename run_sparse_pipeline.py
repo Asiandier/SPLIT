@@ -567,31 +567,65 @@ def _validate_summary(
     if require_alpha_vamp:
         refinement = summary.get('alpha_vamp', {})
         background = summary.get('background_ss', {})
-        if (expected_method != 'fixed_lam_ratio' or refinement.get('status') != 'converged'
-                or refinement.get('method') != 'prior_Q_ss_em_vamp_alpha'
-                or refinement.get('mode') != 'final_refit'
-                or refinement.get('constraint_kind') != 'prior_expected_variance'
-                or refinement.get('background_estimator') != 'constrained_ss_em_vamp'
-                or refinement.get('refinement_order') != 'alpha_prior_Q_vamp_then_background_ss'
-                or refinement.get('alternating_rounds') != 2
-                or refinement.get('validation_used') is not False):
-            raise ValueError('Requested final-refit prior-Q alpha VAMP workflow was not completed')
-        rounds = refinement.get('rounds', [])
-        if (not isinstance(rounds, list) or len(rounds) != 2
-                or any(row.get('round') != i+1
-                    or row.get('alpha', {}).get('status') != 'converged'
-                    or row.get('alpha', {}).get('constraint_kind') != 'prior_expected_variance'
-                    or row.get('alpha', {}).get('background_estimator') !=
-                        ('native_conditional_blup' if i == 0 else 'constrained_ss_em_vamp')
-                    or row.get('background', {}).get('status') != 'converged'
-                    for i, row in enumerate(rounds))):
-            raise ValueError('Requested two-round prior-Q alpha VAMP workflow was not completed')
-        if (background.get('status') != 'converged'
-                or background.get('conditioning_alpha') != 'prior_Q_ss_em_vamp_alpha'
-                or background.get('alternating_rounds') != 2):
-            raise ValueError('Final background SS must be conditional on the updated VAMP alpha')
-        required.extend(str(prefix)+suffix for suffix in (
-            '.alpha_vamp.npz', '.alpha_vamp.json', '.background_ss.npz', '.background_ss.json'))
+        policy = 'native_alpha_blup_on_nonconvergence'
+        if (refinement.get('failure_policy') != policy
+                or background.get('failure_policy') != policy):
+            raise ValueError('Prediction refinement uses a different failure policy')
+        if refinement.get('status') == 'fallback_native':
+            if (expected_method != 'fixed_lam_ratio'
+                    or refinement.get('method') != 'final_weighted_lasso'
+                    or background.get('method') != 'gaussian_multi_blup'):
+                raise ValueError('Prediction fallback must restore native alpha and BLUP')
+            failure = refinement.get('failure', {})
+            if (failure.get('component') not in ('alpha', 'background')
+                    or failure.get('round') not in (1, 2)
+                    or not failure.get('status')
+                    or failure.get('status') == ['converged']
+                    or background.get('failure') != failure):
+                raise ValueError('Prediction fallback lacks a matching nonconvergence record')
+            for component in (refinement, background):
+                if (component.get('status') != 'fallback_native'
+                        or component.get('native_restored') is not True
+                        or component.get('mode') != 'final_refit'
+                        or component.get('fallback_reason') != 'vamp_nonconvergence'
+                        or component.get('validation_used') is not False
+                        or component.get('variance_components_fixed') is not True
+                        or component.get('alternating_rounds') != 0
+                        or component.get('requested_alternating_rounds') != 2):
+                    raise ValueError('Incomplete native prediction fallback')
+            for suffix in ('.alpha_vamp.npz', '.background_ss.npz'):
+                if Path(str(prefix)+suffix).exists():
+                    raise ValueError('Native fallback retains a stale refined posterior')
+            required.extend(str(prefix)+suffix for suffix in ('.alpha_vamp.json', '.background_ss.json'))
+        else:
+            if (expected_method != 'fixed_lam_ratio' or refinement.get('status') != 'converged'
+                    or refinement.get('method') != 'prior_Q_ss_em_vamp_alpha'
+                    or refinement.get('mode') != 'final_refit'
+                    or refinement.get('constraint_kind') != 'prior_expected_variance'
+                    or refinement.get('background_estimator') != 'constrained_ss_em_vamp'
+                    or refinement.get('refinement_order') != 'alpha_prior_Q_vamp_then_background_ss'
+                    or refinement.get('alternating_rounds') != 2
+                    or refinement.get('validation_used') is not False):
+                raise ValueError('Requested final-refit prior-Q alpha VAMP workflow was not completed')
+            rounds = refinement.get('rounds', [])
+            if (not isinstance(rounds, list) or len(rounds) != 2
+                    or any(row.get('round') != i+1
+                        or row.get('alpha', {}).get('status') != 'converged'
+                        or row.get('alpha', {}).get('constraint_kind') != 'prior_expected_variance'
+                        or row.get('alpha', {}).get('background_estimator') !=
+                            ('native_conditional_blup' if i == 0 else 'constrained_ss_em_vamp')
+                        or row.get('background', {}).get('status') != 'converged'
+                        for i, row in enumerate(rounds))):
+                raise ValueError('Requested two-round prior-Q alpha VAMP workflow was not completed')
+            if (background.get('status') != 'converged'
+                    or background.get('conditioning_alpha') != 'prior_Q_ss_em_vamp_alpha'
+                    or background.get('alternating_rounds') != 2):
+                raise ValueError('Final background SS must be conditional on the updated VAMP alpha')
+            required.extend(str(prefix)+suffix for suffix in (
+                '.alpha_vamp.npz', '.alpha_vamp.json', '.background_ss.npz', '.background_ss.json'))
+            if any((row.get('alpha', {}).get('linear_solver') or {}).get('double_loop_ec')
+                   for row in rounds):
+                raise ValueError('EC refinement cannot satisfy the native fallback policy')
     validate_output_manifest(summary.get("output_artifacts"), required_paths=required)
     return summary
 
@@ -1269,11 +1303,14 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
             }
         ),
         "compute_effects": bool(args.compute_effects),
-        **({'background_ss': True, 'background_ss_max_iterations': int(args.background_ss_max_iterations),
+        **({'background_ss': True,
+            'refinement_failure_policy': 'native_alpha_blup_on_nonconvergence',
+            'background_ss_max_iterations': int(args.background_ss_max_iterations),
             'background_ss_numerics': dict(pcg_tolerance=args.background_ss_pcg_tol,
                 trace_probes=args.background_ss_trace_probes, lanczos_steps=args.background_ss_lanczos_steps)}
            if args.background_ss else {}),
         **({'alpha_vamp': dict(method='prior_Q_ss_em_vamp_alpha',
+              failure_policy='native_alpha_blup_on_nonconvergence',
               max_iterations=int(args.alpha_vamp_max_iterations), hyperpriors=None,
               pi_counts='all SNPs; outside-support indicators fixed zero',
               alpha_background='native_conditional_blup_then_previous_round_background_ss', validation_used=False,
