@@ -6,6 +6,7 @@ No foreground, covariance component or noise parameter is re-estimated.
 """
 from __future__ import annotations
 from dataclasses import dataclass
+import logging
 import time
 import numpy as np
 import jax
@@ -14,6 +15,8 @@ from .grouped_ss_vamp import (
     GenotypeProducts, VAMPConfig, VAMPResult, VAMPConvergenceError, fit_grouped_ss_vamp,
 )
 from .ss_linear import MatrixFreeSampleSolver
+
+logger = logging.getLogger(__name__)
 
 
 class StreamedGenotypeProducts:
@@ -317,7 +320,7 @@ def refine_lasso_background_ss(context, *, y, alpha, gamma, covariates,
 
 def refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
                                  beta_active, beta_cov, theta, background_effects,
-                                 config=None, context=None):
+                                 config=None, context=None, callback=None):
     """Automatic adapter for the final sparse pipeline's in-memory outputs.
 
     Reuses native streamed training products in logical GRM order, which is
@@ -333,11 +336,12 @@ def refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
         return _refine_sparse_fit_background(fitter=fitter, grm_index=grm_index,
             y=y, covariates=covariates, support=support, beta_active=beta_active,
             beta_cov=beta_cov, theta=theta, background_effects=background_effects,
-            config=config, context=context)
+            config=config, context=context, callback=callback)
 
 
 def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
-                                  beta_active, beta_cov, theta, background_effects, config, context):
+                                  beta_active, beta_cov, theta, background_effects, config, context,
+                                  callback=None):
     from dataclasses import asdict, replace
     began = time.monotonic()
     config = config or VAMPConfig(max_iterations=2000)
@@ -377,6 +381,9 @@ def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
                 release()
         products = StreamedGenotypeProducts(grm_index, n, normalizers, block_bytes=block_bytes,
                                             device_cache_bytes=cache_bytes)
+        logger.info('[background SS] n=%s, SNPs=%s, packed GPU cache=%.3f GiB / %.3f GiB budget; '
+                    'preparing linear solver and trace quadrature',
+                    n, p, products.device_cache_bytes/2**30, cache_bytes/2**30)
         context = GroupedSSBackgroundContext(products, groups, normalizers)
     elif (context.products.n != n or context.products.p != p
             or getattr(context.products, 'index', None) is not grm_index
@@ -384,7 +391,7 @@ def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
             or not np.array_equal(context.normalizers, normalizers)):
         raise ValueError('Reused SS context must have the same training index and GRM partition')
     result = refine_lasso_background_ss(context, y=y, alpha=alpha, gamma=beta_cov,
-        covariates=covariates, blup=initial, variance_components=theta, config=config)
+        covariates=covariates, blup=initial, variance_components=theta, config=config, callback=callback)
     attempts = [dict(status=result.posterior.status, iterations=result.posterior.iterations,
                      seconds=result.posterior.seconds, config=asdict(config))]
     if result.posterior.status != ['converged']:
@@ -394,7 +401,7 @@ def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
         retry = replace(config, damping=min(config.damping, .1), em_damping=min(config.em_damping, .025),
                         em_acceleration_floor=max(config.em_acceleration_floor, config.em_tolerance))
         result = refine_lasso_background_ss(context, y=y, alpha=alpha, gamma=beta_cov,
-            covariates=covariates, blup=initial, variance_components=theta, config=retry)
+            covariates=covariates, blup=initial, variance_components=theta, config=retry, callback=callback)
         attempts.append(dict(status=result.posterior.status, iterations=result.posterior.iterations,
                              seconds=result.posterior.seconds, config=asdict(retry)))
     result.numerical_attempts = attempts

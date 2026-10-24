@@ -10,8 +10,15 @@ import os
 
 
 def packed_device_cache_budget(gpu_budget_bytes=None) -> int:
-    """Reserve a bounded fraction for reusable two-bit genotype blocks."""
-    return (min(2 * 1024**3, max(0, int(gpu_budget_bytes)//8))
+    """Share the process budget between packed data and compute workspaces.
+
+    The planner accounts for this reservation before sizing compute blocks.
+    A fixed 2 GiB ceiling disabled the complete-source cache for larger
+    cohorts even when the process had ample GPU memory. Reserve at most half
+    of its budget instead; actual allocations still require the whole packed
+    source to fit, and consume only the source's size.
+    """
+    return (max(0, int(gpu_budget_bytes)//2)
             if gpu_budget_bytes is not None else 256 * 1024**2)
 
 

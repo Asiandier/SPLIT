@@ -3177,7 +3177,10 @@ def _refine_prediction_with_fallback(*, args, pkg_name, fitter, grm_index,
                 config=ss_core.VAMPConfig(max_iterations=args.background_ss_max_iterations,
                     linear_pcg_tolerance=args.background_ss_pcg_tol,
                     trace_probes=args.background_ss_trace_probes,
-                    trace_lanczos_steps=args.background_ss_lanczos_steps))
+                    trace_lanczos_steps=args.background_ss_lanczos_steps),
+                callback=lambda row: logger.info(
+                    '[background SS round %s] iteration=%s, module_error=%s, EM_error=%s',
+                    refinement_round, row['iteration'], row['module_error'], row['em_error']))
             ss_context = ss_result.context
             ss_posterior = ss_result.posterior
             training_full_score = ss_result.fitted_mean[:, 0]
@@ -5982,7 +5985,7 @@ def main() -> None:
 if __name__ == "__main__":
     _h = logging.StreamHandler(sys.stdout)
     _h.setFormatter(logging.Formatter("%(message)s"))
-    for _name in ("GPU_REML_v6", __name__):
+    for _name in (pkg_name, __name__):
         _lg = logging.getLogger(_name)
         _lg.addHandler(_h)
         _lg.setLevel(logging.INFO)
