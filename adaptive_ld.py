@@ -49,9 +49,9 @@ from .pipeline_common import (
     make_nonbed_input_fam,
     read_keep_ids,
     resolve_cpu_threads,
-    run_planner,
     setup_gpu,
 )
+from .sparse_planner import run_sparse_planner
 from .reml_model import FitConfig, InfinitesimalREMLFitter, standardize_response
 from .sparse_core import (
     MultiGRMIndex,
@@ -809,7 +809,7 @@ def build_analysis_context(args: argparse.Namespace) -> AnalysisContext:
         if float(args.gpu_budget_gib) > 0.0
         else None
     )
-    plan = run_planner(
+    plan = run_sparse_planner(
         n_samples=int(y.size),
         p_list=[marker_count_source],
         n_grm=len(groups),

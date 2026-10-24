@@ -368,10 +368,10 @@ def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
         workspace = min(max(config.trace_workspace_bytes, minimum_workspace),
                         max(1, int(budget)//8))
         config = replace(config, trace_workspace_bytes=workspace)
-    from .runtime_env import packed_device_cache_budget
+    from .sparse_planner import sparse_packed_device_cache_budget
     cache_bytes = getattr(getattr(fitter, 'cfg', None), 'packed_device_cache_bytes', None)
     if cache_bytes is None:
-        cache_bytes = packed_device_cache_budget(budget)
+        cache_bytes = sparse_packed_device_cache_budget(budget)
     if context is None:
         # REML is complete. Reuse its reservation for SS's smaller FP64 blocks
         # instead of holding two copies of the same compressed genotypes.

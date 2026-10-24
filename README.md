@@ -560,11 +560,15 @@ fit lifecycle.
   retention. Lower this budget to leave more VRAM for other processes. For memory diagnostics,
   `XLA_PYTHON_CLIENT_ALLOCATOR=platform` releases allocations eagerly, at a
   potential performance cost.
-  Up to one eighth of the budget (capped at 2 GiB) is reserved for reusable
-  two-bit genotype blocks. A complete source must fit its share to be cached;
-  larger sources continue to stream. Background SS reuses this reservation
-  with smaller decode blocks and device-side loops. Neither cache stores a
-  dense standardized genotype matrix or sample Gram matrix.
+  Ordinary REML reserves up to one eighth of the budget (capped at 2 GiB)
+  for reusable two-bit genotype blocks. The sparse workflow explicitly uses
+  a separate policy, allowing up to half its budget for these blocks. The
+  planner includes the chosen reservation before sizing compute workspaces;
+  the same allowance is passed to the fitter. A complete source must fit its
+  share to be cached; larger sources continue to stream. Background SS reuses
+  the sparse allowance after releasing the native REML cache, with smaller
+  decode blocks and device-side loops. Neither cache stores a dense
+  standardized genotype matrix or sample Gram matrix.
 - `--ring-depth`: number of CPU-side staging buffers used for genotype
   streaming. This is the main knob for controlling CPU memory peak during data
   movement. Larger values can give smoother host-to-GPU streaming but allocate

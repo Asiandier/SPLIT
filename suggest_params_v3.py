@@ -488,12 +488,15 @@ def suggest_call_width(
     source_format: Optional[str] = None,
     arbitrary_component_partition: bool = False,
     requested_call_width: Optional[int] = None,
+    packed_device_cache_bytes: Optional[int] = None,
 ) -> PlanResult:
     """
     GPU-only planner.
 
     Reports estimated host anon memory for informational purposes.
     Never rejects based on host memory.
+    An explicit packed cache allowance is accounted for in every live phase;
+    omitting it preserves the ordinary REML cache policy.
     """
     if optimizer not in {"strict", "smile_scoring"}:
         raise ValueError(f"Unknown REML optimizer: {optimizer}")
@@ -530,6 +533,11 @@ def suggest_call_width(
         else gpu_free * float(gpu_headroom)
     )
     gpu_budget_gib = gpu_budget / _GIB
+    cache_budget = packed_device_cache_budget(gpu_budget)
+    if packed_device_cache_bytes is not None:
+        cache_budget = int(packed_device_cache_bytes)
+        if cache_budget < 0 or cache_budget > gpu_budget:
+            raise ValueError("Packed device cache must fit within the GPU budget.")
     slq_workspace_bytes = (
         default_workspace_bytes(gpu_budget)
         if slq_workspace_bytes is None else int(slq_workspace_bytes)
@@ -548,7 +556,7 @@ def suggest_call_width(
         # Upper bound across dense sources, including per-call byte padding.
         # Reserving the cap is conservative if no complete source fits it.
         packed_bytes = n*(total_p+3*geom.n_calls)//4
-        streamer_state += min(packed_bytes, packed_device_cache_budget(gpu_budget))
+        streamer_state += min(packed_bytes, cache_budget)
         precond_state = _fit_projected_core_state_bytes(n, G, precond_rank)
         build_basis = streamer_state + _basis_build_live_bytes(n, geom, precond_rank)
         if component_block_sizes is not None:
@@ -756,7 +764,7 @@ def suggest_call_width(
         feasible=gpu_feasible, call_width=w, precond_rank=precond_rank,
         gpu_budget_gib=gpu_budget_gib,
         gpu_fixed_gib=gpu_fixed_gib,
-        packed_device_cache_bytes=packed_device_cache_budget(gpu_budget),
+        packed_device_cache_bytes=cache_budget,
         gpu_scratch_gib=scratch / _GIB,
         target_width=target_width,
         ring_depth=depth,

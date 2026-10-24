@@ -19,7 +19,7 @@ Performance notes (vs. previous version):
     for the Z portion.
   • Gram matrix inputs kept in float64 throughout to avoid precision loss.
   • Pre-built JAX arrays for y and covar avoid repeated device_put.
-  • Shared planner: uses the same closed-form GPU-width rule as pure REML.
+  • Sparse cache policy: reserves packed genotypes before shared GPU-width planning.
 """
 from __future__ import annotations
 
@@ -63,6 +63,7 @@ _pcg_mod = importlib.import_module(f"{pkg_name}.pcg")
 _information_mod = importlib.import_module(f"{pkg_name}.sparse_information")
 _core_mod = importlib.import_module(f"{pkg_name}.sparse_core")
 _common_mod = importlib.import_module(f"{pkg_name}.pipeline_common")
+_sparse_planner_mod = importlib.import_module(f"{pkg_name}.sparse_planner")
 _io_utils_mod = importlib.import_module(f"{pkg_name}.io_utils")
 _component_spec_mod = importlib.import_module(f"{pkg_name}.component_spec")
 _effect_io_mod = importlib.import_module(f"{pkg_name}.effect_io")
@@ -123,7 +124,7 @@ env = _common_mod.env
 query_gpu = _common_mod.query_gpu
 read_keep_ids = _common_mod.read_keep_ids
 setup_gpu = _common_mod.setup_gpu
-run_planner = _common_mod.run_planner
+run_sparse_planner = _sparse_planner_mod.run_sparse_planner
 print_planner_info = _common_mod.print_planner_info
 log_runtime_gpu_memory = _common_mod.log_runtime_gpu_memory
 ensure_parent_dir = _io_utils_mod.ensure_parent_dir
@@ -3601,7 +3602,7 @@ def main() -> None:
     planned_n_grm = (
         len(component_variant_indices) if component_variant_indices else 1
     )
-    plan = run_planner(
+    plan = run_sparse_planner(
         n_samples=y_np.shape[0], p_list=p_list,
         n_grm=planned_n_grm,
         component_block_sizes=(

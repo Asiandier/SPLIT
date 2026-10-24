@@ -235,6 +235,7 @@ def run_planner(
     source_format: Optional[str] = None,
     arbitrary_component_partition: bool = False,
     requested_call_width: Optional[int] = None,
+    packed_device_cache_bytes: Optional[int] = None,
 ) -> PlanResult:
     """Run GPU planner and return a PlanResult."""
     plan = suggest_call_width(
@@ -256,6 +257,7 @@ def run_planner(
         source_format=source_format,
         arbitrary_component_partition=arbitrary_component_partition,
         requested_call_width=requested_call_width,
+        packed_device_cache_bytes=packed_device_cache_bytes,
     )
     if not plan.feasible:
         raise SystemExit(
