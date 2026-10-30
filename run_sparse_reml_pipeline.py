@@ -858,8 +858,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--background-ss-trace-probes', type=int, default=32)
     p.add_argument('--background-ss-lanczos-steps', type=int, default=64)
     p.add_argument('--alpha-vamp', action='store_true',
-        help='After the frozen-lambda refit, run two conditional alpha/background SS rounds with prior-Q alpha EM-VAMP.')
-    p.add_argument('--alpha-vamp-max-iterations', type=int, default=10000)
+        help='After the frozen-lambda refit, jointly refine alpha and background with a genome-wide alpha variance prior.')
+    p.add_argument('--alpha-vamp-max-iterations', type=int, default=10000,
+                   help='Maximum iterations per joint alpha/background VAMP attempt.')
     p.add_argument("--keep-path", default=env("KEEP_PATH", ""))
     p.add_argument("--keep-out", default=env("KEEP_OUT", ""))
     p.add_argument("--dropped-out", default=env("DROPPED_OUT", ""))
@@ -1415,6 +1416,8 @@ def _json_safe_value(value):
         }
     if isinstance(value, (list, tuple)):
         return [_json_safe_value(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return _json_safe_value(value.tolist())
     if isinstance(value, np.generic):
         value = value.item()
     if isinstance(value, float) and not np.isfinite(value):
@@ -3119,187 +3122,184 @@ def _parse_variance_components_init(
     return theta
 
 
+def _refine_joint_prediction(*, args, pkg_name, fitter, grm_index,
+        Z_support, y_np, covar_np, beta_cov_lasso, beta_lasso_active,
+        theta_lasso_ml, q_chive, support, background_effects, out_prefix):
+    """Publish a converged joint posterior, or the complete original pair."""
+    joint = importlib.import_module(f'{pkg_name}.joint_refinement')
+    core = importlib.import_module(f'{pkg_name}.grouped_ss_vamp')
+    fitted = joint.refine_native_fit(
+        fitter=fitter, grm_index=grm_index, y=y_np, covariates=covar_np,
+        gamma=beta_cov_lasso, support=support, original_alpha=beta_lasso_active,
+        theta=theta_lasso_ml, q_sparse=q_chive, background_effects=background_effects,
+        config=core.VAMPConfig(max_iterations=args.alpha_vamp_max_iterations,
+            linear_pcg_tolerance=args.background_ss_pcg_tol,
+            trace_probes=args.background_ss_trace_probes,
+            trace_lanczos_steps=args.background_ss_lanczos_steps),
+        callback=lambda row: logger.info(
+            '[joint VAMP attempt %s] iteration=%s, module_error=%s, EM_error=%s',
+            row['attempt'], row['iteration'], row['module_error'], row['em_error']))
+    fit = fitted.fit
+    fallback = fit.status == 'fallback_native'
+    status = 'fallback_native' if fallback else 'converged'
+    elapsed = fitted.metadata['total_refinement_seconds']
+    fit_seconds = sum(row['seconds'] for row in fit.attempts)
+    common = dict(requested=True, status=status, mode='final_refit',
+        model='joint_global_budget_p', joint_refinement_schema=1, joint_inference=True,
+        failure_policy='native_alpha_blup_on_nonconvergence', native_restored=fallback,
+        variance_components_fixed=True, noise_fixed=True, gamma_fixed=True,
+        support_fixed=True, validation_used=False,
+        constraint_kind='genome_prior_expected_variance',
+        posterior_scope='support-truncated genome-wide alpha prior',
+        total_prediction_refinement_seconds=elapsed,
+        timing_scope='shared joint stage; charged once to alpha_vamp.total_refinement_seconds',
+        zero_variance_model=fit.status == 'converged_zero')
+    alpha_summary = dict(common, **{
+        'method': 'final_weighted_lasso' if fallback else 'joint_global_budget_p',
+        'Q_s': max(float(q_chive), 0.), 'Q_s_raw': float(q_chive),
+        'alpha_em_count': int(grm_index.m_total), 'support_size': len(support),
+        'global_trace_normalizer': fitted.metadata['global_trace_normalizer'],
+        'support_trace_normalizer': fitted.metadata['support_trace_normalizer'],
+        'variance_constraint': 'pi_a*slab_variance_a*tr(X_all.T@X_all)/n=Q_s',
+        'initialization': fit.attempts[-1].get('initialization') if fit.attempts else None,
+        'iterations': sum(row.get('iterations', 0) for row in fit.attempts),
+        'fit_seconds': fit_seconds, 'total_refinement_seconds': elapsed,
+        'setup_and_products_seconds': max(elapsed-fit_seconds, 0.),
+        'numerical_attempts': fit.attempts, 'joint_summary': fit.summary,
+        'linear_solver': fit.attempts[-1].get('linear_solver') if fit.attempts else None,
+        'sample_gram_materialized': False,
+        'packed_device_cache_bytes': fitted.metadata['packed_device_cache_bytes'],
+        'training_mse': float(np.mean((np.asarray(y_np)-fitted.training_prediction)**2)),
+        'inference_estimates_source': 'native covariance-aligned LASSO; prediction refinement is separate'})
+    background_summary = dict(common,
+        method='gaussian_multi_blup' if fallback else 'joint_global_budget_p',
+        variance_constraint='pi_g*slab_variance_g*M_g=theta_g',
+        group_snp_counts=np.asarray(grm_index.m_per_grm).tolist(),
+        grm_normalizers=fitted.metadata['grm_normalizers'],
+        total_refinement_seconds=0.,
+        joint_metadata=out_prefix+'.alpha_vamp.json',
+        pcg_diagnostics='Effect-output BLUP diagnostics describe the original initialization.')
+    summaries = [alpha_summary, background_summary]
+    suffixes = ['.alpha_vamp', '.background_ss']
+    if fallback:
+        failure = dict(component='joint', **fit.attempts[-1])
+        for summary, suffix in zip(summaries, suffixes):
+            summary.update(fallback_reason='vamp_nonconvergence', failure=failure)
+            if os.path.exists(out_prefix+suffix+'.npz'):
+                os.unlink(out_prefix+suffix+'.npz')
+        logger.warning('[joint VAMP] Both attempts failed; restored original alpha and BLUP.')
+    else:
+        p = int(grm_index.m_total)
+        post = fit.posterior
+        # The all-zero budget model has no stochastic coordinates or solver.
+        def vector(key):
+            return np.zeros(p) if post is None else np.asarray(post[key])[:, 0]
+        pi = np.asarray(fit.summary['pi'])
+        slab = np.asarray(fit.summary['slab_variance'])
+        alpha_summary.update(pi=float(pi[0]), slab_variance=float(slab[0]))
+        background_summary.update(pi=pi[1:].tolist(), slab_variance=slab[1:].tolist())
+        alpha_score = np.asarray(Z_support, float)@fit.alpha
+        nuisance = np.asarray(covar_np, float)@np.asarray(beta_cov_lasso, float)
+        bg_score = np.asarray(fitted.background_effects.random_effect)
+        np.savez(out_prefix+'.alpha_vamp.npz',
+            support=support, source_snp_indices=grm_index.source_variant_indices(support),
+            alpha=fit.alpha, old_alpha=beta_lasso_active,
+            posterior_variance=np.maximum(vector('second_alpha')[support]-fit.alpha**2, 0.),
+            pip=vector('pip_alpha')[support], pi=pi[:1], slab_variance=slab[:1],
+            train_alpha_score=alpha_score, training_residual=np.asarray(y_np)-nuisance-bg_score,
+            native_train_background_score=np.asarray(background_effects.random_effect),
+            gamma_fixed=beta_cov_lasso, theta_fixed=theta_lasso_ml, Q_s=max(float(q_chive), 0.),
+            trace_normalizer=fitted.metadata['global_trace_normalizer'],
+            support_trace_normalizer=fitted.metadata['support_trace_normalizer'],
+            joint_inference=True, joint_refinement_schema=1)
+        np.savez(out_prefix+'.background_ss.npz',
+            beta_background=fit.background,
+            beta_initial_blup=np.concatenate([np.asarray(x) for x in background_effects.snp_effects]),
+            posterior_variance=np.maximum(vector('second_background')-fit.background**2, 0.),
+            posterior_total_variance=vector('variance'),
+            posterior_alpha_background_covariance=(vector('cross_moment')[support]
+                -fit.alpha*fit.background[support]),
+            pip=vector('pip_background'), pi=pi[1:], slab_variance=slab[1:],
+            groups=np.repeat(np.arange(len(grm_index.m_per_grm)), grm_index.m_per_grm),
+            theta=theta_lasso_ml, normalizers=fitted.metadata['grm_normalizers'],
+            conditioning_support=support, conditioning_alpha=fit.alpha,
+            training_residual=np.asarray(y_np)-nuisance-alpha_score,
+            training_background_score=bg_score, joint_inference=True, joint_refinement_schema=1,
+            source_snp_indices=grm_index.source_variant_indices(np.arange(p)))
+        logger.info('[joint VAMP] %s; iterations=%s, fit %.2fs, total %.2fs',
+                    fit.status, alpha_summary['iterations'], fit_seconds, elapsed)
+    for summary, suffix in zip(summaries, suffixes):
+        summary['paths'] = {'metadata':out_prefix+suffix+'.json'}
+        if not fallback:
+            summary['paths']['posterior'] = out_prefix+suffix+'.npz'
+        atomic_json(summary['paths']['metadata'], _json_safe_value(summary))
+    return fit.alpha, fitted.background_effects, alpha_summary, background_summary
+
+
 def _refine_prediction_with_fallback(*, args, pkg_name, fitter, grm_index,
         Z_support, y_np, covar_np, beta_cov_lasso, beta_lasso_active,
         theta_lasso_ml, q_chive, support, background_effects, out_prefix):
-    """Accept the complete conditional sequence or restore the native pair.
-
-    Only solver nonconvergence triggers fallback. Training input errors,
-    resource failures and output errors remain visible to the caller.
-    """
+    """Select joint refinement, or the explicit fixed-alpha background-only API."""
+    if args.alpha_vamp:
+        return _refine_joint_prediction(args=args, pkg_name=pkg_name, fitter=fitter,
+            grm_index=grm_index, Z_support=Z_support, y_np=y_np, covar_np=covar_np,
+            beta_cov_lasso=beta_cov_lasso, beta_lasso_active=beta_lasso_active,
+            theta_lasso_ml=theta_lasso_ml, q_chive=q_chive, support=support,
+            background_effects=background_effects, out_prefix=out_prefix)
     ss_mod = importlib.import_module(f'{pkg_name}.background_ss')
-    ss_core = importlib.import_module(f'{pkg_name}.grouped_ss_vamp')
-    if args.alpha_vamp:
-        alpha_mod = importlib.import_module(f'{pkg_name}.alpha_vamp')
-    native_background_effects = background_effects
-    native_alpha = np.asarray(beta_lasso_active, dtype=np.float64).copy()
-    prediction_alpha_active = native_alpha.copy()
-    alpha_vamp_summary = dict(requested=bool(args.alpha_vamp), status="not_requested")
-    policy = "native_alpha_blup_on_nonconvergence"
-    conditioning_background_score = np.asarray(background_effects.random_effect, dtype=np.float64)
-    ss_context = None
-    alpha_rounds, background_rounds = [], []
-    round_one_alpha = {}
-    n_refinement_rounds = 2 if args.alpha_vamp else 1
+    core = importlib.import_module(f'{pkg_name}.grouped_ss_vamp')
+    alpha_summary = dict(requested=False, status='not_requested')
+    policy = 'native_alpha_blup_on_nonconvergence'
+    metadata_path = out_prefix+'.background_ss.json'
+    posterior_path = out_prefix+'.background_ss.npz'
     try:
-        for refinement_round in range(1, n_refinement_rounds+1):
-            if args.alpha_vamp:
-                conditioning_estimator = ('native_conditional_blup' if refinement_round == 1
-                                          else 'constrained_ss_em_vamp')
-                alpha_result = alpha_mod.refine_alpha_vamp(
-                    design=Z_support, y=y_np, covariates=covar_np, gamma=beta_cov_lasso,
-                    background_score=conditioning_background_score,
-                    alpha=prediction_alpha_active, total_snps=grm_index.m_total,
-                    q_sparse=q_chive, noise_variance=float(theta_lasso_ml[-1]),
-                    background_estimator=conditioning_estimator,
-                    config=ss_core.VAMPConfig(max_iterations=args.alpha_vamp_max_iterations,
-                        damping=.2, em_damping=.2, tolerance=1e-4, em_tolerance=1e-4, log_every=25),
-                    callback=lambda row: logger.info(
-                        '[alpha VAMP round %s] iteration=%s, module_error=%s, EM_error=%s',
-                        refinement_round, row['iteration'], row['module_error'], row['em_error']))
-                prediction_alpha_active = alpha_result.alpha
-                alpha_rounds.append(dict(alpha_result.summary, round=refinement_round,
-                    background_conditioning_alpha=('native_weighted_lasso_before_alpha_VAMP'
-                        if refinement_round == 1 else 'previous_round_prior_Q_ss_em_vamp_alpha'),
-                    squared_terms_background=conditioning_estimator))
-                if refinement_round == 1:
-                    round_one_alpha = dict(round1_alpha=alpha_result.alpha,
-                        round1_train_alpha_score=alpha_result.training_sparse_score,
-                        round1_training_residual=alpha_result.residual)
-                logger.info('[alpha VAMP round %s] converged in %s iterations, pi=%s, support=%s',
-                    refinement_round, alpha_result.posterior.iterations, alpha_result.summary['pi'], len(support))
-
-            # Every background fit starts at the same native conditional BLUP.
-            # Reuse streamed products and trace quadrature, not posterior messages.
-            background_effects, ss_result, initial_blup = ss_mod.refine_sparse_fit_background(
-                fitter=fitter, grm_index=grm_index, y=y_np, covariates=covar_np,
-                support=support, beta_active=prediction_alpha_active, beta_cov=beta_cov_lasso,
-                theta=theta_lasso_ml, background_effects=native_background_effects, context=ss_context,
-                config=ss_core.VAMPConfig(max_iterations=args.background_ss_max_iterations,
-                    linear_pcg_tolerance=args.background_ss_pcg_tol,
-                    trace_probes=args.background_ss_trace_probes,
-                    trace_lanczos_steps=args.background_ss_lanczos_steps),
-                callback=lambda row: logger.info(
-                    '[background SS round %s] iteration=%s, module_error=%s, EM_error=%s',
-                    refinement_round, row['iteration'], row['module_error'], row['em_error']))
-            ss_context = ss_result.context
-            ss_posterior = ss_result.posterior
-            training_full_score = ss_result.fitted_mean[:, 0]
-            background_rounds.append(dict(requested=True, status='converged', round=refinement_round,
-                method='constrained_ss_em_vamp', initial_effect='native_BLUP', initial_pi=.1, hyperpriors=None,
-                conditioning_alpha='prior_Q_ss_em_vamp_alpha' if args.alpha_vamp else 'native_weighted_lasso',
-                alpha_gamma_fixed=True, zero_theta_groups_fixed_zero=True,
-                variance_components_fixed=True, noise_fixed=True,
-                variance_constraint='pi_g*slab_variance_g=theta_g/M_g',
-                pi=ss_posterior.pi[:, 0].tolist(), slab_variance=ss_posterior.slab_variance[:, 0].tolist(),
-                group_snp_counts=np.bincount(ss_result.groups).tolist(),
-                grm_normalizers=ss_result.normalizers.tolist(),
-                training_full_squared_term=float(np.mean(training_full_score**2)),
-                training_mse=float(np.mean((np.asarray(y_np, dtype=np.float64)-training_full_score)**2)),
-                iterations=ss_posterior.iterations, fit_seconds=ss_posterior.seconds,
-                total_refinement_seconds=ss_result.total_seconds,
-                setup_and_products_seconds=ss_result.setup_and_products_seconds,
-                initialization=ss_posterior.initialization, numerical_attempts=ss_result.numerical_attempts,
-                linear_solver=ss_posterior.linear_solver,
-                pcg_diagnostics='Original BLUP initialization PCG; SS convergence is recorded separately.'))
-            logger.info('[background SS round %s] converged in %s iterations, fit %.2fs, total %.2fs',
-                refinement_round, ss_posterior.iterations, ss_posterior.seconds, ss_result.total_seconds)
-            if refinement_round < n_refinement_rounds:
-                conditioning_background_score = ss_result.background[:, 0]
-                # Only the preceding training score is needed by the next alpha
-                # fit. Release its full posterior and per-component effects.
-                background_effects = native_background_effects
-                del ss_result, ss_posterior
-
-    except ss_core.VAMPConvergenceError as error:
-        # The update is transactional: even a round-two failure restores BOTH
-        # original components, not the last successful conditional update.
-        failure = dict(error.diagnostics, round=refinement_round)
-        summaries = {}
-        for component, rows, requested, method, suffix in (
-                ('alpha', alpha_rounds, bool(args.alpha_vamp), 'final_weighted_lasso', '.alpha_vamp'),
-                ('background', background_rounds, True, 'gaussian_multi_blup', '.background_ss')):
-            if not requested:
-                continue
-            posterior_path = out_prefix+suffix+'.npz'
-            if os.path.exists(posterior_path):
-                os.unlink(posterior_path)
-            metadata_path = out_prefix+suffix+'.json'
-            elapsed = sum(row['total_refinement_seconds'] for row in rows)
-            if error.component == component:
-                elapsed += failure['total_refinement_seconds']
-            summary = dict(requested=True, status='fallback_native', method=method,
-                mode='final_refit', failure_policy=policy, fallback_reason='vamp_nonconvergence',
-                native_restored=True, validation_used=False, variance_components_fixed=True,
-                alternating_rounds=0, requested_alternating_rounds=n_refinement_rounds,
-                completed_conditional_fits=rows, failure=failure,
-                total_refinement_seconds=elapsed, paths={'metadata':metadata_path})
-            summaries[component] = summary
-        total = sum(row['total_refinement_seconds'] for row in summaries.values())
-        for summary in summaries.values():
-            summary['total_alternating_refinement_seconds'] = total
-            atomic_json(summary['paths']['metadata'], _json_safe_value(summary))
-        logger.warning('[prediction refinement] %s round %s did not converge; '
-            'restored native alpha + BLUP (all conditional updates discarded).',
-            error.component, refinement_round)
-        return (native_alpha, native_background_effects,
-                summaries.get('alpha', alpha_vamp_summary), summaries['background'])
-
-    # Publish only after every requested conditional fit has converged.
-    ss_file = out_prefix+'.background_ss.npz'
-    ss_metadata = out_prefix+'.background_ss.json'
-    np.savez(ss_file, beta_background=ss_posterior.mean[:, 0],
-             posterior_variance=ss_posterior.variance[:, 0], pip=ss_posterior.pip[:, 0],
-             pi=ss_posterior.pi[:, 0], slab_variance=ss_posterior.slab_variance[:, 0],
-             groups=ss_result.groups, normalizers=ss_result.normalizers,
-             theta=theta_lasso_ml, beta_initial_blup=initial_blup,
-             conditioning_support=support, conditioning_alpha=prediction_alpha_active,
-             training_residual=ss_result.residual[:, 0],
-             training_background_score=ss_result.background[:, 0],
-             alternating_rounds=n_refinement_rounds,
-             source_snp_indices=grm_index.source_variant_indices(np.arange(grm_index.m_total)))
-    background_ss_summary = dict(background_rounds[-1], alternating_rounds=n_refinement_rounds,
-        failure_policy=policy,
-        rounds=background_rounds,
-        **{key:sum(row[key] for row in background_rounds) for key in
-            ('iterations', 'fit_seconds', 'total_refinement_seconds', 'setup_and_products_seconds')},
-        paths={'posterior':ss_file, 'metadata':ss_metadata})
-    atomic_json(ss_metadata, _json_safe_value(background_ss_summary))
-
-    if args.alpha_vamp:
-        alpha_file = out_prefix+'.alpha_vamp.npz'
-        alpha_metadata = out_prefix+'.alpha_vamp.json'
-        posterior = alpha_result.posterior
-        np.savez(alpha_file, support=support,
-            source_snp_indices=grm_index.source_variant_indices(support),
-            alpha=prediction_alpha_active, old_alpha=beta_lasso_active,
-            previous_alpha=round_one_alpha['round1_alpha'],
-            posterior_variance=posterior.variance[:, 0], pip=posterior.pip[:, 0],
-            pi=posterior.pi[:, 0], slab_variance=posterior.slab_variance[:, 0],
-            train_alpha_score=alpha_result.training_sparse_score,
-            training_residual=alpha_result.residual, Q_s=alpha_result.summary['Q_s'],
-            trace_normalizer=alpha_result.summary['trace_normalizer'],
-            train_conditioning_background_score=conditioning_background_score,
-            native_train_background_score=np.asarray(native_background_effects.random_effect, dtype=np.float64),
-            gamma_fixed=beta_cov_lasso, theta_fixed=theta_lasso_ml,
-            alternating_rounds=n_refinement_rounds, **round_one_alpha)
-        alpha_vamp_summary = dict(alpha_rounds[-1], alternating_rounds=n_refinement_rounds,
-            failure_policy=policy,
-            rounds=[dict(round=i+1, alpha=a, background=b)
-                    for i, (a, b) in enumerate(zip(alpha_rounds, background_rounds))],
-            **{key:sum(row[key] for row in alpha_rounds) for key in
-                ('iterations', 'fit_seconds', 'total_refinement_seconds')},
-            final_background_estimator='constrained_ss_em_vamp',
-            final_full_squared_term=background_ss_summary['training_full_squared_term'],
-            final_training_mse=background_ss_summary['training_mse'],
-            total_alternating_refinement_seconds=(sum(row['total_refinement_seconds'] for row in alpha_rounds)
-                +background_ss_summary['total_refinement_seconds']),
-            inference_estimates_source='native covariance-aligned LASSO; prediction refinement is separate',
-            paths={'posterior':alpha_file, 'metadata':alpha_metadata})
-        atomic_json(alpha_metadata, _json_safe_value(alpha_vamp_summary))
-    # Function-local posteriors and cached genotype workspaces are released
-    # before held-out prediction, on both the accepted and fallback paths.
-    return prediction_alpha_active, background_effects, alpha_vamp_summary, background_ss_summary
+        updated, result, initial = ss_mod.refine_sparse_fit_background(
+            fitter=fitter, grm_index=grm_index, y=y_np, covariates=covar_np,
+            support=support, beta_active=beta_lasso_active, beta_cov=beta_cov_lasso,
+            theta=theta_lasso_ml, background_effects=background_effects,
+            config=core.VAMPConfig(max_iterations=args.background_ss_max_iterations,
+                linear_pcg_tolerance=args.background_ss_pcg_tol,
+                trace_probes=args.background_ss_trace_probes,
+                trace_lanczos_steps=args.background_ss_lanczos_steps),
+            callback=lambda row: logger.info('[background SS] iteration=%s, module_error=%s, EM_error=%s',
+                row['iteration'], row['module_error'], row['em_error']))
+    except core.VAMPConvergenceError as error:
+        if os.path.exists(posterior_path):
+            os.unlink(posterior_path)
+        summary = dict(requested=True, status='fallback_native', method='gaussian_multi_blup',
+            mode='final_refit', failure_policy=policy, native_restored=True,
+            fallback_reason='vamp_nonconvergence', validation_used=False,
+            variance_components_fixed=True, failure=error.diagnostics,
+            total_refinement_seconds=error.diagnostics['total_refinement_seconds'],
+            paths={'metadata':metadata_path})
+        atomic_json(metadata_path, _json_safe_value(summary))
+        return np.asarray(beta_lasso_active).copy(), background_effects, alpha_summary, summary
+    post = result.posterior
+    score = result.fitted_mean[:, 0]
+    summary = dict(requested=True, status='converged', method='constrained_ss_em_vamp',
+        mode='final_refit', failure_policy=policy, initial_effect='native_BLUP',
+        initial_pi=.1, hyperpriors=None, conditioning_alpha='native_weighted_lasso',
+        alpha_gamma_fixed=True, zero_theta_groups_fixed_zero=True,
+        variance_components_fixed=True, noise_fixed=True, validation_used=False,
+        variance_constraint='pi_g*slab_variance_g=theta_g/M_g',
+        pi=post.pi[:, 0].tolist(), slab_variance=post.slab_variance[:, 0].tolist(),
+        group_snp_counts=np.bincount(result.groups).tolist(),
+        grm_normalizers=result.normalizers.tolist(),
+        training_full_squared_term=float(np.mean(score**2)),
+        training_mse=float(np.mean((np.asarray(y_np)-score)**2)),
+        iterations=post.iterations, fit_seconds=post.seconds,
+        total_refinement_seconds=result.total_seconds,
+        setup_and_products_seconds=result.setup_and_products_seconds,
+        initialization=post.initialization, numerical_attempts=result.numerical_attempts,
+        linear_solver=post.linear_solver, paths={'posterior':posterior_path, 'metadata':metadata_path})
+    np.savez(posterior_path, beta_background=post.mean[:, 0], posterior_variance=post.variance[:, 0],
+        pip=post.pip[:, 0], pi=post.pi[:, 0], slab_variance=post.slab_variance[:, 0],
+        groups=result.groups, normalizers=result.normalizers, theta=theta_lasso_ml,
+        beta_initial_blup=initial, conditioning_support=support, conditioning_alpha=beta_lasso_active,
+        training_residual=result.residual[:, 0], training_background_score=result.background[:, 0],
+        source_snp_indices=grm_index.source_variant_indices(np.arange(grm_index.m_total)))
+    atomic_json(metadata_path, _json_safe_value(summary))
+    return np.asarray(beta_lasso_active).copy(), updated, alpha_summary, summary
 
 
 def main() -> None:

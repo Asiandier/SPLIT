@@ -208,6 +208,29 @@ class VAMPConfig:
     trace_tolerance: float = 1e-6
 
 
+def validate_vamp_config(config):
+    """Validate shared numerical controls without changing global JAX precision."""
+    if not (0 < config.damping <= 1 and 0 < config.em_damping <= 1):
+        raise ValueError('Damping must be in (0,1]')
+    if config.max_iterations < 1 or config.em_inner_steps < 1 or config.em_max_step < 1:
+        raise ValueError('Invalid iteration count or EM acceleration limit')
+    for name in ['max_iterations', 'min_iterations', 'em_warmup', 'em_inner_steps',
+                 'consecutive_converged', 'log_every']:
+        value = getattr(config, name)
+        minimum = 0 if name in ['min_iterations', 'em_warmup'] else 1
+        if not isinstance(value, (int, np.integer)) or value < minimum:
+            raise ValueError(f'{name} must be an integer >= {minimum}')
+    if (not np.isfinite(config.em_max_step) or not np.isfinite(config.em_acceleration_floor)
+            or config.em_acceleration_floor < 0 or not np.isfinite(config.tolerance)
+            or config.tolerance <= 0 or not np.isfinite(config.em_tolerance)
+            or config.em_tolerance <= 0):
+        raise ValueError('Invalid numerical tolerances or EM acceleration settings')
+    if not np.isfinite(config.slab_variance_min) or config.slab_variance_min <= 0:
+        raise ValueError('Slab variance numerical floor must be positive')
+    if not (0 < config.pi_min <= config.initial_pi <= 1):
+        raise ValueError('Invalid numerical pi bounds or initialization')
+
+
 @dataclass
 class VAMPResult:
     mean: np.ndarray
@@ -246,25 +269,7 @@ def fit_grouped_ss_vamp(products: GenotypeProducts, residual, groups, theta,
     config = config or VAMPConfig()
     if not jax.config.jax_enable_x64:
         raise RuntimeError('Enable jax_enable_x64 before fitting FP64 EM-VAMP')
-    if not (0 < config.damping <= 1 and 0 < config.em_damping <= 1):
-        raise ValueError('Damping must be in (0,1]')
-    if config.max_iterations < 1 or config.em_inner_steps < 1 or config.em_max_step < 1:
-        raise ValueError('Invalid iteration count or EM acceleration limit')
-    for name in ['max_iterations', 'min_iterations', 'em_warmup', 'em_inner_steps',
-                 'consecutive_converged', 'log_every']:
-        value = getattr(config, name)
-        minimum = 0 if name in ['min_iterations', 'em_warmup'] else 1
-        if not isinstance(value, (int, np.integer)) or value < minimum:
-            raise ValueError(f'{name} must be an integer >= {minimum}')
-    if (not np.isfinite(config.em_max_step) or not np.isfinite(config.em_acceleration_floor)
-            or config.em_acceleration_floor < 0 or not np.isfinite(config.tolerance)
-            or config.tolerance <= 0 or not np.isfinite(config.em_tolerance)
-            or config.em_tolerance <= 0):
-        raise ValueError('Invalid numerical tolerances or EM acceleration settings')
-    if not np.isfinite(config.slab_variance_min) or config.slab_variance_min <= 0:
-        raise ValueError('Slab variance numerical floor must be positive')
-    if not (0 < config.pi_min <= config.initial_pi <= 1):
-        raise ValueError('Invalid numerical pi bounds or initialization')
+    validate_vamp_config(config)
     start = time.monotonic()
     groups_host = np.asarray(groups)
     t_host = np.asarray(theta, float)

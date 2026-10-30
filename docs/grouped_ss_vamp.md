@@ -1,7 +1,8 @@
 # Fixed-foreground grouped spike-and-slab EM-VAMP
 
 `grouped_ss_vamp.py` implements constrained SS EM-VAMP, shared by background
-inference and [support-alpha refinement](alpha_vamp.md). The background adapter
+inference. The [joint alpha/background model](joint_vamp.md) shares its numerical
+configuration and constrained M step. The background adapter
 fixes the current prediction alpha, gamma, REML components and noise.
 The sparse workflow consumes the kernel after its native fit and any alpha update.
 Native output metadata records the initialization, numerical attempts,
@@ -184,13 +185,9 @@ Both sparse CLI entry points accept `--background-ss` and
 LASSO/variance fit, the pipeline computes its native BLUP and calls
 `background_ss.refine_sparse_fit_background` with the in-memory final
 support, prediction alpha, native gamma, theta, training phenotype and component
-BLUP vectors. With `--alpha-vamp`, only the final combined fit runs two
-conditional alpha/background rounds. The first alpha fit holds native BLUP
-fixed; the second holds the first background SS mean fixed. Background SS
-uses the current alpha residual and the same native BLUP initialization in
-both rounds. The adapter reuses its streamed products and fixed trace
-quadrature through the preceding result's `context`; it does not carry EM
-parameters between fits. See [prior-Q alpha VAMP](alpha_vamp.md).
+BLUP vectors. This is the explicit `--background-ss` mode with native alpha
+fixed. `--alpha-vamp` selects a different [joint model](joint_vamp.md), rather
+than calling this adapter in alternating rounds.
 The adapter reuses native training-standardized operators in logical GRM
 order and calculates the residual itself. A scoped FP64 context preserves
 the surrounding pipeline precision setting.
@@ -280,7 +277,7 @@ case against its exact posterior with both zero and BLUP initializations;
 initial message inversion against independent SciPy roots; and rejection of
 invalid initial effect arrays. The native adapter checks all prior constraints
 and rejects unconverged results. Real-file end-to-end tests independently
-check that SS and alpha VAMP coefficients reproduce held-out prediction components
+check that refined coefficients reproduce held-out prediction components
 using training-only normalization, and verify the completed outputs and resume
 contract without supplying test phenotypes.
 `tests/test_ss_linear.py` independently checks positive-shift solves and

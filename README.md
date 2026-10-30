@@ -402,9 +402,9 @@ gpu-reml-sparse \
 
 A prediction genotype prefix enables prediction directly after the final refit.
 `--compute-effects` independently controls effect-table export and is optional
-for prediction. Add `--alpha-vamp` to update alpha directly after the final
-refit with a single prior-Q SS EM-VAMP model and two conditional alpha/background
-SS rounds. Alpha refinement has no validation-selected parameter.
+for prediction. Add `--alpha-vamp` to jointly update alpha and background
+after the final refit using a genome-wide sparse-variance prior. This prediction
+refinement has no validation-selected parameter.
 
 The combined phenotype and keep files are constructed automatically from the
 training and validation inputs. They may instead be supplied explicitly with
@@ -629,66 +629,43 @@ python -m pip wheel --no-deps --no-build-isolation \
 
 ## Current prediction refinement
 
-The adopted full prediction workflow is now available with
-`run_sparse_pipeline --alpha-vamp`: after the combined-sample LASSO/variance
-refit, attempt two conditional alpha/background SS rounds with a single alpha SS
-EM-VAMP model. The first alpha fit conditions on native conditional BLUP; the
-second conditions on the preceding background SS mean. Each background SS fit
-starts from the same native BLUP. Gamma, support and variance components stay
-fixed, and alpha's prior expected sparse variance is constrained to Q_s. Pi has no hyperprior;
-its EM count includes all SNPs, with outside-support indicators fixed zero.
-No alpha-specific validation selection or training-only SS is needed.
-If alpha VAMP fails to converge, the entire prediction update is discarded
-and the original weighted-LASSO alpha plus conditional BLUP is used. There is
-no EC fallback. The same restoration applies if background VAMP remains
-unconverged after its numerical retry. Native heritability estimates remain
-unchanged; metadata records the fallback and the time spent attempting refinement.
-See [prior-Q VAMP alpha](docs/alpha_vamp.md)
-for the model, command, inputs and outputs.
+`run_sparse_pipeline --alpha-vamp` jointly updates sparse alpha and background
+effects after the final combined-sample refit. The original support, covariate
+coefficients, heritability estimates and variance components remain fixed.
+The model has independent spike-and-slab generating priors for alpha and
+background, with one alpha inclusion probability and one background probability
+per GRM group. Its four-state posterior retains their dependence.
 
-Background SS refinement fixes the current prediction alpha and native
-covariate coefficients. Its training response is
-`r = y - X @ alpha_prediction - C @ gamma_lasso`: alpha is the VAMP update with
-`--alpha-vamp`, or native LASSO alpha with `--background-ss` alone.
-The original GRM
-variance components and original BLUP remain the reference.
+The alpha prior budget is genome-wide: `pi_a * slab_a * tr(X_all.T X_all)/n = Q_s`.
+The approximate alpha posterior is restricted to the original LASSO support;
+background effects can update throughout active groups. Consequently, the
+support-only alpha prior variance need not equal Q_s. This replaces both the
+prior scaling and the old two-round conditional update, while preserving native
+heritability estimation. See [joint EM-VAMP](docs/joint_vamp.md) for derivations,
+outputs, limits and the complete failure policy.
 
-The GPU background SS implementation is `grouped_ss_vamp.py`; its model,
-constrained EM update, sample-space VAMP solver, numerical checks and limits
-are described in [grouped SS EM-VAMP](docs/grouped_ss_vamp.md).
-This refinement shares the native streamed genotype operators with REML.
-PCG solves shifted sample-space systems, and fixed-probe Lanczos quadrature
-caches only small tridiagonal eigensystems for the VAMP Onsager trace.
-It constructs neither a full standardized genotype design nor an `n*n` sample
-Gram or `p*p` LD matrix. Additional workspaces scale linearly with sample and
-SNP counts for fixed probe batch width and Lanczos depth; the original packed
-host genotype cache remains part of the native streaming workflow.
-The two rounds reuse background genotype products and trace quadrature.
-The statistical model and background variance constraints are unchanged.
+The existing `--alpha-vamp` command enables this joint model.
+`--alpha-vamp-max-iterations` defaults to 10000 per attempt. A numerical retry
+uses stronger damping from the same original total effects. If neither attempt
+converges, the complete original alpha+BLUP predictor is restored; no partial
+update or EC result is accepted. Refinement uses the final refit's fitting
+phenotypes, including the former validation subset after merging; it adds no
+validation-based tuning and never uses held-out test phenotypes.
 
-Add `--background-ss` to the sparse pipeline command to run this refinement
-automatically after the final LASSO refit, or after alpha VAMP when
-`--alpha-vamp` is enabled. The pipeline supplies the final prediction
-alpha, gamma, native BLUP, GRM normalizers and variance components; the SS
-posterior means then feed the existing effect writer and prediction path.
-`--background-ss-max-iterations` defaults to 2000. With `--background-ss` alone,
-the high level `run_sparse_pipeline` command refines only the final combined
-sample fit. It adds no validation tuning step.
+Production inference uses streamed/packed genotype products, verified PCG and
+fixed-probe Lanczos trace quadrature. It builds neither a full FP64 genotype
+matrix nor a dense sample Gram or SNP LD matrix. Numerical controls remain
+`--background-ss-pcg-tol` (1e-9), `--background-ss-trace-probes` (32) and
+`--background-ss-lanczos-steps` (64). Ordinary REML planning is unchanged.
 
-Numerical settings are `--background-ss-pcg-tol` (default `1e-9`),
-`--background-ss-trace-probes` (32), and `--background-ss-lanczos-steps` (64).
-Metadata reports verified PCG residuals, Gauss/Radau quadrature gaps and trace
-sampling standard errors separately. Small cohorts use the complete trace
-probe population; larger cohorts use a stochastic trace approximation.
-Insufficient solves or quadrature accuracy raise an error. This removes the
-dense-memory bottleneck; actual biobank runtime still depends on the number
-of streamed genotype passes and numerical conditioning.
+The explicit `--background-ss` mode without `--alpha-vamp` keeps native LASSO
+alpha fixed and performs one background-only fit, as documented in
+[grouped SS EM-VAMP](docs/grouped_ss_vamp.md). Its iteration limit remains
+`--background-ss-max-iterations` (2000).
 
-On convergence, `<prefix>.background_ss.npz` and `.background_ss.json` retain
-the original BLUP initialization, posterior moments, group parameters and
-convergence metadata. On fallback, only the JSON record is written.
-`beta_background` in the effect table and the legacy prediction column
-`lasso_background_blup` contain the refined SS mean on convergence, or the
-original BLUP on fallback. Metadata identifies the accepted estimator as
-`constrained_ss_em_vamp` or `gaussian_multi_blup`, respectively. See the
-documentation for the reusable in-memory adapter and batched inference API.
+The existing alpha/background NPZ and JSON output names remain, with explicit
+joint-model metadata. Effect exports and predictions consume the accepted
+joint means, or the original pair on fallback. Joint runtime is recorded once;
+resume checks reject old conditional-model outputs when joint refinement is
+requested. Details of artifact contents and shared timing are in the model
+documentation.
