@@ -14,6 +14,7 @@ _EXPORTS: dict[str, str] = {
     "MatrixFreeSampleSolver": ".ss_linear",
     "SupportPrecisionSolver": ".ss_linear",
     "JointRefinement": ".joint_refinement",
+    "JointVAMPConfig": ".joint_vamp",
     "NativeJointRefinement": ".joint_refinement",
     "refine_joint": ".joint_refinement",
     "refine_native_fit": ".joint_refinement",

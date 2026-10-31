@@ -126,8 +126,22 @@ denoiser to reproduce the original alpha+BLUP total posterior mean.
 - Message/EM damping is 0.2/0.05. A failed attempt restarts from the original
   total effects with damping at most 0.1/0.025 and the same iteration budget.
 - All five undamped diagnostics must pass: message, module agreement,
-  precision, constrained EM map and probability change. Tolerances are 1e-5;
-  at least 30 iterations and five consecutive passing checks are required.
+  precision, constrained EM map and probability change. Message/module/precision
+  tolerance remains 1e-5; EM map/probability tolerance is 1e-3. At least 30
+  iterations and five consecutive passing checks are required. A temporary
+  prediction plateau alone is insufficient for stopping: the message check
+  protects against subsequent EM transitions. Background-only defaults are unchanged.
+- EM acceleration retains its previous resolution of 1e-5, independently of
+  the stopping tolerance. Loosening stopping must not suppress small EM
+  directions or alter the probability-update trajectory.
+- A separate training-prediction check requires a relative RMS change below
+  1e-3 across a five-iteration window, for five consecutive checks. At a
+  candidate stopping point the actual nonlinear posterior prediction is
+  computed and must also agree with the linear prediction to this tolerance.
+  This certificate concerns fitting genotypes, never held-out phenotypes;
+  it does not imply an identical test R-squared or exact SNP coefficients.
+- Joint PCG solves use a verified relative residual of 1e-7 by default.
+  `--background-ss-pcg-tol` can override it. Background-only mode retains 1e-9.
 - If both attempts fail, restore **both** original LASSO alpha and BLUP.
   There is no EC or partial-update fallback. Invalid inputs, allocation
   failures and I/O failures are not silently accepted as numerical fallback.
@@ -139,6 +153,28 @@ and trace setup are reused across a retry; component scoring is batched in
 at most eight groups. The sparse planner's memory budget applies without
 changing ordinary REML planning. Inference uses scoped FP64.
 
+Under a supplied GPU budget, joint products use up to 2 GiB per block,
+bounded by one eighth of that budget. The trace workspace targets all required
+probes within the same budget fraction. Batch width follows the available
+workspace and the per-probe memory estimate, with no fixed numerical cap.
+At 55,000 samples and a 20 GiB budget this fits all 32 default probes,
+instead of processing only three at a time. Probe count, seed and quadrature accuracy
+are unchanged. The product block and trace workspace are separately bounded;
+neither is a reservation of the entire available GPU memory.
+
+For the sample-space solve, with lambda = sigma_e^2 * kappa_2,
+$$
+(XX'+\lambda I)u=y-C\widehat\gamma-Xr_2,\qquad
+m_2=r_2+X'u,\qquad
+Xm_2=y-C\widehat\gamma-\lambda u.
+$$
+The last identity monitors the linear-module prediction without another
+genome scan each iteration. Its error is the independently checked PCG
+residual. Relative RMS changes divide by the larger standard deviation of
+the two predictions, with a numerical floor for zero/constant scores. The
+additional product at stopping verifies the nonlinear predictor actually
+returned. Logging frequency does not change these checks.
+
 `joint_vamp.py` contains the four-state denoiser and joint solver.
 `joint_refinement.py` validates inputs, handles retries and joins the native
 fit. The independent `--background-ss` mode remains available with alpha fixed.
@@ -147,7 +183,8 @@ fit. The independent `--background-ss` mode remains available with alpha fixed.
 
 The established `.alpha_vamp.npz/.json` and `.background_ss.npz/.json` names
 are retained. Metadata identifies `joint_global_budget_p`,
-`joint_refinement_schema=1` and `joint_inference=true`; it does not report two
+`joint_refinement_schema=2`, `numerical_policy=prediction_guarded_v2` and
+`joint_inference=true`; it does not report two
 conditional rounds. Native alpha, original BLUP, group/SNP order, fixed
 covariates and variance components remain available for audit. Background
 output also stores total posterior variance and alpha/background covariance
@@ -164,8 +201,9 @@ scoring. Do not add two copies of the shared duration.
 
 On fallback, both posterior NPZ files are removed and JSON records describe
 the failed joint attempts and restored original pair. The high-level resume
-validator rejects old conditional-model results and checks matching joint
-statuses, timing and output manifests. Use a new final-refit output/work
+validator rejects old conditional-model and earlier numerical-policy results
+and checks matching joint statuses, prediction certificates, timing and output
+manifests. Use a new final-refit output/work
 location when migrating an existing completed experiment; old scientific
 results are not automatically rewritten.
 

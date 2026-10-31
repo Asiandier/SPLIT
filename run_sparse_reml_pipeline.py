@@ -854,7 +854,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--background-ss', action='store_true',
                    help='Refine the final LASSO background with variance-constrained SS EM-VAMP, initialized from native BLUP.')
     p.add_argument('--background-ss-max-iterations', type=int, default=2000)
-    p.add_argument('--background-ss-pcg-tol', type=float, default=1e-9)
+    p.add_argument('--background-ss-pcg-tol', type=float, default=None,
+                   help='Refinement PCG tolerance: 1e-7 for joint VAMP, 1e-9 for background-only.')
     p.add_argument('--background-ss-trace-probes', type=int, default=32)
     p.add_argument('--background-ss-lanczos-steps', type=int, default=64)
     p.add_argument('--alpha-vamp', action='store_true',
@@ -1054,6 +1055,8 @@ def parse_args() -> argparse.Namespace:
         default=env("VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"},
     )
     args = p.parse_args()
+    if args.background_ss_pcg_tol is None:
+        args.background_ss_pcg_tol = 1e-7 if args.alpha_vamp else 1e-9
     # The Gram equations and the full-marker score both use PCG solutions.
     # Requiring a certificate far below that solve precision creates false
     # failures, so both KKT checks use one compatible numerical tolerance.
@@ -3127,25 +3130,32 @@ def _refine_joint_prediction(*, args, pkg_name, fitter, grm_index,
         theta_lasso_ml, q_chive, support, background_effects, out_prefix):
     """Publish a converged joint posterior, or the complete original pair."""
     joint = importlib.import_module(f'{pkg_name}.joint_refinement')
-    core = importlib.import_module(f'{pkg_name}.grouped_ss_vamp')
+    core = importlib.import_module(f'{pkg_name}.joint_vamp')
+    def progress(row):
+        logger.info('[joint VAMP attempt %s] iteration=%s, module_error=%s, EM_error=%s',
+                    row['attempt'], row['iteration'], row['module_error'], row['em_error'])
+        logger.info('[joint VAMP numerical] message=%.3e, precision=%.3e, '
+                    'prediction_change=%s, prediction_agreement=%s, PCG_iterations=%s',
+                    row['message_error'], row['precision_error'], row['prediction_change'],
+                    row['module_prediction_error'], row.get('pcg_iterations'))
     fitted = joint.refine_native_fit(
         fitter=fitter, grm_index=grm_index, y=y_np, covariates=covar_np,
         gamma=beta_cov_lasso, support=support, original_alpha=beta_lasso_active,
         theta=theta_lasso_ml, q_sparse=q_chive, background_effects=background_effects,
-        config=core.VAMPConfig(max_iterations=args.alpha_vamp_max_iterations,
-            linear_pcg_tolerance=args.background_ss_pcg_tol,
+        config=core.JointVAMPConfig(max_iterations=args.alpha_vamp_max_iterations,
+            linear_pcg_tolerance=(args.background_ss_pcg_tol
+                if args.background_ss_pcg_tol is not None else 1e-7),
             trace_probes=args.background_ss_trace_probes,
             trace_lanczos_steps=args.background_ss_lanczos_steps),
-        callback=lambda row: logger.info(
-            '[joint VAMP attempt %s] iteration=%s, module_error=%s, EM_error=%s',
-            row['attempt'], row['iteration'], row['module_error'], row['em_error']))
+        callback=progress)
     fit = fitted.fit
     fallback = fit.status == 'fallback_native'
     status = 'fallback_native' if fallback else 'converged'
     elapsed = fitted.metadata['total_refinement_seconds']
     fit_seconds = sum(row['seconds'] for row in fit.attempts)
     common = dict(requested=True, status=status, mode='final_refit',
-        model='joint_global_budget_p', joint_refinement_schema=1, joint_inference=True,
+        model='joint_global_budget_p', joint_refinement_schema=2, joint_inference=True,
+        numerical_policy='prediction_guarded_v2',
         failure_policy='native_alpha_blup_on_nonconvergence', native_restored=fallback,
         variance_components_fixed=True, noise_fixed=True, gamma_fixed=True,
         support_fixed=True, validation_used=False,
@@ -3169,6 +3179,9 @@ def _refine_joint_prediction(*, args, pkg_name, fitter, grm_index,
         'linear_solver': fit.attempts[-1].get('linear_solver') if fit.attempts else None,
         'sample_gram_materialized': False,
         'packed_device_cache_bytes': fitted.metadata['packed_device_cache_bytes'],
+        'product_block_bytes': fitted.metadata['product_block_bytes'],
+        'trace_workspace_bytes': fitted.metadata['trace_workspace_bytes'],
+        'prediction_certificate': fit.attempts[-1].get('prediction_certificate') if fit.attempts else None,
         'training_mse': float(np.mean((np.asarray(y_np)-fitted.training_prediction)**2)),
         'inference_estimates_source': 'native covariance-aligned LASSO; prediction refinement is separate'})
     background_summary = dict(common,
@@ -3211,7 +3224,7 @@ def _refine_joint_prediction(*, args, pkg_name, fitter, grm_index,
             gamma_fixed=beta_cov_lasso, theta_fixed=theta_lasso_ml, Q_s=max(float(q_chive), 0.),
             trace_normalizer=fitted.metadata['global_trace_normalizer'],
             support_trace_normalizer=fitted.metadata['support_trace_normalizer'],
-            joint_inference=True, joint_refinement_schema=1)
+            joint_inference=True, joint_refinement_schema=2)
         np.savez(out_prefix+'.background_ss.npz',
             beta_background=fit.background,
             beta_initial_blup=np.concatenate([np.asarray(x) for x in background_effects.snp_effects]),
@@ -3224,7 +3237,7 @@ def _refine_joint_prediction(*, args, pkg_name, fitter, grm_index,
             theta=theta_lasso_ml, normalizers=fitted.metadata['grm_normalizers'],
             conditioning_support=support, conditioning_alpha=fit.alpha,
             training_residual=np.asarray(y_np)-nuisance-alpha_score,
-            training_background_score=bg_score, joint_inference=True, joint_refinement_schema=1,
+            training_background_score=bg_score, joint_inference=True, joint_refinement_schema=2,
             source_snp_indices=grm_index.source_variant_indices(np.arange(p)))
         logger.info('[joint VAMP] %s; iterations=%s, fit %.2fs, total %.2fs',
                     fit.status, alpha_summary['iterations'], fit_seconds, elapsed)

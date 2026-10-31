@@ -122,7 +122,7 @@ class MatrixFreeSampleSolver:
     def __init__(self, products, active, *, pcg_tolerance=1e-9,
                  pcg_max_iterations=400, probes=32, lanczos_steps=64,
                  workspace_bytes=256*1024**2, seed=20261011,
-                 exact_probe_limit=128, trace_tolerance=1e-6):
+                 exact_probe_limit=128, trace_tolerance=1e-6, max_probe_batch=8):
         if not jax.config.jax_enable_x64:
             raise RuntimeError('Enable jax_enable_x64 before matrix-free SS setup')
         active = np.asarray(active, bool)
@@ -135,6 +135,9 @@ class MatrixFreeSampleSolver:
                             ('exact_probe_limit', exact_probe_limit)]:
             if not isinstance(value, (int, np.integer)) or value < 1:
                 raise ValueError(f'{name} must be a positive integer')
+        if max_probe_batch is not None and (
+                not isinstance(max_probe_batch, (int, np.integer)) or max_probe_batch < 1):
+            raise ValueError('max_probe_batch must be None or a positive integer')
         if not 0 < pcg_tolerance < 1 or not 0 < trace_tolerance < 1:
             raise ValueError('Invalid matrix-free numerical tolerances')
         self.matvec = products.gram_operator(active)
@@ -146,6 +149,7 @@ class MatrixFreeSampleSolver:
         self.pcg_tolerance = pcg_tolerance
         self.pcg_max_iterations = pcg_max_iterations
         self.trace_tolerance = trace_tolerance
+        self.max_probe_batch = max_probe_batch
         self._warm = None
         self.last_diagnostics = {}
         self.solve_calls = self.total_pcg_iterations = 0
@@ -196,7 +200,9 @@ class MatrixFreeSampleSolver:
         # A minimal one-probe budget still works, using Jacobi alone.
         coarse_rank_limit = min(8, (workspace_bytes-per_probe)//(24*self.n))
         coarse_workspace = 24*self.n*coarse_rank_limit
-        width = min(count, 8, max(1, (workspace_bytes-coarse_workspace)//per_probe))
+        width = min(count, max(1, (workspace_bytes-coarse_workspace)//per_probe))
+        if self.max_probe_batch is not None:
+            width = min(width, self.max_probe_batch)
         rng = np.random.default_rng(seed)
         columns = rng.choice(population, size=count, replace=False).astype(np.uint64)
         signs = rng.choice(np.array([-1., 1.]), size=self.n)

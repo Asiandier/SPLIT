@@ -9,12 +9,44 @@ Only training data enter inference. See docs/joint_vamp.md for derivations.
 from __future__ import annotations
 
 import time
+from collections import deque
+from dataclasses import dataclass
 import numpy as np
 import jax
 import jax.numpy as jnp
 
 from .grouped_ss_vamp import VAMPConfig, constrained_ss_m_step, validate_vamp_config
 from .ss_linear import SupportPrecisionSolver
+
+
+@dataclass(frozen=True)
+class JointVAMPConfig(VAMPConfig):
+    """Prediction-refinement accuracy; background-only/REML defaults are separate."""
+
+    max_iterations: int = 10000
+    # Retain message consistency: a temporarily flat predictor can precede a
+    # later EM transition. Loosen only the hyperparameter stopping check.
+    tolerance: float = 1e-5
+    em_tolerance: float = 1e-3
+    linear_pcg_tolerance: float = 1e-7
+    prediction_tolerance: float = 1e-3
+    # Preserve the strict solver's acceleration decisions when loosening
+    # stopping tolerances. A stopping rule must not disable weak EM updates.
+    em_acceleration_resolution: float = 1e-5
+
+
+@jax.jit
+def _prediction_difference(current, previous, response_norm):
+    """RMSE difference relative to predicted-score SD, with a zero-score floor."""
+    norm = jnp.maximum(
+        jnp.linalg.norm(current - jnp.mean(current, axis=0)),
+        jnp.linalg.norm(previous - jnp.mean(previous, axis=0)),
+    )
+    floor = jnp.maximum(
+        jnp.sqrt(jnp.finfo(current.dtype).eps) * response_norm,
+        jnp.finfo(current.dtype).tiny,
+    )
+    return jnp.linalg.norm(current - previous) / jnp.maximum(norm, floor)
 
 
 @jax.jit
@@ -103,7 +135,8 @@ def invert_mean(target, precision, pi_a, var_a, pi_b, var_b):
 
 
 def _make_em_update(em_map, evidence_at, config, active):
-    resolution = max(config.em_acceleration_floor, config.em_tolerance)
+    resolution = max(config.em_acceleration_floor,
+                     getattr(config, "em_acceleration_resolution", config.em_tolerance))
 
     @jax.jit
     def update(r, gam, prob):
@@ -189,8 +222,16 @@ def fit_joint(
     """
     if not jax.config.jax_enable_x64:
         raise RuntimeError("FP64 required")
-    cfg = config or VAMPConfig(max_iterations=10000)
+    cfg = config or JointVAMPConfig()
     validate_vamp_config(cfg)
+    prediction_tolerance = getattr(cfg, "prediction_tolerance", None)
+    if prediction_tolerance is not None and (
+        not np.isfinite(prediction_tolerance) or prediction_tolerance <= 0
+    ):
+        raise ValueError("Prediction tolerance must be finite and positive")
+    acceleration_resolution = getattr(cfg, "em_acceleration_resolution", cfg.em_tolerance)
+    if not np.isfinite(acceleration_resolution) or acceleration_resolution <= 0:
+        raise ValueError("EM acceleration resolution must be finite and positive")
     start = time.monotonic()
     p = products.p
     groups = np.asarray(groups)
@@ -374,6 +415,10 @@ def fit_joint(
     trace = []
     stable = 0
     converged = False
+    prediction_history = deque(maxlen=cfg.consecutive_converged + 1)
+    response_norm = jnp.linalg.norm(y)
+    prediction_certificate = None
+    prediction_checks = 0
     for iteration in range(1, cfg.max_iterations + 1):
         old = prob
         if cfg.learn_pi and iteration > cfg.em_warmup:
@@ -389,6 +434,8 @@ def fit_joint(
             m2, newprecision, newr = solver.natural_module(
                 eta[None, :] * mean - precision[None, :] * r, eta - precision
             )
+            if prediction_tolerance is not None:
+                linear_score = linear_products.forward(m2)
         else:
             if div_host >= 1:
                 raise ArithmeticError("Joint divergence >=1 in sample-space solver")
@@ -403,6 +450,11 @@ def fit_joint(
             m2 = r2 + correction
             newprecision = gamma2 * fraction / (1 - fraction)
             newr = r2 + correction / fraction[None, :]
+            if prediction_tolerance is not None:
+                # From (XX' + shift I)u = y-Xr2: Xm2 = y-shift*u,
+                # up to the independently verified PCG residual. No extra
+                # genome scan is needed to monitor the linear predictions.
+                linear_score = y - (gamma2 * noise_j)[None, :] * solved
         errors = np.asarray(
             jnp.stack(
                 [
@@ -428,8 +480,42 @@ def fit_joint(
         good = max(errors[:3]) < cfg.tolerance and not guard
         if cfg.learn_pi:
             good = good and max(errors[3:]) < cfg.em_tolerance
+        prediction_error = None
+        module_prediction_error = None
+        if prediction_tolerance is not None:
+            prediction_history.append(linear_score)
+            if len(prediction_history) == prediction_history.maxlen:
+                prediction_error = float(_prediction_difference(
+                    linear_score, prediction_history[0], response_norm
+                ))
+                if not np.isfinite(prediction_error):
+                    raise ArithmeticError("Nonfinite training prediction change")
+            good = good and prediction_error is not None and prediction_error < prediction_tolerance
         stable = stable + 1 if eligible and good else 0
         converged = stable >= cfg.consecutive_converged
+        if converged and prediction_tolerance is not None:
+            # Certify the predictor actually returned by the nonlinear
+            # module, not just the cheaper linear-module proxy. Only candidate
+            # stopping points incur this extra genotype product.
+            score = linear_products.forward(mean)
+            module_prediction_error = float(_prediction_difference(
+                score, linear_score, response_norm
+            ))
+            prediction_checks += 1
+            if not np.isfinite(module_prediction_error):
+                raise ArithmeticError("Nonfinite training prediction agreement")
+            converged = module_prediction_error < prediction_tolerance
+            if converged:
+                prediction_certificate = dict(
+                    scope="fitting_genotypes_only", tolerance=prediction_tolerance,
+                    window_iterations=cfg.consecutive_converged,
+                    window_relative_rmse=prediction_error,
+                    module_relative_rmse=module_prediction_error,
+                    normalization="predicted_score_standard_deviation",
+                    nonlinear_predictor_checked=True,
+                )
+            else:
+                stable = 0
         if not converged:
             nextprecision = (1 - cfg.damping) * precision + cfg.damping * newprecision
             r = (
@@ -458,7 +544,11 @@ def fit_joint(
                 divergence=div_host,
                 precision_guarded=guard,
                 converged=converged,
+                prediction_change=prediction_error,
+                module_prediction_error=module_prediction_error,
             )
+            if not natural:
+                row.update(getattr(solver, "last_diagnostics", {}))
             trace.append(row)
             if callback:
                 callback(row)
@@ -487,4 +577,6 @@ def fit_joint(
         background_variance_budgets=theta,
         prior_expected_variance=np.asarray(prob) * slab * np.asarray(norms),
         precision=np.asarray(precision),
+        prediction_certificate=prediction_certificate,
+        prediction_verification_products=prediction_checks,
     )

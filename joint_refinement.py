@@ -5,6 +5,7 @@ Products and the Gaussian solver are supplied by the calling pipeline.
 """
 
 from dataclasses import asdict, dataclass, replace
+import logging
 import time
 import numpy as np
 import jax
@@ -16,6 +17,28 @@ from .sparse_planner import sparse_packed_device_cache_budget
 
 from .grouped_ss_vamp import VAMPConfig, validate_vamp_config
 from .joint_vamp import fit_joint
+
+logger = logging.getLogger(__name__)
+
+
+def joint_workspace(n, config, budget):
+    """Bounded workspace for joint prediction; never changes REML planning."""
+    if budget is None:
+        return 512 * 1024**2, config.trace_workspace_bytes
+    if n < 1 or int(budget) < 1:
+        raise ValueError("Joint workspace needs positive sample count and GPU budget")
+    cap = max(1, int(budget) // 8)
+    block_bytes = min(2 * 1024**3, cap)
+    depth = min(config.trace_lanczos_steps, n)
+    per_probe = 8 * (n * (2 * depth + 32) + 8 * (depth + 1) ** 2)
+    population = 1 << (int(n) - 1).bit_length()
+    probes = (population if population <= config.trace_exact_probe_limit
+              else min(population, config.trace_probes))
+    # Match the trace solver's retained coarse-basis reservation. Request a
+    # useful batch when it fits; a smaller budget keeps the solver's bounded
+    # batching/error policy. Probe count and quadrature accuracy are unchanged.
+    desired = probes * per_probe + 24 * n * 8
+    return block_bytes, min(max(config.trace_workspace_bytes, desired), cap)
 
 
 @dataclass
@@ -376,15 +399,8 @@ def refine_native_fit(
     # Match native sparse-path memory planning; these are workspace limits,
     # not model parameters or a change to ordinary REML planning.
     budget = getattr(getattr(fitter, "cfg", None), "gpu_budget_bytes", None)
-    block_bytes = 512 * 1024**2
-    if budget is not None:
-        block_bytes = min(block_bytes, max(1, int(budget) // 16))
-        depth = min(config.trace_lanczos_steps, n)
-        minimum = 8 * (n * (2 * depth + 32) + 8 * (depth + 1) ** 2)
-        workspace = min(
-            max(config.trace_workspace_bytes, minimum), max(1, int(budget) // 8)
-        )
-        config = replace(config, trace_workspace_bytes=workspace)
+    block_bytes, workspace = joint_workspace(n, config, budget)
+    config = replace(config, trace_workspace_bytes=workspace)
     cache_bytes = getattr(
         getattr(fitter, "cfg", None), "packed_device_cache_bytes", None
     )
@@ -402,10 +418,15 @@ def refine_native_fit(
             block_bytes=block_bytes,
             device_cache_bytes=cache_bytes,
         )
+        logger.info('[joint VAMP setup] n=%s, SNPs=%s, packed cache=%.3f GiB, '
+                    'product block=%s SNPs, trace workspace=%.1f MiB',
+                    n, p, products.device_cache_bytes / 2**30,
+                    products.chunk_size, workspace / 2**20)
         global_trace = training_trace(products)
         support_trace = training_trace(products, support_mask)
         solver = None
         if np.any(active):
+            logger.info('[joint VAMP setup] building reusable trace quadrature')
             solver = MatrixFreeSampleSolver(
                 products,
                 active,
@@ -417,7 +438,12 @@ def refine_native_fit(
                 seed=config.trace_seed,
                 exact_probe_limit=config.trace_exact_probe_limit,
                 trace_tolerance=config.trace_tolerance,
+                max_probe_batch=None,
             )
+            diagnostics = solver.diagnostics()
+            logger.info('[joint VAMP setup] trace ready in %.2fs; batch=%s, depth=%s',
+                        diagnostics['setup_seconds'], diagnostics['trace_batch_width'],
+                        diagnostics['lanczos_steps'])
         nuisance = covariates @ gamma
         fitted = refine_joint(
             products=products,
@@ -478,5 +504,7 @@ def refine_native_fit(
         blup_pcg_metadata_describes_initial_fit=True,
         sample_gram_materialized=False,
         joint_summary=fitted.summary,
+        product_block_bytes=block_bytes,
+        trace_workspace_bytes=workspace,
     )
     return NativeJointRefinement(fitted, updated, prediction, metadata)

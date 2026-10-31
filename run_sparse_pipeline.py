@@ -569,7 +569,8 @@ def _validate_summary(
         background = summary.get('background_ss', {})
         for component in (refinement, background):
             if (expected_method != 'fixed_lam_ratio'
-                    or component.get('joint_refinement_schema') != 1
+                    or component.get('joint_refinement_schema') != 2
+                    or component.get('numerical_policy') != 'prediction_guarded_v2'
                     or component.get('model') != 'joint_global_budget_p'
                     or component.get('joint_inference') is not True
                     or component.get('mode') != 'final_refit'
@@ -611,6 +612,19 @@ def _validate_summary(
             if not refinement.get('zero_variance_model') and (
                     not attempts or attempts[-1].get('status') != 'converged'):
                 raise ValueError('Joint posterior lacks a converged numerical attempt')
+            if not refinement.get('zero_variance_model'):
+                certificate = refinement.get('prediction_certificate') or {}
+                tolerance = certificate.get('tolerance', 0.)
+                prediction_errors = [certificate.get(key) for key in (
+                    'window_relative_rmse', 'module_relative_rmse')]
+                if (certificate.get('scope') != 'fitting_genotypes_only'
+                        or certificate.get('nonlinear_predictor_checked') is not True
+                        or not isinstance(tolerance, (int, float))
+                        or not math.isfinite(tolerance) or tolerance <= 0
+                        or any(not isinstance(error, (int, float))
+                               or not math.isfinite(error) or not 0 <= error < tolerance
+                               for error in prediction_errors)):
+                    raise ValueError('Joint posterior lacks a valid training-prediction certificate')
             required.extend(str(prefix)+suffix for suffix in ('.alpha_vamp.npz', '.background_ss.npz'))
         required.extend(str(prefix)+suffix for suffix in ('.alpha_vamp.json', '.background_ss.json'))
     validate_output_manifest(summary.get("output_artifacts"), required_paths=required)
@@ -1056,7 +1070,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--background-ss', action='store_true',
                         help='Apply BLUP-initialized constrained SS after the final combined-sample LASSO refit.')
     parser.add_argument('--background-ss-max-iterations', type=int, default=2000)
-    parser.add_argument('--background-ss-pcg-tol', type=float, default=1e-9)
+    parser.add_argument('--background-ss-pcg-tol', type=float, default=None,
+                        help='Refinement PCG tolerance: 1e-7 for joint VAMP, 1e-9 for background-only.')
     parser.add_argument('--background-ss-trace-probes', type=int, default=32)
     parser.add_argument('--background-ss-lanczos-steps', type=int, default=64)
     parser.add_argument('--alpha-vamp', action='store_true',
@@ -1114,6 +1129,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
+    if args.background_ss_pcg_tol is None:
+        args.background_ss_pcg_tol = 1e-7 if args.alpha_vamp else 1e-9
     if bool(args.fit_pheno_txt) != bool(args.fit_keep_path):
         parser.error("--fit-pheno-txt and --fit-keep-path must be supplied together.")
     if args.mode == "adaptive" and args.component_spec:
@@ -1297,7 +1314,9 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
             'background_ss_numerics': dict(pcg_tolerance=args.background_ss_pcg_tol,
                 trace_probes=args.background_ss_trace_probes, lanczos_steps=args.background_ss_lanczos_steps)}
            if args.background_ss else {}),
-        **({'alpha_vamp': dict(method='joint_global_budget_p', joint_refinement_schema=1,
+        **({'alpha_vamp': dict(method='joint_global_budget_p', joint_refinement_schema=2,
+              numerical_policy='prediction_guarded_v2',
+              tolerance=1e-5, em_tolerance=1e-3, prediction_tolerance=1e-3,
               failure_policy='native_alpha_blup_on_nonconvergence',
               max_iterations=int(args.alpha_vamp_max_iterations), hyperpriors=None,
               pi_counts='all SNPs; outside-support alpha posterior indicators fixed zero',
