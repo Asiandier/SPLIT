@@ -6,33 +6,97 @@ subtract tr{Z (Z' P_C Z)^-1 Z'}/n from the calibrated sparse quadratic.
 """
 from __future__ import annotations
 
+import logging
+import math
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 import scipy.linalg as sla
 
 from .pcg import pcg_solve
 
+logger = logging.getLogger(__name__)
+
+
+def _solve_information_block(hv, rhs, precond, *, tol, maxiter, warm):
+    """Use FP32 PCG, with FP64 residual correction below its accuracy floor.
+
+    Every correction solves H delta = b-Hx for the SAME H. The total PCG
+    iteration budget and the final requested residual tolerance are unchanged.
+    Ordinary REML and its PCG implementation do not use this helper.
+    """
+    block = jnp.asarray(rhs, dtype=jnp.float32)
+    initial = None if warm is None else jnp.asarray(warm, dtype=jnp.float32)
+    inner_tol = max(float(tol), math.sqrt(float(tol)))
+    tight = tol < math.sqrt(np.finfo(np.float32).eps)
+    solution, relative, iterations = pcg_solve(
+        hv, block, M=precond, tol=inner_tol if tight else tol,
+        maxiter=maxiter, X0=initial,
+    )
+    used = int(iterations)
+    if not tight or float(relative) <= tol:
+        return np.asarray(solution), float(relative), used
+    # In a well-conditioned system, tightening by the same log factor should
+    # take about the same number of steps. Keep that cheap FP32 fast path;
+    # avoid spending the entire budget repeatedly chasing a rounding floor.
+    polish_budget = min(maxiter-used, max(1, used))
+    if polish_budget:
+        solution, relative, count = pcg_solve(
+            hv, block, M=precond, tol=tol, maxiter=polish_budget, X0=solution,
+        )
+        used += int(count)
+        if float(relative) <= tol:
+            return np.asarray(solution), float(relative), used
+    with jax.experimental.enable_x64():
+        target = jnp.asarray(rhs, dtype=jnp.float64)
+        value = jnp.asarray(solution, dtype=jnp.float64)
+        scale = jnp.linalg.norm(target, axis=0)
+        scale = jnp.where(scale > 0, scale, 1.)
+        previous = math.inf
+        corrections = 0
+        while True:
+            residual = target-hv(value)
+            actual = float(jax.device_get(jnp.max(
+                jnp.linalg.norm(residual, axis=0)/scale
+            )))
+            if not math.isfinite(actual):
+                raise FloatingPointError("Non-finite FP64 information residual.")
+            if actual <= tol or used >= maxiter or actual >= previous:
+                logger.info(
+                    "[information PCG] FP64 residual correction: columns=%s "
+                    "corrections=%s iterations=%s/%s true_residual=%.3e tol=%.3e",
+                    rhs.shape[1], corrections, used, maxiter, actual, tol,
+                )
+                return np.asarray(value), actual, used
+            previous = actual
+            correction, _, count = pcg_solve(
+                hv, residual.astype(jnp.float32), M=precond,
+                tol=inner_tol, maxiter=maxiter-used,
+            )
+            used += int(count)
+            if not count:
+                return np.asarray(value), actual, used
+            value = value+correction.astype(jnp.float64)
+            corrections += 1
+
 
 def solve_columns(hv, rhs, precond, *, tol, maxiter, batch_size=128, warm=None):
     """Bound streamed operator temporaries and check the true solve residual."""
-    rhs = np.asarray(rhs, dtype=np.float32)
+    rhs = np.asarray(rhs)
     if rhs.ndim != 2 or batch_size < 1:
         raise ValueError("Information solves require matrix RHS and positive batch size.")
-    result = np.empty_like(rhs)
+    result = np.empty(rhs.shape, dtype=np.float64)
     for start in range(0, rhs.shape[1], batch_size):
         end = min(start + batch_size, rhs.shape[1])
-        block = jnp.asarray(rhs[:, start:end])
-        initial = None if warm is None else jnp.asarray(warm[:, start:end])
-        solution, relative, iterations = pcg_solve(
-            hv, block, M=precond, tol=tol, maxiter=maxiter, X0=initial,
+        solution, actual, iterations = _solve_information_block(
+            hv, rhs[:, start:end], precond, tol=tol, maxiter=maxiter,
+            warm=None if warm is None else warm[:, start:end],
         )
-        # pcg_solve returns the verified B-HX residual, including warm hits.
-        # Reapplying H here repeats a full genotype pass for every RHS batch.
-        actual = float(relative)
         if not np.isfinite(actual) or actual > tol * 1.05:
             raise FloatingPointError(
                 f"Sparse information PCG failed: true residual={actual:.3e}, "
-                f"reported={float(relative):.3e}, tolerance={tol:.3e}, "
+                f"tolerance={tol:.3e}, "
                 f"iterations={int(iterations)}/{maxiter}."
             )
         result[:, start:end] = np.asarray(solution)
