@@ -5,13 +5,14 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+from contextlib import nullcontext
 from typing import Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .pcg import pcg_solve
+from .sparse_information import solve_sparse_pcg as pcg_solve
 from .reml_model import (
     EffectEstimates,
     _copy_training_standardization_to_test_streamer,
@@ -380,7 +381,8 @@ def _predict_sparse_path(
         )
         if not np.isfinite(float(np.asarray(jax.device_get(reported)))):
             raise RuntimeError("Sparse path background-BLUP PCG returned a non-finite residual.")
-        dual = dual.at[:, solve_columns].set(refined)
+        with jax.experimental.enable_x64():
+            dual = dual.astype(refined.dtype).at[:, solve_columns].set(refined)
         iters = int(np.asarray(jax.device_get(iterations)))
     relative = _path_true_relative_residual(hv, dual, rhs) if solve_columns.size else relative
     rel = float(np.max(relative))
@@ -479,11 +481,14 @@ def _predict_sparse_path(
 
 
 def _path_true_relative_residual(hv, dual, rhs) -> np.ndarray:
-    error = hv(dual) - rhs
-    relative = jnp.linalg.norm(error, axis=0) / jnp.maximum(
-        jnp.linalg.norm(rhs, axis=0), jnp.finfo(rhs.dtype).tiny
-    )
-    values = np.asarray(jax.device_get(relative), dtype=np.float64)
+    scope = (jax.experimental.enable_x64()
+             if dual.dtype == jnp.float64 else nullcontext())
+    with scope:
+        error = hv(dual) - rhs
+        relative = jnp.linalg.norm(error, axis=0) / jnp.maximum(
+            jnp.linalg.norm(rhs, axis=0), jnp.finfo(rhs.dtype).tiny
+        )
+        values = np.asarray(jax.device_get(relative), dtype=np.float64)
     if not np.all(np.isfinite(values)):
         raise RuntimeError("Non-finite true residual in sparse path prediction.")
     return values

@@ -675,7 +675,19 @@ def _compute_score_traces(
     return jnp.concatenate([trace_genetic, trace_residual], axis=0)
 
 
-def _eval_once(
+def _eval_once(ctx, *args, **kwargs):
+    """Keep accurate sparse solves and their projections in the same scope.
+
+    A float64 solution must not be rounded back to float32 before covariate
+    projection or AI construction. Ordinary REML retains its original path.
+    """
+    if ctx.mean_information is None:
+        return _eval_once_impl(ctx, *args, **kwargs)
+    with jax.experimental.enable_x64():
+        return _eval_once_impl(ctx, *args, **kwargs)
+
+
+def _eval_once_impl(
     ctx: REMLContext,
     pvec: Array,
     warm_all: Array,
@@ -704,6 +716,11 @@ def _eval_once(
     """
     theta_g = pvec[:ctx.G]
     theta_e = pvec[ctx.G:]
+    if ctx.mean_information is None:
+        solve_pcg = pcg_solve
+    else:
+        from .sparse_information import solve_sparse_pcg
+        solve_pcg = solve_sparse_pcg
 
     def Hv(V: Array) -> Array:
         if ctx.weighted_hv is not None:
@@ -756,7 +773,7 @@ def _eval_once(
         X0_all = jnp.zeros_like(rhs_all)
 
     # ---- PCG: Python while loop, Hv per iteration in Python scope ----------
-    sol_all, main_rel_res, k_pcg = pcg_solve(
+    sol_all, main_rel_res, k_pcg = solve_pcg(
         Hv, rhs_all, M=M_cur, tol=minq_tol, maxiter=maxiter, X0=X0_all,
     )
     del X0_all
@@ -902,7 +919,7 @@ def _eval_once(
     else:
         X0_ai = jnp.zeros_like(GPy_cols)
     ai_t0 = time.perf_counter()
-    HinvGPy, ai_rel_res, k_ai = pcg_solve(
+    HinvGPy, ai_rel_res, k_ai = solve_pcg(
         Hv, GPy_cols, M=M_cur, tol=minq_tol, maxiter=maxiter, X0=X0_ai,
     )
     del X0_ai

@@ -59,7 +59,6 @@ logger = logging.getLogger(__name__)
 _inf_mod = importlib.import_module(f"{pkg_name}.reml_model")
 _data_mod = importlib.import_module(f"{pkg_name}.data_utils")
 _lasso_mod = importlib.import_module(f"{pkg_name}.lasso_cd")
-_pcg_mod = importlib.import_module(f"{pkg_name}.pcg")
 _information_mod = importlib.import_module(f"{pkg_name}.sparse_information")
 _core_mod = importlib.import_module(f"{pkg_name}.sparse_core")
 _common_mod = importlib.import_module(f"{pkg_name}.pipeline_common")
@@ -86,7 +85,7 @@ LassoPathConfig = _lasso_mod.LassoPathConfig
 make_lambda_sequence = _lasso_mod.make_lambda_sequence
 compute_projected_hinv_vector = _lasso_mod.compute_projected_hinv_vector
 fit_weighted_lasso_with_covariates = _lasso_mod.fit_weighted_lasso_with_covariates
-pcg_solve = _pcg_mod.pcg_solve
+pcg_solve = _information_mod.solve_sparse_pcg
 SparseMeanInformation = _information_mod.SparseMeanInformation
 MultiGRMIndex = _core_mod.MultiGRMIndex
 _validate_component_partition = _core_mod.validate_component_partition
@@ -766,7 +765,7 @@ def _emit_lasso_prediction(
             **request_metadata,
             "branch_outputs_emitted": True,
             "emitted_branches": ["lasso"],
-            "branches": branch_metadata,
+            "branches": _json_safe_value(branch_metadata),
         },
     )
     return {
@@ -1265,7 +1264,10 @@ def _solve_hinv_columns_batched(
             "total_batch_iterations": 0,
         }
 
-    solution_np = np.empty_like(rhs_np)
+    solution_np = np.empty(
+        rhs_np.shape,
+        dtype=(np.float64 if tol < np.sqrt(np.finfo(np.float32).eps) else np.float32),
+    )
     max_reported = 0.0
     max_true = 0.0
     max_iterations = 0
@@ -1298,7 +1300,7 @@ def _solve_hinv_columns_batched(
         # for a converged warm start. Reuse it instead of streaming H twice.
         true_residual = reported
         solution_np[:, start:stop] = np.asarray(
-            jax.device_get(solution), dtype=np.float32
+            jax.device_get(solution), dtype=solution_np.dtype
         )
         max_reported = max(max_reported, float(reported))
         max_true = max(max_true, float(true_residual))
@@ -3688,6 +3690,7 @@ def main() -> None:
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter,
             slq_samples=args.slq_samples, slq_m=args.slq_m,
             slq_quadrature_tol=args.slq_quadrature_tol,
+            slq_workspace_bytes=_sparse_planner_mod.sparse_slq_workspace_bytes(gpu_budget_bytes),
             precond_rank=plan.precond_rank,
             reml_pcg_tol=args.pcg_tol,
             effect_pcg_tol=args.pcg_tol,
@@ -3712,6 +3715,7 @@ def main() -> None:
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter,
             slq_samples=args.slq_samples, slq_m=args.slq_m,
             slq_quadrature_tol=args.slq_quadrature_tol,
+            slq_workspace_bytes=_sparse_planner_mod.sparse_slq_workspace_bytes(gpu_budget_bytes),
             precond_rank=plan.precond_rank,
             reml_pcg_tol=args.pcg_tol,
             effect_pcg_tol=args.pcg_tol,

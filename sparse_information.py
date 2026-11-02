@@ -19,39 +19,46 @@ from .pcg import pcg_solve
 logger = logging.getLogger(__name__)
 
 
-def _solve_information_block(hv, rhs, precond, *, tol, maxiter, warm):
+def solve_sparse_pcg(hv, rhs, M=None, tol=1e-2, maxiter=200, X0=None,
+                     check_every=2):
     """Use FP32 PCG, with FP64 residual correction below its accuracy floor.
 
     Every correction solves H delta = b-Hx for the SAME H. The total PCG
     iteration budget and the final requested residual tolerance are unchanged.
     Ordinary REML and its PCG implementation do not use this helper.
     """
-    block = jnp.asarray(rhs, dtype=jnp.float32)
-    initial = None if warm is None else jnp.asarray(warm, dtype=jnp.float32)
     inner_tol = max(float(tol), math.sqrt(float(tol)))
     tight = tol < math.sqrt(np.finfo(np.float32).eps)
-    solution, relative, iterations = pcg_solve(
-        hv, block, M=precond, tol=inner_tol if tight else tol,
-        maxiter=maxiter, X0=initial,
-    )
-    used = int(iterations)
-    if not tight or float(relative) <= tol:
-        return np.asarray(solution), float(relative), used
-    # In a well-conditioned system, tightening by the same log factor should
-    # take about the same number of steps. Keep that cheap FP32 fast path;
-    # avoid spending the entire budget repeatedly chasing a rounding floor.
-    polish_budget = min(maxiter-used, max(1, used))
-    if polish_budget:
-        solution, relative, count = pcg_solve(
-            hv, block, M=precond, tol=tol, maxiter=polish_budget, X0=solution,
+    if tight and getattr(X0, "dtype", None) == np.float64:
+        # Accepted REML states already carry a precise solution. Do not round
+        # away that work before checking an unchanged or nearby covariance.
+        solution, used = X0, 0
+    else:
+        block = jnp.asarray(rhs, dtype=jnp.float32)
+        initial = None if X0 is None else jnp.asarray(X0, dtype=jnp.float32)
+        solution, relative, iterations = pcg_solve(
+            hv, block, M=M, tol=inner_tol if tight else tol,
+            maxiter=maxiter, X0=initial, check_every=check_every,
         )
-        used += int(count)
-        if float(relative) <= tol:
-            return np.asarray(solution), float(relative), used
+        used = int(iterations)
+        if not tight or float(relative) <= tol:
+            return solution, float(relative), used
+        # Give ordinary FP32 convergence a cheap chance before residual
+        # correction, rather than exhausting the budget at a rounding floor.
+        polish_budget = min(maxiter-used, max(1, used))
+        if polish_budget:
+            solution, relative, count = pcg_solve(
+                hv, block, M=M, tol=tol, maxiter=polish_budget, X0=solution,
+                check_every=check_every,
+            )
+            used += int(count)
+            if float(relative) <= tol:
+                return solution, float(relative), used
     with jax.experimental.enable_x64():
         target = jnp.asarray(rhs, dtype=jnp.float64)
         value = jnp.asarray(solution, dtype=jnp.float64)
         scale = jnp.linalg.norm(target, axis=0)
+        value = jnp.where(scale > 0, value, 0.)
         scale = jnp.where(scale > 0, scale, 1.)
         previous = math.inf
         corrections = 0
@@ -68,15 +75,15 @@ def _solve_information_block(hv, rhs, precond, *, tol, maxiter, warm):
                     "corrections=%s iterations=%s/%s true_residual=%.3e tol=%.3e",
                     rhs.shape[1], corrections, used, maxiter, actual, tol,
                 )
-                return np.asarray(value), actual, used
+                return value, actual, used
             previous = actual
             correction, _, count = pcg_solve(
-                hv, residual.astype(jnp.float32), M=precond,
-                tol=inner_tol, maxiter=maxiter-used,
+                hv, residual.astype(jnp.float32), M=M,
+                tol=inner_tol, maxiter=maxiter-used, check_every=check_every,
             )
             used += int(count)
             if not count:
-                return np.asarray(value), actual, used
+                return value, actual, used
             value = value+correction.astype(jnp.float64)
             corrections += 1
 
@@ -89,9 +96,9 @@ def solve_columns(hv, rhs, precond, *, tol, maxiter, batch_size=128, warm=None):
     result = np.empty(rhs.shape, dtype=np.float64)
     for start in range(0, rhs.shape[1], batch_size):
         end = min(start + batch_size, rhs.shape[1])
-        solution, actual, iterations = _solve_information_block(
-            hv, rhs[:, start:end], precond, tol=tol, maxiter=maxiter,
-            warm=None if warm is None else warm[:, start:end],
+        solution, actual, iterations = solve_sparse_pcg(
+            hv, rhs[:, start:end], M=precond, tol=tol, maxiter=maxiter,
+            X0=None if warm is None else warm[:, start:end],
         )
         if not np.isfinite(actual) or actual > tol * 1.05:
             raise FloatingPointError(

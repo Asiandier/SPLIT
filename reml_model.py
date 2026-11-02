@@ -68,6 +68,7 @@ class FitConfig:
     slq_samples: int = 4
     slq_m: int = 8
     slq_quadrature_tol: float = 1e-6
+    slq_workspace_bytes: int | None = None
     slq_mode: str = "projected_core_residual"
     precond_rank: int = 500
     pcg_ridge: float = 1e-6
@@ -1916,7 +1917,11 @@ class InfinitesimalREMLFitter:
                 slq_samples=self.cfg.slq_samples,
                 slq_m=self.cfg.slq_m,
                 slq_mode=self.cfg.slq_mode,
-                slq_workspace_bytes=default_workspace_bytes(self.cfg.gpu_budget_bytes),
+                slq_workspace_bytes=(
+                    default_workspace_bytes(self.cfg.gpu_budget_bytes)
+                    if self.cfg.slq_workspace_bytes is None
+                    else int(self.cfg.slq_workspace_bytes)
+                ),
                 slq_quadrature_tolerance=self.cfg.slq_quadrature_tol,
                 precond_conf=self.precond_conf,
                 slq_precond_conf=self.precond_conf,
