@@ -76,6 +76,7 @@ _sparse_prediction_mod = importlib.import_module(
 _sparsity_selection_mod = importlib.import_module(
     f"{pkg_name}.sparsity_selection"
 )
+_h2_se_mod = importlib.import_module(f"{pkg_name}.sparse_heritability_se")
 
 InfinitesimalREMLFitter = _inf_mod.InfinitesimalREMLFitter
 FitConfig = _inf_mod.FitConfig
@@ -784,6 +785,7 @@ def _emit_lasso_prediction(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run sparse REML + LASSO pipeline on real genotype data.")
+    _h2_se_mod.add_h2_se_arguments(p)
     # Exactly one genotype source must be supplied. It may be partitioned into
     # disjoint GRM components by --component-spec.
     p.add_argument("--bed-prefix", default=env("BED_PREFIX", ""),
@@ -3353,6 +3355,7 @@ def _refine_prediction_with_fallback(*, args, pkg_name, fitter, grm_index,
 
 def main() -> None:
     args = parse_args()
+    _h2_se_mod.validate_h2_se_arguments(args)
     if not np.isfinite(args.slq_quadrature_tol) or args.slq_quadrature_tol < 0:
         raise SystemExit('--slq-quadrature-tol must be finite and nonnegative.')
     if args.alpha_vamp:
@@ -5556,6 +5559,25 @@ def main() -> None:
         "information_corrected_sparse_reml" if lasso_branch_valid else "unavailable"
     )
 
+    # Capture uncertainty before prediction refinement, using the native Lasso
+    # endpoint and the same sample/kernel standardization as the h2 estimate.
+    h2_uncertainty = _h2_se_mod.pipeline_h2_se(
+        args=args, fitter=fitter, grm_index=grm_index, valid=lasso_branch_valid,
+        theta=theta_lasso_ml, y=y_np, z=Z_support, covar=covar_np,
+        alpha=beta_lasso_active,
+        ratio=float(final_lasso['selected_lam_ratio']) if final_lasso is not None else 0.,
+        lam=float(final_lasso['lam']) if final_lasso is not None else 0.,
+        q=q_chive, atoms=genetic_trace_atoms, h2=h2,
+        mean_information=final_information, outer_converged=lasso_ml_outer_converged)
+    h2_se_path = out_prefix + '.h2_se.json'
+    if args.h2_se:
+        atomic_json(h2_se_path, _json_safe_value(h2_uncertainty))
+        logger.log(logging.INFO if h2_uncertainty['status'] == 'available' else logging.WARNING,
+                   '[h2 SE] status=%s SE=%s reason=%s', h2_uncertainty['status'],
+                   h2_uncertainty.get('se_recommended'), h2_uncertainty.get('reason'))
+    else:
+        cleanup_path(h2_se_path)
+
     lasso_warm_state_out_summary = None
     if args.lasso_warm_state_out:
         if (
@@ -5861,6 +5883,9 @@ def main() -> None:
         ],
         "estimator_mode": output_contract["estimator_mode"],
         "computed_estimators": output_contract["computed_estimators"],
+        "h2_se": h2_uncertainty.get("se_recommended"),
+        "h2_se_status": h2_uncertainty["status"],
+        "heritability_uncertainty": h2_uncertainty,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
         "elapsed_sec": float(time.time() - t0),
         "n_samples": int(y_np.shape[0]),
@@ -6082,6 +6107,8 @@ def main() -> None:
     # Summary is the completion marker: publish it only after every requested
     # artifact is closed, including selected SNPs and reusable sparse state.
     artifacts = [out_prefix + ".history.json", out_prefix + ".selected_snps.tsv"]
+    if args.h2_se:
+        artifacts.append(h2_se_path)
     if args.lasso_warm_state_out:
         artifacts.append(args.lasso_warm_state_out)
     artifacts.extend(sparse_effect_summary.get("paths", {}).values())

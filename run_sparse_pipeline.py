@@ -44,6 +44,7 @@ from .io_utils import (
     IncompleteOutputError, atomic_json, read_json, validate_output_manifest,
 )
 from .component_spec import load_component_specs
+from .sparse_heritability_se import add_h2_se_arguments, validate_h2_se_arguments
 from .ld_score import (
     compute_ld_scores_with_plink2,
     load_aligned_ld_scores,
@@ -448,6 +449,9 @@ def _low_level_command(
                               ('lanczos-steps', getattr(args, 'background_ss_lanczos_steps', 64))]:
             command.extend([f'--background-ss-{option}', str(value)])
     if final_outputs:
+        command.append('--h2-se' if args.h2_se else '--no-h2-se')
+        for option in ['trace-probes', 'moment-probes', 'seed', 'pcg-tol', 'batch-size']:
+            command.extend([f'--h2-se-{option}', str(getattr(args, 'h2_se_'+option.replace('-', '_')))])
         if args.compute_effects:
             command.append("--compute-effects")
         if args.prediction_prefix is not None:
@@ -466,6 +470,9 @@ def _low_level_command(
                 command.extend(
                     ["--prediction-keep-path", str(args.prediction_keep_path)]
                 )
+    if not final_outputs:
+        # Validation/adaptive model selection does not need repeated SE work.
+        command.append('--no-h2-se')
     if args.verbose:
         command.append("--verbose")
     return command
@@ -1025,6 +1032,7 @@ def _run_final_refit(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_h2_se_arguments(parser)
     parser.add_argument("--mode", choices=("fixed", "adaptive"), default="fixed")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--bed-prefix", default="")
@@ -1211,6 +1219,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("PCG tolerance must be positive and ridge nonnegative.")
     if args.alpha_vamp:
         args.background_ss = True
+    try:
+        validate_h2_se_arguments(args)
+    except ValueError as error:
+        parser.error(str(error))
     return args
 
 
@@ -1312,6 +1324,9 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
             }
         ),
         "compute_effects": bool(args.compute_effects),
+        "heritability_uncertainty": {name: getattr(args, name) for name in
+            ['h2_se', 'h2_se_trace_probes', 'h2_se_moment_probes', 'h2_se_seed',
+             'h2_se_pcg_tol', 'h2_se_batch_size']},
         **({'background_ss': True,
             'refinement_failure_policy': 'native_alpha_blup_on_nonconvergence',
             'background_ss_max_iterations': int(args.background_ss_max_iterations),
@@ -1441,6 +1456,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "selection": selection_result,
             "final_refit": {
                 **_stage_snapshot(final),
+                "h2_se": final.get("h2_se"),
+                "h2_se_status": final.get("h2_se_status"),
+                "heritability_uncertainty": final.get("heritability_uncertainty"),
                 "fit_samples": int(final["n_samples"]),
                 "lambda_ratio_frozen": True,
                 "component_spec": (

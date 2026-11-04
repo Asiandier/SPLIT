@@ -228,6 +228,13 @@ Sparse-run output semantics are deliberately explicit:
   multiplied by a GRM trace atom.
 - `h2_chive_guarded` is the validated counterpart of `h2_chive`
   and equals the top-level `h2` field whenever the COHERIT branch is valid.
+- Final sparse fits also emit `h2_se` and `h2_se_status`, with complete local
+  uncertainty diagnostics in `heritability_uncertainty` and `<prefix>.h2_se.json`.
+  This is a fixed-support, fixed-boundary observed-derivative sandwich
+  approximation, including joint sparse/background variance uncertainty.
+  It uses native matrix-free operators without refitting models; the production
+  runner computes it only after the final combined-sample fit. `--no-h2-se`
+  disables it. See [SE derivation and controls](docs/sparse_h2_se.md).
 - `q_chive_components` retains the squared fitted-mean and residual-correction terms,
   and `term3_mean_uncertainty_subtracted`, which is subtracted from their sum
   to form the COHERIT sparse
