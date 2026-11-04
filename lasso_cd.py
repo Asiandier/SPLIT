@@ -24,15 +24,58 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 
 import numpy as np
 import scipy.linalg as sla
-from numba import njit
+from numba import njit, prange
 
 logger = logging.getLogger(__name__)
 
 from .pipeline_common import solve_spd
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _copy_design_float64(source, target):
+    """Convert independent contiguous slices using the configured CPU pool."""
+    if target.strides[0] == target.itemsize:
+        for column in prange(source.shape[1]):
+            for row in range(source.shape[0]):
+                target[row, column] = source[row, column]
+    else:
+        for row in prange(source.shape[0]):
+            for column in range(source.shape[1]):
+                target[row, column] = source[row, column]
+
+
+def _float64_design(value):
+    """Preserve NumPy conversion/layout while avoiding serial multi-GiB copies."""
+    source = np.asarray(value)
+    # For small arrays, launching parallel workers costs more than conversion.
+    # This threshold only selects a copy kernel, never a numerical algorithm.
+    if source.dtype != np.float32 or source.ndim != 2 or source.size < 1024**2:
+        return np.asarray(source, dtype=np.float64)
+    target = np.empty_like(source, dtype=np.float64, order="K")
+    _copy_design_float64(source, target)
+    return target
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def _copy_design_columns(source, columns, target):
+    for column in prange(columns.size):
+        original = columns[column]
+        for row in range(source.shape[0]):
+            target[row, column] = source[row, original]
+
+
+def _design_columns(source, columns):
+    """The same column gather as NumPy, parallelized only for large copies."""
+    if source.shape[0] * columns.size < 1024**2:
+        return source[:, columns]
+    target = np.empty((source.shape[0], columns.size), dtype=source.dtype, order="F")
+    _copy_design_columns(source, columns, target)
+    return target
 
 
 @dataclass
@@ -822,6 +865,45 @@ def compute_projected_hinv_vector(
     return t - HC @ coef
 
 
+class WeightedGramCache:
+    """Reuse Gram entries within one immutable sample/design/covariance scope.
+
+    Construct a new cache when H or standardization changes. Only the previous
+    candidate set is retained, so storage is bounded by the current problem.
+    Both cross blocks are evaluated: independently converged H^-1 columns are
+    not exactly symmetric, and copying one transpose would change the old Q.
+    """
+
+    def __init__(self):
+        self.ids = np.empty(0, dtype=np.int64)
+        self.gram = np.empty((0, 0), dtype=np.float64)
+        self.reused_columns = 0
+
+    def update(self, ids, z, hz):
+        ids = np.asarray(ids, dtype=np.int64)
+        if (ids.ndim != 1 or len(ids) != z.shape[1]
+                or np.unique(ids).size != ids.size):
+            raise ValueError("Gram cache requires unique, aligned marker IDs.")
+        _, old_pos, retained = np.intersect1d(
+            self.ids, ids, assume_unique=True, return_indices=True,
+        )
+        fresh = np.setdiff1d(np.arange(len(ids)), retained, assume_unique=True)
+        self.reused_columns = int(retained.size)
+        if not retained.size:
+            gram = z.T @ hz
+        elif np.array_equal(self.ids, ids):
+            return self.gram
+        else:
+            gram = np.empty((len(ids), len(ids)), dtype=np.float64)
+            gram[np.ix_(retained, retained)] = self.gram[np.ix_(old_pos, old_pos)]
+            if fresh.size:
+                gram[fresh, :] = _design_columns(z, fresh).T @ hz
+                gram[np.ix_(retained, fresh)] = _design_columns(z, retained).T @ _design_columns(hz, fresh)
+        self.ids = ids.copy()
+        self.gram = gram
+        return gram
+
+
 def fit_weighted_lasso_with_covariates(
     y: np.ndarray,
     covar: np.ndarray | None,
@@ -834,6 +916,8 @@ def fit_weighted_lasso_with_covariates(
     beta_snp_path0: np.ndarray | None = None,
     lambda_sequence: np.ndarray | None = None,
     lambda_max_reference: float | None = None,
+    gram_cache: WeightedGramCache | None = None,
+    marker_ids: np.ndarray | None = None,
 ) -> dict:
     """
     Weighted sparse fitting with unpenalized covariates and penalized SNP effects.
@@ -846,10 +930,11 @@ def fit_weighted_lasso_with_covariates(
         lambda_sequence: Optional explicit decreasing absolute lambda block.
         lambda_max_reference: Global lambda-max defining explicit-block ratios.
     """
+    gram_started = time.perf_counter()
     y = np.asarray(y, dtype=np.float64).reshape(-1)
-    Z = np.asarray(geno, dtype=np.float64)
+    Z = _float64_design(geno)
     Hy = np.asarray(Hinv_y, dtype=np.float64).reshape(-1)
-    HZ = np.asarray(Hinv_geno, dtype=np.float64)
+    HZ = _float64_design(Hinv_geno)
 
     if Z.ndim != 2:
         raise ValueError("geno must be a 2D matrix.")
@@ -866,7 +951,12 @@ def fit_weighted_lasso_with_covariates(
     yHy = float(y @ Hy)
     profile_yHy = yHy
     gZy = Z.T @ Hy
-    GZZ = Z.T @ HZ
+    if gram_cache is None:
+        GZZ = Z.T @ HZ
+    else:
+        if marker_ids is None:
+            raise ValueError("Cached weighted Lasso requires aligned marker IDs.")
+        GZZ = gram_cache.update(marker_ids, Z, HZ)
     GCC = None
     GCZ = None
     gCy = None
@@ -909,6 +999,8 @@ def fit_weighted_lasso_with_covariates(
         if np.any(need):
             Q[np.diag_indices(k)] += (1e-8 - d) * need
 
+    gram_seconds = time.perf_counter() - gram_started
+    cd_started = time.perf_counter()
     lasso = solve_lasso_path(
         Q=Q,
         q=q,
@@ -918,6 +1010,7 @@ def fit_weighted_lasso_with_covariates(
         lambda_sequence=lambda_sequence,
         lambda_max_reference=lambda_max_reference,
     )
+    cd_seconds = time.perf_counter() - cd_started
 
     beta_snp_path = np.asarray(lasso["beta_path"], dtype=np.float64)
 
@@ -937,6 +1030,9 @@ def fit_weighted_lasso_with_covariates(
         )
 
     result = {
+        "gram_seconds": gram_seconds,
+        "cd_seconds": cd_seconds,
+        "gram_reused_columns": 0 if gram_cache is None else gram_cache.reused_columns,
         "path": lasso["path"],
         "beta_snp_path": beta_snp_path,
         "beta_cov_path": beta_cov_path,
@@ -971,6 +1067,7 @@ def fit_weighted_lasso_with_covariates(
 
 
 __all__ = [
+    "WeightedGramCache",
     "LassoPathConfig",
     "make_lambda_sequence",
     "solve_lasso_cd_gram",

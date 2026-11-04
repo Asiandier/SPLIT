@@ -59,10 +59,13 @@ logger = logging.getLogger(__name__)
 _inf_mod = importlib.import_module(f"{pkg_name}.reml_model")
 _data_mod = importlib.import_module(f"{pkg_name}.data_utils")
 _lasso_mod = importlib.import_module(f"{pkg_name}.lasso_cd")
+_residual_lasso_mod = importlib.import_module(f"{pkg_name}.lasso_residual")
 _information_mod = importlib.import_module(f"{pkg_name}.sparse_information")
+_sparse_reml_mod = importlib.import_module(f"{pkg_name}.sparse_reml")
 _core_mod = importlib.import_module(f"{pkg_name}.sparse_core")
 _common_mod = importlib.import_module(f"{pkg_name}.pipeline_common")
 _sparse_planner_mod = importlib.import_module(f"{pkg_name}.sparse_planner")
+_sparse_fp64_mod = importlib.import_module(f"{pkg_name}.sparse_fp64")
 _io_utils_mod = importlib.import_module(f"{pkg_name}.io_utils")
 _component_spec_mod = importlib.import_module(f"{pkg_name}.component_spec")
 _effect_io_mod = importlib.import_module(f"{pkg_name}.effect_io")
@@ -82,6 +85,8 @@ load_pheno_covar_aligned_with_transform = (
 )
 load_covar_aligned = _data_mod.load_covar_aligned
 LassoPathConfig = _lasso_mod.LassoPathConfig
+WeightedGramCache = _lasso_mod.WeightedGramCache
+CandidateDesignCache = _core_mod.CandidateDesignCache
 make_lambda_sequence = _lasso_mod.make_lambda_sequence
 compute_projected_hinv_vector = _lasso_mod.compute_projected_hinv_vector
 fit_weighted_lasso_with_covariates = _lasso_mod.fit_weighted_lasso_with_covariates
@@ -937,6 +942,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--lasso-lam-min-ratio", type=float, default=0.05)
     p.add_argument("--lasso-n-lambda", type=int, default=60)
+    p.add_argument("--lasso-path-solver", choices=("basil", "residual"), default="basil",
+        help="Validation-path numerical solver; grid, penalty and selection rules are unchanged.")
     p.add_argument(
         "--lasso-fixed-lam-ratio",
         type=float,
@@ -1189,13 +1196,18 @@ def _fit_covariate_contrast_residual_reml(
             )
         if not np.all(np.isfinite(nuisance_design)):
             raise ValueError("Covariate design contains non-finite values.")
-    return fitter.fit_infinitesimal(
-        jnp.asarray(residual, dtype=jnp.float32),
-        jnp.asarray(nuisance_design, dtype=jnp.float32),
-        h2_init=float(h2_init),
-        var_components_init=jnp.asarray(theta, dtype=jnp.float32),
-        **({"mean_information": mean_information} if mean_information is not None else {}),
-    )
+    try:
+        return fitter.fit_infinitesimal(
+            jnp.asarray(residual, dtype=jnp.float32),
+            jnp.asarray(nuisance_design, dtype=jnp.float32),
+            h2_init=float(h2_init),
+            var_components_init=jnp.asarray(theta, dtype=jnp.float32),
+            **({"mean_information": mean_information} if mean_information is not None else {}),
+        )
+    finally:
+        release = getattr(mean_information, "release_likelihood_cache", None)
+        if release is not None:
+            release()
 
 
 def _require_pcg_converged(
@@ -1267,6 +1279,7 @@ def _solve_hinv_columns_batched(
     solution_np = np.empty(
         rhs_np.shape,
         dtype=(np.float64 if tol < np.sqrt(np.finfo(np.float32).eps) else np.float32),
+        order="F",  # cached solutions are subsequently assembled by column
     )
     max_reported = 0.0
     max_true = 0.0
@@ -1275,6 +1288,8 @@ def _solve_hinv_columns_batched(
     n_batches = 0
     for start in range(0, n_columns, batch):
         stop = min(start + batch, n_columns)
+        batch_started = time.perf_counter()
+        logger.info("[candidate solve] %s columns=%s:%s start", stage, start, stop)
         rhs_batch = jnp.asarray(rhs_np[:, start:stop], dtype=jnp.float32)
         warm_batch = (
             jnp.asarray(warm_np[:, start:stop], dtype=jnp.float32)
@@ -1307,6 +1322,9 @@ def _solve_hinv_columns_batched(
         max_iterations = max(max_iterations, int(iterations))
         total_iterations += int(iterations)
         n_batches += 1
+        logger.info("[candidate solve] %s columns=%s:%s iterations=%s residual=%.3e time=%.2fs",
+                    stage, start, stop, int(iterations), reported,
+                    time.perf_counter()-batch_started)
 
     return solution_np, {
         "batch_size": batch,
@@ -2243,6 +2261,9 @@ def _fit_complete_weighted_lasso_path_basil(
     basil_trace: list[dict[str, object]] = []
     total_path_seconds = 0.0
     total_kkt_seconds = 0.0
+    # H and the sample/design scope stay fixed throughout this BASIL rollout.
+    gram_cache = WeightedGramCache()
+    design_cache = CandidateDesignCache(grm_index.extract_standardized_columns, np.asarray(y).size)
     total_validation_warm_rows = 0
     any_external_path_warm_start = False
     aggregate_pcg = {
@@ -2344,9 +2365,9 @@ def _fit_complete_weighted_lasso_path_basil(
                 f"({candidate.size} > {max_candidate})."
             )
 
-        Z_candidate = grm_index.extract_standardized_columns(candidate).astype(
-            np.float32, copy=False
-        )
+        extract_started = time.perf_counter()
+        Z_candidate = design_cache.extract(candidate)
+        extract_seconds = time.perf_counter() - extract_started
         missing_positions = np.asarray(
             [
                 column
@@ -2372,7 +2393,7 @@ def _fit_complete_weighted_lasso_path_basil(
             missing_rhs = np.ascontiguousarray(
                 Z_candidate[:, missing_positions], dtype=np.float32
             )
-            missing_warm = np.zeros_like(missing_rhs)
+            missing_warm = np.zeros_like(missing_rhs, order="F")
             warm_hits = 0
             for column, marker in enumerate(missing_markers.tolist()):
                 previous_solution = previous_hinv_z.get(int(marker))
@@ -2402,9 +2423,11 @@ def _fit_complete_weighted_lasso_path_basil(
             for column, marker in enumerate(missing_markers.tolist()):
                 outer_hinv_z[int(marker)] = solved_missing[:, column]
 
-        Hinv_Z_candidate = np.empty_like(Z_candidate, dtype=np.float32)
+        assemble_started = time.perf_counter()
+        Hinv_Z_candidate = np.empty_like(Z_candidate, dtype=np.float32, order="F")
         for column, marker in enumerate(candidate.tolist()):
             Hinv_Z_candidate[:, column] = outer_hinv_z[int(marker)]
+        assemble_seconds = time.perf_counter() - assemble_started
 
         for key in ("n_batches", "n_columns", "total_batch_iterations"):
             aggregate_pcg[key] += int(pcg_diagnostic[key])
@@ -2487,11 +2510,24 @@ def _fit_complete_weighted_lasso_path_basil(
             beta_snp_path0=beta_path0,
             lambda_sequence=lam_sequence[fit_indices],
             lambda_max_reference=lam_max,
+            gram_cache=gram_cache,
+            marker_ids=candidate,
         )
         path_seconds = float(time.perf_counter() - path_started)
         total_path_seconds += path_seconds
         sparse_path_performance["lasso_path_solves"] += 1
         sparse_path_performance["lasso_path_solve_seconds"] += path_seconds
+        for label in ("gram_seconds", "cd_seconds"):
+            key = "lasso_" + label
+            sparse_path_performance[key] = sparse_path_performance.get(key, 0.) + block_fit[label]
+        logger.info(
+            "[outer %s BASIL %s timing] gram=%.2fs cd=%.2fs cached_gram_columns=%s "
+            "new_hinv_columns=%s candidate_hinv_total=%.2fs extract=%.2fs assemble=%.2fs",
+            outer, basil_iteration, block_fit["gram_seconds"], block_fit["cd_seconds"],
+            block_fit["gram_reused_columns"], missing_positions.size,
+            sparse_path_performance.get("candidate_hinv_pcg_seconds", 0.),
+            extract_seconds, assemble_seconds,
+        )
         sparse_path_performance["lasso_cd_iterations"] += int(
             sum(int(row["cd_iter"]) for row in block_fit["path"])
         )
@@ -2805,10 +2841,8 @@ def _fit_complete_weighted_lasso_path_basil(
             solution_covariates[path_index], dtype=np.float64
         )
 
-    Z_final = grm_index.extract_standardized_columns(final_candidate).astype(
-        np.float32, copy=False
-    )
-    Hinv_Z_final = np.empty_like(Z_final, dtype=np.float32)
+    Z_final = design_cache.extract(final_candidate)
+    Hinv_Z_final = np.empty_like(Z_final, dtype=np.float32, order="F")
     for column, marker in enumerate(final_candidate.tolist()):
         if int(marker) not in outer_hinv_z:
             raise RuntimeError("BASIL final Hinv[Z] cache is incomplete.")
@@ -3642,6 +3676,8 @@ def main() -> None:
         ),
         arbitrary_component_partition=bool(component_variant_indices),
         requested_call_width=(args.call_width if args.call_width > 0 else None),
+        rhs_batch_size=int(args.candidate_pcg_rhs_batch_size),
+        device=args.device,
     )
     call_width = plan.call_width
     gpu_budget_bytes = (
@@ -3734,6 +3770,12 @@ def main() -> None:
 
     logger.info("[INFO] build fitter @ %s", datetime.now().isoformat(timespec='seconds'))
     fitter = InfinitesimalREMLFitter(fit_cfg)
+    _sparse_fp64_mod.configure(
+        fitter.streamers, _sparse_planner_mod.sparse_fp64_workspace_bytes(
+            gpu_budget_bytes, plan=plan, n_samples=y_np.shape[0],
+            rhs_batch_size=int(args.candidate_pcg_rhs_batch_size),
+        ),
+    )
     close_fitter = fitter.close
     atexit.register(close_fitter)
     ops = fitter._assemble_reml_operators()
@@ -4010,7 +4052,11 @@ def main() -> None:
         "tolerance": float("nan"),
         "max_active_error": float("inf"),
         "max_inactive_excess": float("inf"),
-        "decision_precision": "ordinary_pcg",
+        "decision_precision": (
+            "verified_residual_pcg"
+            if iterative_validation_selection and args.lasso_path_solver == "residual"
+            else "ordinary_pcg"
+        ),
         "method": (
             "weighted_basil_complete_path_global_kkt"
             if iterative_validation_selection
@@ -4193,35 +4239,53 @@ def main() -> None:
                         training_score_path=training_score_path,
                     )
 
-                basil_result = _fit_complete_weighted_lasso_path_basil(
-                    args=args,
-                    grm_index=grm_index,
-                    hv=hv,
-                    precond=precond,
-                    y=y_np,
-                    covar=covar_np,
-                    hinv_y=Hinv_y_for_path,
-                    hinv_covar=Hinv_covar_for_path,
-                    initial_score_abs=np.asarray(score, dtype=np.float64),
-                    path_cfg=path_cfg,
-                    previous_candidate=warm_lasso_candidate,
-                    previous_beta_path=warm_lasso_beta_path,
-                    previous_hinv_z=warm_z_dict,
-                    outer=outer,
-                    sparse_path_performance=sparse_path_performance,
-                    validation_evaluator=evaluate_basil_validation_block,
-                    validation_stopping_lag=int(
-                        args.validation_early_stopping_lag
-                    ),
-                )
+                if args.lasso_path_solver == "residual":
+                    basil_result = _residual_lasso_mod.fit_weighted_residual_path(
+                        fitter=fitter, grm_index=grm_index, hv=hv, precond=precond,
+                        theta=theta, y=y_np, covar=covar_np,
+                        lam_max=float(np.max(score)), path_cfg=path_cfg,
+                        pcg_tol=float(args.pcg_tol), max_pcg_iters=int(args.max_pcg_iters),
+                        pcg_ridge=float(args.pcg_ridge),
+                        marker_batch=int(args.basil_marker_batch_size),
+                        max_iterations=int(args.basil_max_iterations),
+                        workspace_bytes=int(getattr(fitter.streamers[0], "_sparse_fp64_workspace_bytes", 0)),
+                        validation_evaluator=evaluate_basil_validation_block,
+                        stopping_rule=lambda values: _validation_path_early_stopping_decision(
+                            values, stopping_lag=int(args.validation_early_stopping_lag)),
+                    )
+                    residual_performance = basil_result["lasso_path"]["basil"]["performance"]
+                    sparse_path_performance["residual_lasso"] = residual_performance
+                    sparse_path_performance["lasso_path_solve_seconds"] += (
+                        residual_performance["total_seconds"]-residual_performance["validation_seconds"])
+                else:
+                    basil_result = _fit_complete_weighted_lasso_path_basil(
+                        args=args,
+                        grm_index=grm_index,
+                        hv=hv,
+                        precond=precond,
+                        y=y_np,
+                        covar=covar_np,
+                        hinv_y=Hinv_y_for_path,
+                        hinv_covar=Hinv_covar_for_path,
+                        initial_score_abs=np.asarray(score, dtype=np.float64),
+                        path_cfg=path_cfg,
+                        previous_candidate=warm_lasso_candidate,
+                        previous_beta_path=warm_lasso_beta_path,
+                        previous_hinv_z=warm_z_dict,
+                        outer=outer,
+                        sparse_path_performance=sparse_path_performance,
+                        validation_evaluator=evaluate_basil_validation_block,
+                        validation_stopping_lag=int(
+                            args.validation_early_stopping_lag
+                        ),
+                    )
                 lasso_path = basil_result["lasso_path"]
                 candidate = np.asarray(
                     basil_result["candidate"], dtype=np.int64
                 )
                 Z_cand = np.asarray(basil_result["geno"], dtype=np.float32)
-                sol_z_np = np.asarray(
-                    basil_result["hinv_geno"], dtype=np.float32
-                )
+                sol_z_np = (None if basil_result["hinv_geno"] is None else
+                    np.asarray(basil_result["hinv_geno"], dtype=np.float32))
                 warm_z_dict = dict(basil_result["hinv_z_dict"])
                 kkt_trace = list(basil_result["kkt_trace"])
                 candidate_pcg = dict(basil_result["candidate_pcg"])
@@ -4281,8 +4345,8 @@ def main() -> None:
                             0.0,
                         )
                     ),
-                    "method": "weighted_basil_complete_path_global_kkt",
-                    "decision_precision": "ordinary_pcg",
+                    "method": str(lasso["basil"]["algorithm"]),
+                    "decision_precision": ("verified_residual_pcg" if args.lasso_path_solver == "residual" else "ordinary_pcg"),
                     "pcg_tol": float(args.pcg_tol),
                     "candidate_path_kkt_passed": bool(
                         best_path["kkt_passed"]
@@ -4307,7 +4371,7 @@ def main() -> None:
                         else "outer_update"
                     ),
                     "final_alignment": bool(final_alignment),
-                    "path_solver": "weighted_basil",
+                    "path_solver": str(lasso["basil"]["algorithm"]),
                     "candidate_size": int(candidate.size),
                     "lasso_path_warm_start_used": bool(
                         lasso[
@@ -4363,13 +4427,15 @@ def main() -> None:
         else:
             max_kkt_rounds = int(args.kkt_max_rounds)
 
+        fixed_ratio_gram_cache = WeightedGramCache()
+        fixed_ratio_design_cache = CandidateDesignCache(
+            grm_index.extract_standardized_columns, y_np.size,
+        )
         for kkt_round in range(1, max_kkt_rounds + 1):
             path_pcg_tol = float(args.pcg_tol)
             # Extract the current design, but solve Hinv[Z] only for columns
             # not already certified under this outer iteration's covariance.
-            Z_cand = grm_index.extract_standardized_columns(candidate).astype(
-                np.float32, copy=False
-            )
+            Z_cand = fixed_ratio_design_cache.extract(candidate)
             missing_positions = np.asarray(
                 [
                     column
@@ -4397,7 +4463,7 @@ def main() -> None:
                     missing_rhs = np.ascontiguousarray(
                         Z_cand[:, missing_positions], dtype=np.float32
                     )
-                    missing_warm = np.zeros_like(missing_rhs)
+                    missing_warm = np.zeros_like(missing_rhs, order="F")
                     warm_hits = 0
                     for column, marker in enumerate(
                         missing_markers.tolist()
@@ -4441,7 +4507,7 @@ def main() -> None:
                         outer_hinv_z_dict[int(marker)] = solved_missing[
                             :, column
                         ]
-                sol_z_np = np.empty_like(Z_cand, dtype=np.float32)
+                sol_z_np = np.empty_like(Z_cand, dtype=np.float32, order="F")
                 for column, marker in enumerate(candidate.tolist()):
                     sol_z_np[:, column] = outer_hinv_z_dict[int(marker)]
                 res_all = np.asarray(
@@ -4525,6 +4591,8 @@ def main() -> None:
                         cfg=path_cfg,
                         ridge=args.lasso_ridge,
                         beta_snp_path0=beta_snp_path0,
+                        gram_cache=fixed_ratio_gram_cache,
+                        marker_ids=candidate,
                     )
                 except ValueError as warm_error:
                     # A zero-score path has one row regardless of the
@@ -4546,6 +4614,8 @@ def main() -> None:
                         Hinv_geno=sol_z_np,
                         cfg=path_cfg,
                         ridge=args.lasso_ridge,
+                        gram_cache=fixed_ratio_gram_cache,
+                        marker_ids=candidate,
                     )
                 lasso_path_solve_seconds = float(
                     time.perf_counter() - lasso_path_started
@@ -4554,6 +4624,12 @@ def main() -> None:
                 sparse_path_performance["lasso_path_solve_seconds"] += (
                     lasso_path_solve_seconds
                 )
+                for label in ("gram_seconds", "cd_seconds"):
+                    key = "lasso_" + label
+                    sparse_path_performance[key] = sparse_path_performance.get(key, 0.) + lasso[label]
+                logger.info("[outer %s KKT %s timing] gram=%.2fs cd=%.2fs cached_gram_columns=%s",
+                            outer, kkt_round, lasso["gram_seconds"], lasso["cd_seconds"],
+                            lasso["gram_reused_columns"])
                 sparse_path_performance["lasso_cd_iterations"] += int(
                     sum(int(row["cd_iter"]) for row in lasso["path"])
                 )
@@ -4945,14 +5021,33 @@ def main() -> None:
         if information_markers is None or not np.array_equal(active_markers, information_markers):
             mean_information = SparseMeanInformation(
                 Z_cand[:, active_local], covar_np,
-                hinv_active=sol_z_np[:, active_local],
+                hinv_active=None if sol_z_np is None else sol_z_np[:, active_local],
                 batch_size=int(args.candidate_pcg_rhs_batch_size),
             )
+            mean_information = _sparse_reml_mod.with_projected_likelihood(
+                mean_information,
+                available_bytes=gpu_budget_bytes-plan.gpu_slq_peak_gib*1024**3,
+                precond_rank=plan.precond_rank,
+            )
             information_markers = active_markers.copy()
-        mean_state, residual, beta_cov_current = mean_information.statistics(
-            theta, hv, precond, np.asarray(y_np, dtype=np.float64)-sparse_mean_current,
-            tol=min(float(args.pcg_tol), 1e-5), maxiter=int(args.max_pcg_iters),
+        # The projected optimizer does not consume the endpoint trace.
+        # Compute it when alignment or final output actually needs it; the
+        # post-update h2 convergence check below always remains calibrated.
+        deferred_information = bool(
+            not final_alignment
+            and hasattr(mean_information, "joint_logdet_and_score")
         )
+        mean_state = None
+        if deferred_information:
+            residual, beta_cov_current = mean_information.profile_response(
+                hv, precond, np.asarray(y_np, dtype=np.float64)-sparse_mean_current,
+                tol=min(float(args.pcg_tol), 1e-5), maxiter=int(args.max_pcg_iters),
+            )
+        else:
+            mean_state, residual, beta_cov_current = mean_information.statistics(
+                theta, hv, precond, np.asarray(y_np, dtype=np.float64)-sparse_mean_current,
+                tol=min(float(args.pcg_tol), 1e-5), maxiter=int(args.max_pcg_iters),
+            )
         lasso["beta_cov"] = beta_cov_current
         fixed_mean_current = sparse_mean_current + (
             np.asarray(covar_np) @ beta_cov_current if covar_np is not None else 0.
@@ -4961,13 +5056,15 @@ def main() -> None:
             sparse_path_performance.get("mean_information_seconds", 0.)
             + time.perf_counter()-information_started
         )
-        selected_h2, outer_q_sparse = _outer_coherit_h2_from_fitted_sparse_mean(
-            sparse_mean_current,
-            residual,
-            background_genetic_variance=_background_genetic_variance(theta),
-            residual_variance=float(theta[-1]),
-            mean_uncertainty_trace=mean_state["trace"],
-        )
+        selected_h2 = outer_q_sparse = None
+        if mean_state is not None:
+            selected_h2, outer_q_sparse = _outer_coherit_h2_from_fitted_sparse_mean(
+                sparse_mean_current,
+                residual,
+                background_genetic_variance=_background_genetic_variance(theta),
+                residual_variance=float(theta[-1]),
+                mean_uncertainty_trace=mean_state["trace"],
+            )
         selected_validation_r2 = (
             float(lasso["validation_selection"]["selected"]["predictive_r2"])
             if lasso.get("validation_selection") is not None else None
@@ -4975,7 +5072,8 @@ def main() -> None:
         # Every score-bearing record describes alpha and its actual covariance.
         if iterative_validation_selection:
             iterative_validation_trace[-1].update(
-                coherit_h2=float(selected_h2), q_sparse=float(outer_q_sparse)
+                coherit_h2=selected_h2, q_sparse=outer_q_sparse,
+                information_calibration="deferred" if deferred_information else "computed"
             )
 
         # Alignment can change alpha and h2. Only the returned state may be
@@ -5007,9 +5105,10 @@ def main() -> None:
                         else "final_covariance_lasso"
                     ),
                     "theta": theta.tolist(),
-                    "coherit_h2": float(selected_h2),
-                    "q_sparse": float(outer_q_sparse),
+                    "coherit_h2": selected_h2,
+                    "q_sparse": outer_q_sparse,
                     "mean_uncertainty_trace_per_n": mean_state["trace"]/n_samples,
+                    "information_calibration_before_update": "computed",
                     "mean_information_rank": mean_information.rank,
                     "h2_abs_change": float(alignment_h2_change),
                     "h2_stable": bool(alignment_h2_stable),
@@ -5192,11 +5291,12 @@ def main() -> None:
             "support_size": int(support_new.size),
             "effect_rel": float(effect_rel),
             "effect_stable": bool(effect_stable),
-            "coherit_h2": float(selected_h2),
+            "coherit_h2": selected_h2,
             "coherit_h2_after_variance_update": float(outer_h2),
-            "q_sparse": float(outer_q_sparse),
+            "q_sparse": outer_q_sparse,
             "q_sparse_after_variance_update": float(outer_q_after),
-            "mean_uncertainty_trace_per_n": mean_state["trace"]/n_samples,
+            "mean_uncertainty_trace_per_n": (None if mean_state is None else mean_state["trace"]/n_samples),
+            "information_calibration_before_update": "deferred" if deferred_information else "computed",
             "mean_uncertainty_trace_per_n_after_variance_update": mean_after["trace"]/n_samples,
             "mean_information_rank": mean_information.rank,
             "variance_update_h2_abs_change": float(h2_abs_change),
@@ -5217,7 +5317,7 @@ def main() -> None:
 
         logger.info(
             "[outer %s] pcg_screen=%s pcg_all=%s cand=%s active=%s "
-            "kkt_rounds=%s lam=%.3e validation_predictive_R2=%s h2=%.6f "
+            "kkt_rounds=%s lam=%.3e validation_predictive_R2=%s h2=%s "
             "h2_after_variance_update=%.6f variance_update_h2_change=%.3e "
             "effect_rel=%.3e iter_time=%.1fs",
             outer,
@@ -5237,7 +5337,7 @@ def main() -> None:
                 if lasso.get("validation_selection") is not None
                 else "fixed"
             ),
-            selected_h2,
+            "deferred" if selected_h2 is None else "%.6f" % selected_h2,
             outer_h2,
             h2_abs_change,
             effect_rel,

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 
 import jax
 import jax.numpy as jnp
@@ -39,21 +40,13 @@ def solve_sparse_pcg(hv, rhs, M=None, tol=1e-2, maxiter=200, X0=None,
         solution, relative, iterations = pcg_solve(
             hv, block, M=M, tol=inner_tol if tight else tol,
             maxiter=maxiter, X0=initial, check_every=check_every,
+            stop_on_residual_gap=tight,
         )
         used = int(iterations)
-        if not tight or float(relative) <= tol:
+        if not tight:
             return solution, float(relative), used
-        # Give ordinary FP32 convergence a cheap chance before residual
-        # correction, rather than exhausting the budget at a rounding floor.
-        polish_budget = min(maxiter-used, max(1, used))
-        if polish_budget:
-            solution, relative, count = pcg_solve(
-                hv, block, M=M, tol=tol, maxiter=polish_budget, X0=solution,
-                check_every=check_every,
-            )
-            used += int(count)
-            if float(relative) <= tol:
-                return solution, float(relative), used
+        # Verify the original system in FP64 immediately. Continuing to polish
+        # the FP32 system cannot remove its operator/solution rounding error.
     with jax.experimental.enable_x64():
         target = jnp.asarray(rhs, dtype=jnp.float64)
         value = jnp.asarray(solution, dtype=jnp.float64)
@@ -77,9 +70,15 @@ def solve_sparse_pcg(hv, rhs, M=None, tol=1e-2, maxiter=200, X0=None,
                 )
                 return value, actual, used
             previous = actual
+            # Solving H delta = r to relative error eta gives the original
+            # system a residual bounded by eta * actual in exact arithmetic.
+            # The next FP64 check, not this prediction, controls acceptance.
+            correction_tol = min(.5, max(np.finfo(np.float32).eps,
+                                         .5 * tol / actual))
             correction, _, count = pcg_solve(
                 hv, residual.astype(jnp.float32), M=M,
-                tol=inner_tol, maxiter=maxiter-used, check_every=check_every,
+                tol=correction_tol, maxiter=maxiter-used, check_every=check_every,
+                stop_on_residual_gap=True,
             )
             used += int(count)
             if not count:
@@ -95,6 +94,7 @@ def solve_columns(hv, rhs, precond, *, tol, maxiter, batch_size=128, warm=None):
         raise ValueError("Information solves require matrix RHS and positive batch size.")
     result = np.empty(rhs.shape, dtype=np.float64)
     for start in range(0, rhs.shape[1], batch_size):
+        started = time.perf_counter()
         end = min(start + batch_size, rhs.shape[1])
         solution, actual, iterations = solve_sparse_pcg(
             hv, rhs[:, start:end], M=precond, tol=tol, maxiter=maxiter,
@@ -107,6 +107,8 @@ def solve_columns(hv, rhs, precond, *, tol, maxiter, batch_size=128, warm=None):
                 f"iterations={int(iterations)}/{maxiter}."
             )
         result[:, start:end] = np.asarray(solution)
+        logger.info("[information solve] columns=%s:%s iterations=%s residual=%.3e time=%.2fs",
+                    start, end, iterations, actual, time.perf_counter()-started)
     return result
 
 
@@ -119,6 +121,7 @@ class SparseMeanInformation:
     """
 
     def __init__(self, active_x, covar, *, hinv_active=None, batch_size=128):
+        started = time.perf_counter()
         x = np.asarray(active_x, dtype=np.float64)
         self.covar = (np.empty((x.shape[0], 0), dtype=np.float64) if covar is None
                       else np.array(covar, dtype=np.float64, copy=True))
@@ -158,12 +161,15 @@ class SparseMeanInformation:
         self._tol = None
         self._state = None
         self._response_cache = None
+        logger.info("[information basis] selected=%s rank=%s time=%.2fs",
+                    x.shape[1], self.rank, time.perf_counter()-started)
 
     def _cached(self, theta, tol):
         return (self._theta is not None and np.array_equal(theta, self._theta)
                 and self._tol <= tol)
 
-    def evaluate(self, theta, hv, precond, hinv_covar, *, tol, maxiter):
+    def evaluate(self, theta, hv, precond, hinv_covar, *, tol, maxiter,
+                 _solved_basis=None):
         """Return logdet, tr(Sigma_g), and W with P-P_S = W W'."""
         theta = np.asarray(theta, dtype=np.float64)
         if self._cached(theta, tol):
@@ -180,8 +186,13 @@ class SparseMeanInformation:
             state = {"logdet": 0., "trace": 0., "w": np.empty((self.n, 0)),
                      "rank": 0}
         else:
-            solved = solve_columns(hv, self.basis, precond, tol=tol, maxiter=maxiter,
-                                   batch_size=self.batch_size, warm=self.hinv_warm)
+            started = time.perf_counter()
+            solved = _solved_basis
+            if solved is None:
+                solved = solve_columns(hv, self.basis, precond, tol=tol, maxiter=maxiter,
+                                       batch_size=self.batch_size, warm=self.hinv_warm)
+            solve_seconds = time.perf_counter()-started
+            started = time.perf_counter()
             self.hinv_warm = solved
             pz = np.asarray(solved, dtype=np.float64)
             if self.covar.shape[1]:
@@ -197,6 +208,8 @@ class SparseMeanInformation:
                                           check_finite=False).T,
                 "rank": self.rank,
             }
+            logger.info("[information evaluation] rank=%s solves=%.2fs projection_and_factor=%.2fs",
+                        self.rank, solve_seconds, time.perf_counter()-started)
         # The REML block already solved C at this theta. Keep that exact factor
         # for the subsequent paired h2 calculation, rather than solving C again.
         state.update(hinv_covar=hc, covar_factor=cf)
@@ -214,11 +227,24 @@ class SparseMeanInformation:
         state = self._state if self._cached(theta, tol) else None
         response_tol = tol
         if state is None:
-            rhs = np.column_stack([response, self.covar])
+            # H is shared by every column. Include the small response/covariate
+            # block in the last selected-span batch to avoid a separate genome
+            # pass for only a handful of columns. Each RHS keeps its own PCG
+            # recurrence and the same verified residual tolerance.
+            rhs = np.column_stack([self.basis, self.covar, response])
+            warm = None
+            if self.hinv_warm is not None:
+                warm = np.column_stack([
+                    self.hinv_warm,
+                    np.zeros((self.n, self.covar.shape[1] + 1)),
+                ])
             solved = solve_columns(hv, rhs, precond, tol=tol, maxiter=maxiter,
-                                   batch_size=self.batch_size)
-            solved_response = solved[:, 0]
-            state = self.evaluate(theta, hv, precond, solved[:, 1:], tol=tol, maxiter=maxiter)
+                                   batch_size=self.batch_size, warm=warm)
+            solved_response = solved[:, -1]
+            state = self.evaluate(
+                theta, hv, precond, solved[:, self.rank:-1], tol=tol,
+                maxiter=maxiter, _solved_basis=solved[:, :self.rank],
+            )
         elif reuse_response:
             solved_response = cached[3]
             response_tol = cached[1]
@@ -235,6 +261,44 @@ class SparseMeanInformation:
             gamma = np.empty(0)
         return state, np.asarray(residual)-self.covar @ gamma, gamma
 
+    def profile_response(self, hv, precond, residual, *, tol, maxiter):
+        """Profile C with one contrast solve, without computing selected trace.
+
+        For Pi=I-Q_C Q_C', P_C=Pi(Pi H Pi+Q_C Q_C')^-1 Pi.
+        H P_C r = r-C gamma then recovers the same GLS covariate estimate.
+        This is for intermediate projected-likelihood updates only. Final h2
+        and all convergence decisions still use statistics().
+        """
+        if not self.covar.shape[1]:
+            return np.asarray(residual), np.empty(0)
+        q, factor = sla.qr(self.covar, mode="economic", check_finite=False)
+        response = np.asarray(residual, dtype=np.float32).reshape(-1, 1)
+        with jax.experimental.enable_x64():
+            q64 = jnp.asarray(q, dtype=jnp.float64)
+            q32 = q64.astype(jnp.float32)
+            def project(value):
+                basis = q32 if value.dtype == jnp.float32 else q64
+                return value-basis @ (basis.T @ value)
+            def contrast(value):
+                projected = project(value)
+                return project(hv(projected))+(value-projected)
+            def precondition(value):
+                projected = project(value)
+                return project(precond(projected))+(value-projected)
+            target = jnp.asarray(response, dtype=jnp.float64)
+            dual, actual, _ = solve_sparse_pcg(
+                contrast, project(target), M=None if precond is None else precondition,
+                tol=tol, maxiter=maxiter,
+            )
+            if not np.isfinite(actual) or actual > tol*1.05:
+                raise FloatingPointError("Covariate contrast profile failed its true residual check")
+            nuisance = target-hv(project(dual))
+            gamma = sla.solve_triangular(
+                factor, np.asarray(q64.T @ nuisance)[:, 0], lower=False,
+                check_finite=False,
+            )
+        return np.asarray(residual)-self.covar @ gamma, gamma
+
     def score_trace_correction(self, state, kernel_mvs, residual_diags=None):
         """tr(W' D_j W), with bounded kernel products and float64 reductions."""
         cached = state.get("score_trace_cache")
@@ -246,6 +310,7 @@ class SparseMeanInformation:
         n_residual = 1 if residual_diags is None else len(residual_diags)
         traces = np.zeros(len(kernel_mvs)+n_residual, dtype=np.float64)
         w = state["w"]
+        started = time.perf_counter()
         for start in range(0, self.rank, self.batch_size):
             block = np.asarray(w[:, start:start+self.batch_size], dtype=np.float32)
             device_block = jnp.asarray(block)
@@ -258,4 +323,6 @@ class SparseMeanInformation:
             else:
                 traces[len(kernel_mvs):] += np.asarray(residual_diags) @ square
         state["score_trace_cache"] = (kernels, residual_diags, traces.copy())
+        logger.info("[information trace] rank=%s components=%s time=%.2fs",
+                    self.rank, len(kernels), time.perf_counter()-started)
         return traces

@@ -73,6 +73,7 @@ def pcg_solve(
     maxiter: int = 200,
     X0: Optional[Array] = None,
     check_every: int = 2,
+    stop_on_residual_gap: bool = False,
 ) -> Tuple[Array, Array, int]:
     """
     Solve H X = B with block PCG.
@@ -94,6 +95,11 @@ def pcg_solve(
     from the true residual within the remaining ``maxiter`` budget. Exhausting
     that budget returns the actual residual even when it exceeds ``tol``;
     callers remain responsible for accepting or rejecting an inexact solve.
+
+    ``stop_on_residual_gap`` is for mixed-precision refinement: once recursive
+    convergence fails the true-residual check, return that verified inexact
+    solution to the higher-precision correction loop instead of restarting
+    this precision. The ordinary solver keeps its existing restart behavior.
     """
     if M is None:
         M = _identity
@@ -165,7 +171,7 @@ def pcg_solve(
             if recursive_relative <= tol or k == maxiter:
                 solution = X * rhs_scale
                 R, rnorm, res_final, relative_host = true_residual(solution)
-                if relative_host <= tol or k == maxiter:
+                if relative_host <= tol or k == maxiter or stop_on_residual_gap:
                     return solution, res_final, k
                 # Re-anchor both the solution and search directions to the
                 # verified state. The iteration counter is never reset.

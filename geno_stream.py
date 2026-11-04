@@ -2569,7 +2569,10 @@ class GenoBlockStreamer:
     ) -> np.ndarray:
         if uniq_idx.size == 0:
             return np.empty((self.n, 0), dtype=np.float32)
-        out_uniq = np.empty((self.n, uniq_idx.size), dtype=np.float32)
+        # Column extraction returns column-major storage. Build it directly
+        # instead of keeping a full row-major matrix only to transpose-copy it
+        # through NumPy's advanced indexing at the end of every BASIL block.
+        out_uniq = np.empty((self.n, uniq_idx.size), dtype=np.float32, order="F")
         begin = 0
         for end in starts:
             c = int(call_ids[begin])
@@ -2588,6 +2591,8 @@ class GenoBlockStreamer:
             g_imp = np.where(block == missing_val, mean, block)
             out_uniq[:, begin:end] = (g_imp - mean) * inv
             begin = end
+        if inverse.size == uniq_idx.size and np.array_equal(inverse, np.arange(uniq_idx.size)):
+            return out_uniq
         return out_uniq[:, inverse]
 
     # ------------------------------------------------------------------
@@ -2803,6 +2808,7 @@ class GenoBlockStreamer:
             n=self.n, n_calls=self._n_calls,
             pop_block=self._pop_cached,
             missing_val=int(self._missing_val), normalize=normalize,
+            fp64_workspace_bytes=getattr(self, "_sparse_fp64_workspace_bytes", 0),
         )
 
     def component_kv(
@@ -2878,6 +2884,7 @@ class GenoBlockStreamer:
             n_calls=self._n_calls, pop_block=self._pop_cached,
             missing_val=int(self._missing_val),
             normalize=normalize, eff_m=self._eff_m_const,
+            sparse_packed_enabled=getattr(self, "_sparse_fp64_workspace_bytes", 0) > 0,
         )
 
     def xv(self, effects: jnp.ndarray) -> jnp.ndarray:

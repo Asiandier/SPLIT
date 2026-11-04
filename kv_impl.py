@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 
 from .geno_stream import _PinnedHostBuffer
+from . import sparse_packed
 
 Array = jnp.ndarray
 
@@ -94,7 +95,20 @@ def _unpack_impute_center(g_dev_packed, true_width, means_call,
     return diff, inv_f
 
 
-@partial(jax.jit, donate_argnums=(6,))
+def _genotype_gram_product(diff, inverse, value, fp64_workspace_bytes):
+    # The private cuBLAS backend helps wide candidate/selected-space solves.
+    # Keep narrow RHS on native JAX; FP64 emulation has splitting overhead.
+    if value.dtype in (jnp.float32, jnp.float64) and value.shape[1] >= 256 and fp64_workspace_bytes > 0:
+        from .sparse_fp64 import matmul
+        inner = matmul(diff, value, transpose_a=True, workspace_limit=fp64_workspace_bytes)
+        return matmul(diff, (inverse*inverse)[:, None]*inner,
+                      workspace_limit=fp64_workspace_bytes)
+    inner = jnp.matmul(diff.T, value, precision=jax.lax.Precision.HIGHEST)
+    return jnp.matmul(diff, (inverse*inverse)[:, None]*inner,
+                      precision=jax.lax.Precision.HIGHEST)
+
+
+@partial(jax.jit, donate_argnums=(6,), static_argnames=("fp64_workspace_bytes",))
 def _kv_one_call_jit(
     g_dev_packed: Array,   # (n, ceil(W / 4)) uint8 packed 2-bit genotypes
     true_width: Array,     # () int32, number of valid SNP columns
@@ -103,20 +117,18 @@ def _kv_one_call_jit(
     V: Array,              # (n, rhs)
     miss_u8: Array,        # () uint8
     acc: Array,            # (n, rhs)
+    *, fp64_workspace_bytes: int = 0,
 ) -> Array:
     """Accumulate one call-block contribution from packed 2-bit genotypes."""
+    if fp64_workspace_bytes > 0 and sparse_packed.supports(V):
+        return acc + sparse_packed.gram_product(
+            g_dev_packed, means_call, inv_call, V, true_width, miss_u8)
     diff, inv_f = _unpack_impute_center(
         g_dev_packed, true_width, means_call, inv_call, V, miss_u8)
-    inner = jnp.matmul(diff.T, V, precision=jax.lax.Precision.HIGHEST)
-    inv_sq = inv_f * inv_f
-    return acc + jnp.matmul(
-        diff,
-        inv_sq[:, None] * inner,
-        precision=jax.lax.Precision.HIGHEST,
-    )
+    return acc + _genotype_gram_product(diff, inv_f, V, fp64_workspace_bytes)
 
 
-@partial(jax.jit, donate_argnums=(7,))
+@partial(jax.jit, donate_argnums=(7,), static_argnames=("fp64_workspace_bytes",))
 def _kv_one_call_scaled_jit(
     g_dev_packed: Array,   # (n, ceil(W / 4)) uint8 packed 2-bit genotypes
     true_width: Array,     # () int32, number of valid SNP columns
@@ -126,20 +138,18 @@ def _kv_one_call_scaled_jit(
     miss_u8: Array,        # () uint8
     scale: Array,          # () scalar multiplier (already includes eff_m scaling)
     acc: Array,            # (n, rhs)
+    *, fp64_workspace_bytes: int = 0,
 ) -> Array:
     """Accumulate one scaled call-block contribution from packed genotypes."""
+    if fp64_workspace_bytes > 0 and sparse_packed.supports(V):
+        return acc + scale * sparse_packed.gram_product(
+            g_dev_packed, means_call, inv_call, V, true_width, miss_u8)
     diff, inv_f = _unpack_impute_center(
         g_dev_packed, true_width, means_call, inv_call, V, miss_u8)
-    inner = jnp.matmul(diff.T, V, precision=jax.lax.Precision.HIGHEST)
-    inv_sq = inv_f * inv_f
-    return acc + scale * jnp.matmul(
-        diff,
-        inv_sq[:, None] * inner,
-        precision=jax.lax.Precision.HIGHEST,
-    )
+    return acc + scale * _genotype_gram_product(diff, inv_f, V, fp64_workspace_bytes)
 
 
-@jax.jit
+@partial(jax.jit, static_argnames=("sparse_packed_enabled",))
 def _xtv_one_call_jit(
     g_dev_packed: Array,   # (n, ceil(W / 4)) uint8 packed 2-bit genotypes
     true_width: Array,     # () int32
@@ -147,8 +157,12 @@ def _xtv_one_call_jit(
     inv_call: Array,       # (max_unpack_width,) f32
     V: Array,              # (n, rhs)
     miss_u8: Array,        # () uint8
+    *, sparse_packed_enabled: bool = False,
 ) -> Array:
     """Compute one call-block contribution for X^T @ V from packed genotypes."""
+    if sparse_packed_enabled and sparse_packed.supports(V):
+        return sparse_packed.transpose_product(
+            g_dev_packed, means_call, inv_call, V, true_width, miss_u8)
     diff, inv_f = _unpack_impute_center(
         g_dev_packed, true_width, means_call, inv_call, V, miss_u8)
     return inv_f[:, None] * jnp.matmul(
@@ -256,6 +270,7 @@ def kv_impl_streamed(
     pop_block: Callable[[int], np.ndarray],
     missing_val: int = 3,
     normalize: bool = True,
+    fp64_workspace_bytes: int = 0,
 ) -> Array:
     """
     Double-buffered streaming K·V.
@@ -295,6 +310,7 @@ def kv_impl_streamed(
             V,
             miss_u8,
             acc,
+            fp64_workspace_bytes=fp64_workspace_bytes,
         )
         del g_dev_cur   # release device buffer for reuse
 
@@ -318,6 +334,7 @@ def xtv_impl_streamed(
     missing_val: int = 3,
     normalize: bool = False,
     eff_m: Array | None = None,
+    sparse_packed_enabled: bool = False,
 ) -> Array:
     """
     Double-buffered streaming X^T·V.
@@ -351,6 +368,7 @@ def xtv_impl_streamed(
             inv_by_call[c],
             V,
             miss_u8,
+            sparse_packed_enabled=sparse_packed_enabled,
         )
         del g_dev_cur   # release device buffer for reuse
         out = _xtv_scatter_jit(out, block_out, snp_starts[c])
@@ -970,6 +988,7 @@ def kv_impl_multi_streamed_weighted(
             miss_u8,
             scale,
             acc,
+            fp64_workspace_bytes=getattr(st, "_sparse_fp64_workspace_bytes", 0),
         )
         del g_dev_cur
 
@@ -1028,6 +1047,7 @@ def kv_impl_multi_streamed_stacked(
             V,
             miss_u8,
             outs[g_idx],
+            fp64_workspace_bytes=getattr(st, "_sparse_fp64_workspace_bytes", 0),
         )
         del g_dev_cur
 
@@ -1079,6 +1099,7 @@ def kv_impl_partitioned_component(
             V,
             miss_u8,
             acc,
+            fp64_workspace_bytes=getattr(streamer, "_sparse_fp64_workspace_bytes", 0),
         )
         del g_dev_cur
 
@@ -1132,6 +1153,7 @@ def kv_impl_partitioned_weighted(
             miss_u8,
             scale,
             acc,
+            fp64_workspace_bytes=getattr(streamer, "_sparse_fp64_workspace_bytes", 0),
         )
         del g_dev_cur
 
@@ -1174,6 +1196,7 @@ def kv_impl_partitioned_stacked(
             V,
             miss_u8,
             outs[comp_idx],
+            fp64_workspace_bytes=getattr(streamer, "_sparse_fp64_workspace_bytes", 0),
         )
         del g_dev_cur
 

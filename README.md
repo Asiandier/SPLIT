@@ -95,9 +95,26 @@ covariance. Since \(P_C C=0\), using a residual that already subtracts the
 current nuisance score is algebraically equivalent to applying \(P_C\) to
 `y-Z b`, while retaining the numerically convenient residual scale.
 For an orthonormal basis `B` of the selected SNP span, the covariance objective
-adds `-0.5 log|B' P_C B|` to the log likelihood. The sparse quadratic subtracts
+adds `-0.5 log|B' P_C B|` to the log likelihood. During the sparse covariance
+update, the covariance, covariate, and selected-span determinants are evaluated
+jointly in an orthogonal contrast space. This equivalent objective avoids
+solving for every selected column at each line-search point; the residual
+quadratic still profiles only the covariates, leaving the LASSO mean fixed.
+The existing SLQ probe count and numerical tolerances are retained, although
+the finite-probe representation changes. Projection buffers are released
+before the endpoint calibration. If the additional basis does not fit the
+sparse memory plan, the original direct calculation is used.
+The sparse quadratic subtracts
 `tr{B (B' P_C B)^-1 B'}/n`. These are paired local mean-information corrections;
 the Lasso residual quadratic itself retains `P_C`.
+See [sparse numerical contracts](docs/sparse_numerics.md) for the determinant
+identity, KKT certificates, precision policy and the roles of both solvers.
+The projected covariance update does not require this trace before taking a
+step. Intermediate updates therefore profile the covariates with one contrast
+solve and defer the trace calculation until after the covariance update.
+Every h² convergence decision and final output retains the calibrated trace.
+Endpoint solves batch the selected directions, covariates and response together;
+mixed-precision corrections stop only after the original FP64 residual check.
 Within each candidate problem, coordinate descent is accepted solely when the
 active and inactive score-KKT conditions pass at the configured numerical
 tolerance; coefficient change is only an active-set scheduling heuristic.
@@ -169,11 +186,14 @@ Sparse-run output semantics are deliberately explicit:
   `h2_chive`.
 - New sparse runs use output schema version 11. Raw/standardized duplicate
   estimator fields and downstream phenotype-scale conversions no longer exist.
-- In each `outer_update` history record, `theta`, `coherit_h2`, and validation
-  predictive R² describe the same selected LASSO state. The subsequent covariance
-  update is recorded separately as `theta_after_variance_update` and
+- In each `outer_update` history record, `theta` and validation predictive R²
+  describe the selected LASSO state. With the projected covariance update,
+  `information_calibration_before_update` is `deferred` and the pre-update
+  `coherit_h2`, `q_sparse` and trace fields are null. The subsequent covariance
+  update is recorded as `theta_after_variance_update` and the fully calibrated
   `coherit_h2_after_variance_update`; its h² convergence fields use the
-  `variance_update_` prefix. The validation audit also records the aligned h².
+  `variance_update_` prefix. Final covariance-alignment records compute both
+  the information correction and h² for the returned LASSO state.
   `q_sparse_after_variance_update` includes information and nuisance effects
   recomputed at that new covariance, rather than reusing the pre-update Q.
 - BASIL validation reuses its training dual and marker scores after a true
@@ -181,6 +201,18 @@ Sparse-run output semantics are deliberately explicit:
   reuse response-independent REML probe products and single-GRM Lanczos work.
   These caches do not cross sample sets or GRM partitions. Resuming a pipeline
   also checks a source-code digest; changed code requires a fresh work directory.
+- `--lasso-path-solver residual` selects an alternative numerical solver for
+  validation paths from one packed genotype source. It solves for residual
+  gradients instead of all inverse-covariance candidate columns, using the
+  existing preconditioner to initialize a quasi-Newton metric. Exact-objective
+  line searches and full-marker KKT checks control acceptance. Certified affine
+  gradients are reused with propagated solve and FP64 rounding-error bounds.
+  Within each fixed covariance, previous solution directions provide a Galerkin
+  initial guess and a balanced PCG preconditioner; every accepted solve still
+  passes an independent true-residual check. The bounded working-set batches
+  are retained, and both caches are local to one Lasso path. The lambda grid,
+  validation rule and KKT tolerance are unchanged. The default remains `basil`;
+  fixed-lambda refits retain their existing solver.
 - `var_components_lasso_ml` contains one kernel coefficient per fixed GRM
   followed by the identity-residual variance. The covariance remains
   `H = sum_g theta_g K_g + theta_e I`; the kernels are not rescaled.
@@ -275,6 +307,32 @@ Optional PGEN support:
 ```bash
 python -m pip install -e ".[pgen]"
 ```
+
+The sparse path can optionally accelerate wide FP32 candidate solves and FP64
+residual-correction products with cuBLAS 13.1 or newer on a supported NVIDIA GPU:
+
+```bash
+python -m pip install -e ".[sparse-fp64]"
+```
+
+This requires a C++17 compiler on the first run. The small JAX FFI bridge is
+cached under `$XDG_CACHE_HOME/gpu_reml/ffi` (normally `~/.cache`). The newer
+cuBLAS library is loaded privately; it does not replace JAX's CUDA libraries.
+The backend uses native FP32 for candidate products and NVIDIA's default
+dynamic-precision FP64 emulation for residual correction, with no reduced
+FP32 precision, fixed-mantissa override, or relaxation of PCG tolerances.
+It operates on XLA's CUDA stream with explicitly bounded workspace. When a
+CUDA compiler is available, narrow RHS products use deterministic staged
+reductions directly on packed genotypes, avoiding a full floating-point
+genotype block. This optional kernel is compiled once and cached alongside
+the GEMM bridge; unsupported environments retain native JAX products.
+Ordinary REML does not opt into either sparse backend.
+See [NVIDIA's FP64 emulation documentation](https://docs.nvidia.com/cuda/archive/13.0.3/cublas/index.html#floating-point-emulation).
+
+If this optional dependency or the FFI build is unavailable, sparse fitting
+logs the reason and uses native JAX. `SPLIT_SPARSE_FP64=native` explicitly
+selects that baseline. `SPLIT_CUBLAS_LIBRARY` can instead name an isolated
+`libcublas.so.13`; its accompanying libraries must remain discoverable.
 
 Development install:
 
@@ -569,6 +627,17 @@ fit lifecycle.
   the sparse allowance after releasing the native REML cache, with smaller
   decode blocks and device-side loops. Neither cache stores a dense
   standardized genotype matrix or sample Gram matrix.
+  Within a fixed sample and standardization scope, sparse candidate expansion
+  reuses previously read genotype columns and previously computed weighted Gram
+  entries. These caches retain only the current candidate set; covariance
+  changes start a new weighted Gram cache.
+  Large candidate-design dtype conversions and column copies use the configured
+  CPU thread pool. They preserve the original values, array layouts and FP64
+  Gram arithmetic, avoiding serial copies of multi-GiB arrays.
+  Sparse planning also accounts for selected-mean FP64 correction solves at
+  `--candidate-pcg-rhs-batch-size`, including their live Krylov vectors and
+  optional FP64 GEMM workspace. It reduces the SNP block width when that
+  phase exceeds the budget; the ordinary REML planner is unchanged.
 - `--ring-depth`: number of CPU-side staging buffers used for genotype
   streaming. This is the main knob for controlling CPU memory peak during data
   movement. Larger values can give smoother host-to-GPU streaming but allocate

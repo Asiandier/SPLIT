@@ -1,0 +1,606 @@
+"""Residual-based weighted Lasso: original objective and full-marker KKT.
+
+The quadratic proposal metric is built from a cheap genotype Gram, optionally
+preconditioned by the existing REML low-rank inverse. Exact residual gradients,
+certified line searches and full-marker KKT determine the accepted solution.
+No candidate H^-1 Z matrix is needed for the path search.
+"""
+from __future__ import annotations
+import logging
+import json
+import math
+import time
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import scipy.linalg as sla
+
+from . import sparse_fp64
+from .lasso_recycle import RecycledInverse
+from .lasso_cd import solve_lasso_cd_gram, make_lambda_sequence
+from .pcg import pcg_solve
+from .precond import scalar_diag_from_precond_conf, build_projected_core_runtime
+
+logger = logging.getLogger(__name__)
+
+def solve_adaptive_pcg(hv, rhs, M=None, tol=1e-8, maxiter=400, X0=None,
+                       check_every=2, recycle=None):
+    with jax.experimental.enable_x64():
+        rhs = jnp.asarray(rhs, dtype=jnp.float64)
+        value = jnp.zeros_like(rhs) if X0 is None else jnp.asarray(X0, dtype=jnp.float64)
+        scale = jnp.linalg.norm(rhs, axis=0)
+        value = jnp.where(scale > 0, value, 0.)
+        scale = jnp.where(scale > 0, scale, 1.)
+        used = 0
+        previous = math.inf
+        recycled_precond = M if recycle is None else recycle.preconditioner(M)
+        coarse_residual = None
+        if recycle is not None and recycle.rank:
+            # The Galerkin minimizer over previous solution directions is
+            # U U' rhs. It subsumes a warm start in span(U), without applying
+            # the covariance to that warm start again.
+            value, coarse_residual = recycle.coarse(rhs)
+        while True:
+            verified = coarse_residual is None
+            if verified:
+                product = hv(value)
+                residual = rhs-product
+            else:
+                residual, coarse_residual = coarse_residual, None
+            actual = float(jnp.max(jnp.linalg.norm(residual, axis=0)/scale))
+            if not np.isfinite(actual):
+                raise FloatingPointError('Nonfinite verified residual')
+            if not verified and (actual <= tol or used >= maxiter or actual >= previous):
+                continue  # No result is returned without a true FP64 residual.
+            if actual <= tol:
+                if recycle is not None:
+                    recycle.observe(value, product)
+                return value, actual, used
+            if used >= maxiter or actual >= previous:
+                return value, actual, used
+            previous = actual
+            # r_new = r - H delta. A correction relative residual eta bounds
+            # the global relative residual by eta*actual. The factor 1/2
+            # leaves room for FP32 correction and addition roundoff. Any
+            # failure of this estimate is caught by the FP64 verification.
+            eta = min(.5, max(np.finfo(np.float32).eps, .5*tol/actual))
+            correction, _, count = pcg_solve(hv, residual.astype(jnp.float32),
+                M=recycled_precond, tol=eta, maxiter=maxiter-used, check_every=check_every,
+                stop_on_residual_gap=True)
+            used += int(count)
+            if not count:
+                if not verified:
+                    continue
+                return value, actual, used
+            value += correction.astype(jnp.float64)
+
+
+def quadratic_l1_step(beta, direction, score, curvature, lam):
+    """Minimize the exact convex loss on beta + t*direction, 0 <= t <= 1."""
+    linear = -float(score @ direction)
+    scale = max(1., abs(linear), abs(curvature), lam*np.sum(np.abs(direction)))
+    if curvature < -128*np.finfo(float).eps*scale:
+        raise ValueError('Negative measured target curvature')
+    curvature = max(0., float(curvature))
+
+    def derivative(t):
+        point = beta+t*direction
+        return linear+t*curvature+lam*float(np.sign(point)@direction)
+
+    if derivative(1.) <= 0:
+        return 1.
+    lo, hi = 0., 1.
+    for _ in range(60):
+        mid = .5*(lo+hi)
+        if derivative(mid) > 0:
+            hi = mid
+        else:
+            lo = mid
+    # Include exact zero crossings to avoid artificial tiny active coefficients.
+    candidates = [0., 1., .5*(lo+hi)]
+    moving = direction != 0
+    roots = -beta[moving]/direction[moving]
+    roots = roots[(roots >= lo-1e-14) & (roots <= hi+1e-14)]
+    candidates.extend(roots.tolist())
+    def change(t):
+        return t*linear+.5*t*t*curvature+lam*(np.sum(np.abs(beta+t*direction))-np.sum(np.abs(beta)))
+    return float(min(candidates, key=change))
+
+
+def bfgs_update(metric, step, change):
+    """Maintain positive curvature; skip pairs dominated by roundoff."""
+    product = metric@step
+    denom = float(step@product)
+    target = float(step@change)
+    eps = 128*np.finfo(float).eps
+    if denom <= eps*np.linalg.norm(step)*np.linalg.norm(product):
+        return None
+    if target <= eps*np.linalg.norm(step)*np.linalg.norm(change):
+        return None
+    # BLAS rank-one updates avoid an extra k-by-k temporary.
+    sla.blas.dger(-1./denom, product, product, a=metric, overwrite_a=1)
+    sla.blas.dger(1./target, change, change, a=metric, overwrite_a=1)
+    return product, denom, target
+
+
+def expand_bfgs_metric(metric, cross, block, pairs, old_indices, new_indices):
+    """Extend only new rows/columns; the old block already has all updates.
+
+    Stored products are B_i s_i, before update i. New coordinates have s_i=0,
+    so their product is cross_i.T @ s_i. Induction gives the same expanded
+    BFGS matrix without replaying the old-by-old rank updates.
+    """
+    cross = np.asfortranarray(cross)
+    block = np.asfortranarray((block+block.T)*.5)
+    for pair in pairs:
+        step = pair['step']
+        new_product = cross[:len(step), :].T@step
+        old_product = pair['product']
+        old_change = pair['change'][old_indices]
+        new_change = pair['change'][new_indices]
+        for scale, left, right in [(-1/pair['denominator'], old_product, new_product),
+                                   (1/pair['target'], old_change, new_change)]:
+            sla.blas.dger(scale, left, right, a=cross, overwrite_a=1)
+        sla.blas.dger(-1/pair['denominator'], new_product, new_product, a=block, overwrite_a=1)
+        sla.blas.dger(1/pair['target'], new_change, new_change, a=block, overwrite_a=1)
+        pair['product'] = np.concatenate([old_product, new_product])
+    return np.asfortranarray(np.block([[metric, cross], [cross.T, block]]))
+
+
+def extrapolate(beta, score, indices, previous_beta, previous_score,
+                lam, old_lam, previous_lam, error_bound, previous_error_bound):
+    """Return a descending predictor and its conservative score-error bound.
+
+    ``beta`` and ``previous_beta`` use the same append-only working-set order;
+    the older vector may be shorter. ``score`` covers EVERY variant.
+    """
+    delta = float(old_lam-previous_lam)
+    if delta >= 0 or lam >= old_lam:
+        raise ValueError('Continuation needs three strictly decreasing lambdas')
+    ratio = float((lam-old_lam)/delta)
+    previous_beta = np.pad(previous_beta, (0, len(beta)-len(previous_beta)))
+    direction = beta-previous_beta
+    score_direction = score-previous_score
+    proposal = beta+ratio*direction
+    curvature = -float(direction@score_direction[indices])
+    change = (-ratio*float(score[indices]@direction)
+              + .5*ratio**2*curvature
+              + lam*float(np.abs(proposal).sum()-np.abs(beta).sum()))
+    # Account for inexact covariance solves in BOTH the slope and curvature.
+    uncertainty = (ratio*error_bound*np.abs(direction).sum()
+                   + .5*ratio**2*(error_bound+previous_error_bound)
+                   * np.abs(direction).sum())
+    accept = bool(np.isfinite(change) and change+uncertainty < 0.)
+    return dict(accepted=accept, ratio=ratio, beta=proposal,
+                score=score+ratio*score_direction,
+                objective_change=change, objective_uncertainty=uncertainty,
+                error_bound=(1.+ratio)*error_bound+ratio*previous_error_bound)
+
+
+
+def affine_gradient_roundoff(beta0, beta1, score0, score1, weight0, weight1, gram_bound):
+    """FP64 affine-update allowance using |(Z' P_C Z)_ij| <= gram_bound.
+
+    Solve-error bounds are propagated separately. Eight rounding units cover
+    the short affine expressions, including a subtract-then-add evaluation.
+    The allowance affects certification only, never the fitted objective.
+    """
+    eps = np.finfo(np.float64).eps
+    def l1_upper(value):
+        size = np.size(value)
+        total = float(np.sum(np.abs(value)))
+        return np.nextafter(total/(1.-size*eps), np.inf)
+    alpha_scale = abs(weight0)*l1_upper(beta0)+abs(weight1)*l1_upper(beta1)
+    score_scale = (abs(weight0)*float(np.max(np.abs(score0)))
+                   +abs(weight1)*float(np.max(np.abs(score1))))
+    return float((8.*eps/(1.-8.*eps))*(gram_bound*alpha_scale+score_scale))
+
+
+def check_certificate(score, indices, beta, lam, tolerance, error_bound):
+    active = np.flatnonzero(beta != 0.)
+    selected = indices[active]
+    outside = np.abs(score).copy()
+    outside[selected] = 0.
+    active_error = (float(np.max(np.abs(score[selected]-lam*np.sign(beta[active]))))
+                    if len(active) else 0.)
+    inactive_error = max(0., float(np.max(outside))-lam)
+    observed = max(active_error, inactive_error)
+    certified = bool(observed+error_bound <= tolerance)
+    # If the computed KKT already passes, changing beta is the wrong action
+    # while its score uncertainty prevents certification. Refine the score.
+    refine = bool(observed <= tolerance and not certified)
+    budget = None
+    if refine:
+        margin = tolerance-observed
+        budget = .25*min(error_bound, margin) if margin > 0 else .25*error_bound
+    return dict(active_error=active_error, inactive_error=inactive_error,
+        observed=observed, upper_bound=observed+error_bound,
+        certified=certified, refine_score=refine, next_error_budget=budget)
+
+
+class ProfiledInverseMetric:
+    """M_C = M - MC(C'MC)^-1 C'M, M = d^-1 I + U E U'.
+
+    All quantities are proposal geometry only. Acceptance and convergence must
+    still use the exact weighted-Lasso loss and its full-marker KKT conditions.
+    """
+    def __init__(self, inverse_diagonal, inverse_core, covar_gram, u_covar):
+        self.dinv = float(inverse_diagonal)
+        self.e = np.asarray(inverse_core, dtype=np.float64)
+        self.uc = np.asarray(u_covar, dtype=np.float64)
+        self.ec = self.e @ self.uc
+        cc = self.dinv*np.asarray(covar_gram) + self.uc.T@self.ec
+        self.chol = sla.cho_factor((cc+cc.T)*.5, lower=True, check_finite=False)
+
+    def covar_features(self, covar_z, u_z):
+        return self.dinv*np.asarray(covar_z) + self.ec.T@u_z
+
+    def block(self, gram, u_left, u_right, c_left, c_right):
+        return (self.dinv*np.asarray(gram) + u_left.T@(self.e@u_right)
+                - c_left.T@sla.cho_solve(self.chol, c_right, check_finite=False))
+
+
+def _matmul(a, b, *, transpose_a=False, workspace_limit=0):
+    if workspace_limit > 0 and next(iter(a.devices())).platform == 'gpu':
+        return sparse_fp64.matmul(a, b, transpose_a=transpose_a,
+            workspace_limit=workspace_limit)
+    return (a.T if transpose_a else a)@b
+
+
+def fit_weighted_residual_path(*, fitter, grm_index, hv, precond, theta, y,
+        covar, lam_max, path_cfg, pcg_tol, max_pcg_iters, pcg_ridge,
+        marker_batch, max_iterations, workspace_bytes, validation_evaluator,
+        stopping_rule, use_preconditioned_metric=True):
+    """Fit a validation path without inverse-covariance candidate columns.
+
+    ``stopping_rule`` and ``validation_evaluator`` are supplied by the supported
+    sparse pipeline. They retain the original metric, grid and selection rule.
+    The returned inverse-design cache is empty by design; selected-span
+    information is computed separately after validation has selected a model.
+    """
+    with jax.experimental.enable_x64():
+        return _fit_path(fitter=fitter, grm_index=grm_index, hv=hv,
+            precond=precond, theta=theta, y=y, covar=covar, lam_max=lam_max,
+            path_cfg=path_cfg, pcg_tol=pcg_tol, max_pcg_iters=max_pcg_iters,
+            pcg_ridge=pcg_ridge, marker_batch=marker_batch,
+            max_iterations=max_iterations, workspace_bytes=workspace_bytes,
+            validation_evaluator=validation_evaluator, stopping_rule=stopping_rule,
+            use_preconditioned_metric=use_preconditioned_metric)
+
+
+def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
+        path_cfg, pcg_tol, max_pcg_iters, pcg_ridge, marker_batch,
+        max_iterations, workspace_bytes, validation_evaluator, stopping_rule,
+        use_preconditioned_metric):
+    started = time.perf_counter()
+    n = np.asarray(y).size
+    if len(fitter.streamers) != 1 or path_cfg.fixed_lam_ratio is not None:
+        raise ValueError('Residual validation path requires one packed source and a full grid')
+    if not np.isfinite(lam_max) or lam_max <= 0:
+        raise ValueError('Residual validation path requires a positive lambda maximum')
+    theta = jnp.asarray(theta, dtype=jnp.float32)
+    sigma = float(theta[-1])
+    if sigma <= 0 or not np.all(np.asarray(theta[:-1]) >= 0):
+        raise ValueError('Covariance must have a positive residual component')
+    yj = jnp.asarray(np.asarray(y).reshape(-1, 1), dtype=jnp.float64)
+    c = (np.empty((n, 0)) if covar is None else np.asarray(covar, dtype=np.float64))
+    qc_host, rc = sla.qr(c, mode='economic', check_finite=False)
+    if np.any(np.abs(np.diag(rc)) <= np.finfo(float).eps*np.linalg.norm(c)):
+        raise ValueError('Covariates must have full column rank')
+    qc = jnp.asarray(qc_host)
+    qc32 = qc.astype(jnp.float32)
+    hqc = hv(qc).block_until_ready() if c.shape[1] else qc
+    stream = fitter.streamers[0]
+    # Training columns use their empirical standard deviations. The rounding
+    # allowance covers their stored FP32 means/scales; target KKT is unchanged.
+    column_norm_bound = np.sqrt(n)*(1+8*np.finfo(np.float32).eps)
+
+    def project(value):
+        q = qc32 if value.dtype == jnp.float32 else qc
+        return value-q@(q.T@value)
+
+    def projected_hv(value):
+        w = project(value)
+        return project(hv(w))+(value-w)
+
+    def projected_pre(value):
+        w = project(value)
+        return project(precond(w) if precond is not None else w)+(value-w)
+
+    geometry = None
+    if use_preconditioned_metric and fitter.precond_conf is not None:
+        d = scalar_diag_from_precond_conf(fitter.precond_conf, theta[:-1], theta[-1])
+        runtime = build_projected_core_runtime(fitter.precond_conf, theta[:-1], d, eps=pcg_ridge)
+        if runtime is not None:
+            u_basis = runtime.U.astype(jnp.float64)
+            u_cov = np.asarray(_matmul(u_basis, jnp.asarray(c),
+                transpose_a=True, workspace_limit=workspace_bytes))
+            e = sla.cho_solve((np.asarray(runtime.chol, dtype=np.float64), True),
+                np.eye(runtime.total_rank))-float(runtime.d_inv)*np.eye(runtime.total_rank)
+            geometry = ProfiledInverseMetric(float(runtime.d_inv), e, c.T@c, u_cov)
+            u_features = np.empty((runtime.total_rank, 0))
+            c_features = np.empty((c.shape[1], 0))
+    indices = np.empty(0, dtype=np.int64)
+    beta = np.empty(0)
+    blocks = []
+    host_blocks = []
+    block_of_marker = np.full(int(grm_index.m_total), -1, dtype=np.int32)
+    column_of_marker = np.zeros(int(grm_index.m_total), dtype=np.int32)
+
+    def cached_design(markers):
+        # Working-set columns have already been decoded. Reuse their FP32
+        # host copies for validation and the returned design, avoiding another
+        # packed-genotype scan for every lambda and again at return.
+        result = np.empty((n, len(markers)), dtype=np.float32, order='F')
+        for output_column, marker in enumerate(markers):
+            block_id = int(block_of_marker[marker])
+            if block_id < 0:
+                raise RuntimeError('Requested marker is absent from the Lasso design cache')
+            result[:, output_column] = host_blocks[block_id][:, column_of_marker[marker]]
+        return result
+    metric = np.empty((0, 0))
+    pairs = []
+    rows, solutions, gammas, metrics, trace = [], [], [], [], []
+    counters = dict(gradient_calls=0, residual_solve_seconds=0., metric_seconds=0.,
+        subproblem_seconds=0., validation_seconds=0., max_pcg_residual=0.,
+        fitted_seconds=0., covariance_solve_seconds=0., score_seconds=0.,
+        gradient_events=[], certificate_reuses=0,
+        max_pcg_iterations=0, validation_pcg_residual=0., validation_pcg_iterations=0)
+    lambdas = make_lambda_sequence(lam_max, path_cfg.lam_min_ratio, path_cfg.n_lambda)
+    lam = float(lambdas[0])
+
+    def tolerance_at(value):
+        return max(path_cfg.kkt_abs_tol, path_cfg.kkt_rel_tol*max(1., value))
+
+    def fitted(coef):
+        value = jnp.zeros((n, 1), dtype=jnp.float64)
+        start = 0
+        for block in blocks:
+            end = start+block.shape[1]
+            value = value+block@jnp.asarray(coef[start:end, None])
+            start = end
+        return value
+
+    recycling = RecycledInverse(n, workspace_bytes=workspace_bytes,
+        memory_limit=getattr(getattr(fitter, "cfg", None), "gpu_budget_bytes", None))
+
+    def evaluate(coef, warm, error_budget=None, reason="proposal"):
+        tick = time.perf_counter()
+        residual = yj-fitted(coef)
+        rhs = project(residual)
+        initial = projected_pre(rhs) if warm is None else warm
+        rhs.block_until_ready()
+        fitted_seconds = time.perf_counter()-tick
+        solve_started = time.perf_counter()
+        bound_scale = column_norm_bound*float(jnp.linalg.norm(rhs))/min(sigma, 1.)
+        budget = .1*tolerance_at(lam) if error_budget is None else float(error_budget)
+        if not np.isfinite(budget) or budget <= 0:
+            raise ValueError('Score-error budget must be positive and finite')
+        requested = min(float(pcg_tol), budget/max(bound_scale, 1.))
+        solved, error, count = solve_adaptive_pcg(projected_hv, rhs,
+            M=projected_pre, tol=requested, maxiter=max_pcg_iters, X0=initial, recycle=recycling)
+        if error > requested:
+            raise RuntimeError('Lasso residual solve failed its requested accuracy')
+        dual = project(solved)
+        dual.block_until_ready()
+        solve_seconds = time.perf_counter()-solve_started
+        score_started = time.perf_counter()
+        score = np.array(stream.xtv(dual, normalize=False), copy=True).reshape(-1)
+        score_seconds = time.perf_counter()-score_started
+        seconds = time.perf_counter()-tick
+        event = dict(reason=reason, lam=float(lam), support=int(np.count_nonzero(coef)),
+            workset=len(coef), fitted_seconds=fitted_seconds, covariance_solve_seconds=solve_seconds,
+            score_seconds=score_seconds,
+            requested_tolerance=float(requested), true_residual=float(error), pcg_iterations=int(count))
+        counters['gradient_events'].append(event)
+        logger.debug('[residual Lasso solve] %s', json.dumps(event))
+        for key in ['fitted_seconds','covariance_solve_seconds','score_seconds']:
+            counters[key] += event[key]
+        counters['gradient_calls'] += 1
+        counters['residual_solve_seconds'] += seconds
+        counters['max_pcg_residual'] = max(counters['max_pcg_residual'], float(error))
+        counters['max_pcg_iterations'] = max(counters['max_pcg_iterations'], int(count))
+        return score, dual, dict(seconds=seconds, residual=float(error),
+            iterations=int(count), gradient_error_bound=bound_scale*float(error))
+
+    gradient, warm, diagnostic = evaluate(beta, None, reason="initial")
+    previous_lam = lam
+    previous_state = None
+    for path_index, lam_value in enumerate(lambdas):
+        lam = float(lam_value)
+        tolerance = tolerance_at(lam)
+        old_state = dict(beta=beta.copy(), score=gradient.copy(), warm=warm,
+            lam=previous_lam, bound=diagnostic['gradient_error_bound'])
+        if previous_state is not None:
+            guess = extrapolate(beta, gradient, indices,
+                previous_state['beta'], previous_state['score'], lam, previous_lam,
+                previous_state['lam'], diagnostic['gradient_error_bound'], previous_state['bound'])
+            if guess['accepted']:
+                guess['error_bound'] += affine_gradient_roundoff(
+                    beta, previous_state['beta'], gradient, previous_state['score'],
+                    1.+guess['ratio'], -guess['ratio'], column_norm_bound**2/sigma)
+                beta, gradient = guess['beta'], guess['score']
+                warm = warm+guess['ratio']*(warm-previous_state['warm'])
+                diagnostic = dict(diagnostic, gradient_error_bound=guess['error_bound'])
+        for iteration in range(max_iterations+1):
+            check = check_certificate(gradient, indices, beta, lam, tolerance,
+                diagnostic['gradient_error_bound'])
+            trace.append(dict(path_index=path_index, iteration=iteration,
+                workset=len(indices), selected=int(np.count_nonzero(beta)),
+                kkt_upper_bound=check['upper_bound'], kkt_tolerance=tolerance,
+                elapsed_seconds=time.perf_counter()-started))
+            if check['refine_score']:
+                gradient, warm, diagnostic = evaluate(beta, warm,
+                    error_budget=check['next_error_budget'], reason='refine_certificate')
+                continue
+            if check['certified']:
+                # The full-marker score and its propagated error already
+                # certify the current coefficients. Validation independently
+                # verifies the associated dual residual before prediction.
+                counters['certificate_reuses'] += 1
+                break
+            if iteration == max_iterations:
+                raise RuntimeError(f'Residual Lasso failed KKT at path index {path_index}')
+            outside = np.abs(gradient).copy()
+            outside[indices] = -np.inf
+            eligible = np.flatnonzero(outside > lam+max(0., tolerance-diagnostic['gradient_error_bound']))
+            batch = (2 if not len(indices) else 1)*max(1, int(marker_batch))
+            fresh = eligible[np.argsort(-outside[eligible], kind='stable')[:batch]]
+            if len(fresh):
+                tick = time.perf_counter()
+                stats = next(iter(yj.devices())).memory_stats()
+                if stats is not None:
+                    # Leave the requested GEMM workspace and a second block
+                    # for conversion/validation. This is a capacity check, not
+                    # a statistical restriction on the number of candidates.
+                    scratch = (workspace_bytes if workspace_bytes > 0 else
+                        16*n*int(getattr(stream, 'call_width', 0)))
+                    need = int(stats['bytes_in_use'])+16*n*len(fresh)+scratch
+                    capacity = int(stats['bytes_limit'])
+                    configured = getattr(getattr(fitter, 'cfg', None), 'gpu_budget_bytes', None)
+                    if configured is not None and configured > 0:
+                        capacity = min(capacity, int(configured))
+                    if need > capacity:
+                        raise MemoryError('Residual Lasso working set exceeds device headroom')
+                host_new = grm_index.extract_standardized_columns(fresh)
+                new = jnp.asarray(host_new, dtype=jnp.float64)
+                cross = np.concatenate([np.asarray(_matmul(old, new,
+                    transpose_a=True, workspace_limit=workspace_bytes)) for old in blocks],
+                    axis=0) if blocks else np.empty((0, len(fresh)))
+                block = np.asarray(_matmul(new, new, transpose_a=True,
+                    workspace_limit=workspace_bytes))
+                if geometry is not None:
+                    uz = np.asarray(_matmul(u_basis, new,
+                        transpose_a=True, workspace_limit=workspace_bytes))
+                    cz = geometry.covar_features(np.asarray(jnp.asarray(c).T@new), uz)
+                    cross = geometry.block(cross, u_features, uz, c_features, cz)
+                    block = geometry.block(block, uz, uz, cz, cz)
+                    u_features = np.concatenate([u_features, uz], axis=1)
+                    c_features = np.concatenate([c_features, cz], axis=1)
+                else:
+                    cross, block = cross/sigma, block/sigma
+                metric = expand_bfgs_metric(metric, cross, block, pairs, indices, fresh)
+                block_of_marker[fresh] = len(host_blocks)
+                column_of_marker[fresh] = np.arange(len(fresh), dtype=np.int32)
+                host_blocks.append(host_new)
+                blocks.append(new)
+                indices = np.concatenate([indices, fresh])
+                beta = np.pad(beta, (0, len(fresh)))
+                counters['metric_seconds'] += time.perf_counter()-tick
+            tick = time.perf_counter()
+            proposal, _, _, passed = solve_lasso_cd_gram(metric,
+                metric@beta+gradient[indices], lam, beta0=beta,
+                max_iter=path_cfg.max_cd_iter, tol=min(path_cfg.cd_tol, 1e-8),
+                kkt_abs_tol=.1*path_cfg.kkt_abs_tol,
+                kkt_rel_tol=.1*path_cfg.kkt_rel_tol)
+            if not passed:
+                raise RuntimeError('Residual Lasso quadratic subproblem failed KKT')
+            counters['subproblem_seconds'] += time.perf_counter()-tick
+            proposed_gradient, proposed_warm, proposed_diag = evaluate(proposal, warm)
+            direction = proposal-beta
+            change = gradient-proposed_gradient
+            for _ in range(8):
+                step_size = quadratic_l1_step(beta, direction, gradient[indices],
+                    direction@change[indices], lam)
+                delta = (-step_size*gradient[indices]@direction
+                    +.5*step_size**2*(direction@change[indices])
+                    +lam*(np.abs(beta+step_size*direction).sum()-np.abs(beta).sum()))
+                uncertainty = np.abs(direction).sum()*(step_size*diagnostic['gradient_error_bound']
+                    +.5*step_size**2*(diagnostic['gradient_error_bound']+proposed_diag['gradient_error_bound']))
+                if step_size > 0 and delta+uncertainty < 0:
+                    break
+                accuracy = .1*min(diagnostic['gradient_error_bound'], proposed_diag['gradient_error_bound'])
+                gradient, warm, diagnostic = evaluate(beta, warm, error_budget=accuracy, reason="line_search_current")
+                proposed_gradient, proposed_warm, proposed_diag = evaluate(
+                    proposal, proposed_warm, error_budget=accuracy, reason="line_search_proposal")
+                change = gradient-proposed_gradient
+            else:
+                raise RuntimeError('Residual Lasso line search cannot certify descent')
+            step = step_size*direction
+            rounding_bound = 0.
+            if step_size == 1.:
+                beta, gradient, warm = proposal, proposed_gradient, proposed_warm
+            else:
+                rounding_bound = affine_gradient_roundoff(
+                    beta, proposal, gradient, proposed_gradient,
+                    1.-step_size, step_size, column_norm_bound**2/sigma)
+                beta = (1.-step_size)*beta+step_size*proposal
+                gradient = (1.-step_size)*gradient+step_size*proposed_gradient
+                warm = (1.-step_size)*warm+step_size*proposed_warm
+            update = bfgs_update(metric, step, step_size*change[indices])
+            if update is not None:
+                pairs.append(dict(step=step.copy(), change=step_size*change.copy(),
+                    product=update[0], denominator=update[1], target=update[2]))
+            diagnostic = dict(proposed_diag, gradient_error_bound=(1-step_size)*diagnostic['gradient_error_bound']
+                +step_size*proposed_diag['gradient_error_bound']+rounding_bound)
+        else:
+            # Refining an uncertain score also consumes the iteration budget.
+            # In particular, the last refinement must not fall through and
+            # label an unchecked path point as converged.
+            raise RuntimeError(f'Residual Lasso failed KKT at path index {path_index}')
+        active = np.flatnonzero(beta != 0.)
+        selected = indices[active]
+        gamma = sla.solve_triangular(rc, np.asarray(qc.T@(yj-fitted(beta))-hqc.T@warm),
+            check_finite=False).reshape(-1) if c.shape[1] else np.empty(0)
+        row = dict(path_index=path_index, k=len(active), lam=lam, lam_ratio=lam/lam_max,
+            converged=True, kkt_passed=True, global_kkt_passed=True,
+            kkt_tolerance=tolerance, max_active_kkt_error=check['active_error'],
+            max_inactive_kkt_excess=check['inactive_error'],
+            global_kkt_max_outside_score=lam+check['inactive_error'],
+            score_error_bound=diagnostic['gradient_error_bound'], iterations=iteration)
+        tick = time.perf_counter()
+        evaluated = validation_evaluator(candidate=selected,
+            train_candidate=cached_design(selected),
+            beta_cov_path=gamma[None, :], beta_snp_path=beta[active][None, :],
+            hinv_residual_path=np.asarray(warm), training_score_path=gradient[:, None])
+        counters['validation_seconds'] += time.perf_counter()-tick
+        counters['validation_pcg_residual'] = max(counters['validation_pcg_residual'], evaluated['pcg_rel_res'])
+        counters['validation_pcg_iterations'] = max(counters['validation_pcg_iterations'], evaluated['pcg_iters'])
+        rows.append(row)
+        solutions.append((selected.copy(), beta[active].copy()))
+        gammas.append(gamma)
+        metrics.append(dict(evaluated['metrics'][0], path_index=path_index))
+        stopping = stopping_rule(metrics)
+        logger.info('[residual Lasso] point=%s/%s support=%s KKT=%.3g/%.3g validation=%.8f time=%.1fs',
+            path_index+1, len(lambdas), len(active), check['upper_bound'], tolerance,
+            metrics[-1]['predictive_r2'], time.perf_counter()-started)
+        if stopping['stopped']:
+            break
+        if path_index >= 1:
+            previous_state = old_state
+        previous_lam = lam
+    final_candidate = np.unique(np.concatenate([item[0] for item in solutions]))
+    beta_path = np.zeros((len(rows), len(final_candidate)))
+    for i, (markers, coefficients) in enumerate(solutions):
+        beta_path[i, np.searchsorted(final_candidate, markers)] = coefficients
+    counters['recycling_rank'] = recycling.rank
+    counters['recycling_dependent'] = recycling.dependent
+    counters['recycling_memory_skips'] = recycling.memory_skips
+    counters['total_seconds'] = time.perf_counter()-started
+    metadata = dict(algorithm='residual_proximal_quasi_newton_global_kkt', n_iterations=len(trace),
+        base_marker_batch_size=marker_batch, lambda_block_size=1,
+        ever_active_size=len(final_candidate), path_solve_seconds=counters['total_seconds']-counters['validation_seconds'],
+        global_kkt_seconds=0., validation_seconds=counters['validation_seconds'],
+        validation_trace=metrics, trace=trace, performance=counters)
+    # Device blocks/curvature are local to this call and released before REML.
+    return dict(lasso_path=dict(path=rows, beta_snp_path=beta_path,
+        beta_cov_path=np.asarray(gammas), lam_max=lam_max, selected_index=None,
+        selection_method=None, selected_lam_ratio=None,
+        path_role='kkt_certified_validation_prefix_residual_lasso',
+        requested_n_lambda=len(lambdas), evaluated_n_lambda=len(rows),
+        validation_metrics=metrics, validation_early_stopping=stopping,
+        external_beta_path_warm_start_used=False, external_beta_path_warm_start_rows_used=0,
+        basil=metadata), candidate=final_candidate,
+        geno=cached_design(final_candidate), hinv_geno=None,
+        hinv_z_dict={}, kkt_trace=trace,
+        candidate_pcg=dict(n_columns=0, n_batches=0, batch_size=0,
+            max_true_relative_residual=counters['max_pcg_residual'],
+            max_reported_relative_residual=counters['max_pcg_residual'],
+            max_iterations=counters['max_pcg_iterations'], total_batch_iterations=0),
+        global_kkt=dict(passed=True, n_path_points=len(rows), n_violating_path_points=0,
+            n_union_violators=0, max_outside_excess_over_threshold=0.,
+            score_backend='residual_pcg_full_marker_xtv'),
+        validation=dict(metrics=metrics, pcg_max_rel_res=counters['validation_pcg_residual'],
+            pcg_max_iters=counters['validation_pcg_iterations'], seconds=counters['validation_seconds'],
+            early_stopping=stopping, trace=metrics))

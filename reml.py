@@ -722,7 +722,20 @@ def _eval_once_impl(
         from .sparse_information import solve_sparse_pcg
         solve_pcg = solve_sparse_pcg
 
+    # Sparse variance updates frequently hit exact component boundaries. Keep
+    # the fused weighted operator when all groups contribute; otherwise scan
+    # only nonzero groups, through their existing range-aware operators. Keep
+    # every component in scores/AI: a zero variance still has a derivative.
+    # Ordinary REML retains its existing operator and execution order.
+    sparse_active = None
+    if ctx.mean_information is not None:
+        active = np.flatnonzero(np.asarray(theta_g) != 0.)
+        if active.size < ctx.G:
+            sparse_active = (tuple(ctx.K_mvs[i] for i in active), theta_g[active])
+
     def Hv(V: Array) -> Array:
+        if sparse_active is not None:
+            return _hv_apply(*sparse_active, theta_e, V, ctx.residual_diag_stack)
         if ctx.weighted_hv is not None:
             theta_e_arg = theta_e[0] if ctx.E == 1 else theta_e
             return ctx.weighted_hv(theta_g, theta_e_arg, V)
@@ -758,64 +771,108 @@ def _eval_once_impl(
     else:
         M_cur = make_precond(ctx.precond_conf, theta_g, diag_H, eps=precond_eps)
 
-    rhs_all = ctx.rhs_const
+    contrast_project = (None if ctx.mean_information is None else
+                        getattr(ctx.mean_information, "covariate_project", None))
+    solve_hv, solve_precond = Hv, M_cur
+    if contrast_project is not None:
+        if ctx.R_rand or taylor_logdet is not None:
+            raise ValueError("Covariate-contrast REML requires strict SLQ without trace probes")
 
-    # Use Python flag — avoids GPU→CPU sync that jnp.isfinite() would cause.
-    if warm_ready:
-        # Let PCG test and, when necessary, improve the accepted-state warm
-        # solution itself.  An unconditional Richardson correction here made
-        # repeated evaluations at the same parameter return different
-        # approximate likelihoods even when PCG reported zero iterations.
-        X0_all = warm_all
-    elif M_cur is not None:
-        X0_all = M_cur(rhs_all)
-    else:
-        X0_all = jnp.zeros_like(rhs_all)
+        def projected_hv(value):
+            projected = contrast_project(value)
+            return contrast_project(Hv(projected)) + (value-projected)
 
-    # ---- PCG: Python while loop, Hv per iteration in Python scope ----------
-    sol_all, main_rel_res, k_pcg = solve_pcg(
-        Hv, rhs_all, M=M_cur, tol=minq_tol, maxiter=maxiter, X0=X0_all,
-    )
-    del X0_all
-    main_rel_res_host = float(jax.device_get(main_rel_res))
-    if (not math.isfinite(main_rel_res_host)) or main_rel_res_host > minq_tol * 1.05:
-        raise FloatingPointError(
-            "Main REML PCG did not converge: "
-            f"relative residual={main_rel_res_host:.3e}, tolerance={minq_tol:.3e}, "
-            f"iterations={int(k_pcg)}/{int(maxiter)}."
+        solve_hv = projected_hv
+        if M_cur is not None:
+            def projected_precond(value):
+                projected = contrast_project(value)
+                return contrast_project(M_cur(projected)) + (value-projected)
+            solve_precond = projected_precond
+        rhs_all = contrast_project(ctx.y[:, None].astype(jnp.float64))
+        if warm_ready and warm_all.shape == rhs_all.shape:
+            initial = warm_all
+        elif solve_precond is not None:
+            initial = solve_precond(rhs_all)
+        else:
+            initial = jnp.zeros_like(rhs_all)
+        sol_all, main_rel_res, k_pcg = solve_pcg(
+            solve_hv, rhs_all, M=solve_precond, tol=minq_tol,
+            maxiter=maxiter, X0=initial,
         )
-    warm_all_next = sol_all
-
-    # ---- Projection (pure XLA) ---------------------------------------------
-    HinvXyZ = sol_all[:, :ctx.n_XyZ_cols]
-    if ctx.xmat is not None and ctx.xmat.shape[1] > 0:
-        x_cols = ctx.xmat.shape[1]
-        HinvX   = HinvXyZ[:, :x_cols]
-        XtHinvX = ctx.xmat.T @ HinvX
-        chol    = _stable_cho_factor_spd(XtHinvX)
-
-        def proj(mat):
-            mid = jsp.linalg.cho_solve(chol, ctx.xmat.T @ mat, check_finite=False)
-            return mat - HinvX @ mid
+        main_rel_res_host = float(main_rel_res)
+        if not math.isfinite(main_rel_res_host) or main_rel_res_host > minq_tol*1.05:
+            raise FloatingPointError(
+                "Projected main REML PCG did not converge: "
+                f"relative residual={main_rel_res_host:.3e}, tolerance={minq_tol:.3e}, "
+                f"iterations={int(k_pcg)}/{int(maxiter)}."
+            )
+        warm_all_next = sol_all
+        proj = contrast_project
+        Py = proj(sol_all)
+        PYstar = Py
+        yPy = jnp.dot(ctx.y, Py[:, 0])
+        logdet_x = jnp.asarray(0., dtype=pvec.dtype)
     else:
-        proj = lambda mat: mat
+        rhs_all = ctx.rhs_const
 
-    PYstar = proj(HinvXyZ[:, ctx.y_col : ctx.rand_stop])
+        # Use Python flag — avoids GPU→CPU sync that jnp.isfinite() would cause.
+        if warm_ready:
+            # Let PCG test and, when necessary, improve the accepted-state warm
+            # solution itself.  An unconditional Richardson correction here made
+            # repeated evaluations at the same parameter return different
+            # approximate likelihoods even when PCG reported zero iterations.
+            X0_all = warm_all
+        elif M_cur is not None:
+            X0_all = M_cur(rhs_all)
+        else:
+            X0_all = jnp.zeros_like(rhs_all)
 
-    Py = PYstar[:, :1]
-    yPy = jnp.dot(ctx.y, PYstar[:, 0])
+        # ---- PCG: Python while loop, Hv per iteration in Python scope ----------
+        sol_all, main_rel_res, k_pcg = solve_pcg(
+            Hv, rhs_all, M=M_cur, tol=minq_tol, maxiter=maxiter, X0=X0_all,
+        )
+        del X0_all
+        main_rel_res_host = float(jax.device_get(main_rel_res))
+        if (not math.isfinite(main_rel_res_host)) or main_rel_res_host > minq_tol * 1.05:
+            raise FloatingPointError(
+                "Main REML PCG did not converge: "
+                f"relative residual={main_rel_res_host:.3e}, tolerance={minq_tol:.3e}, "
+                f"iterations={int(k_pcg)}/{int(maxiter)}."
+            )
+        warm_all_next = sol_all
 
-    if ctx.xmat is not None and ctx.xmat.shape[1] > 0:
-        logdet_x = 2.0 * jnp.sum(jnp.log(jnp.clip(jnp.diag(chol[0]), 1e-30)))
-    else:
-        logdet_x = jnp.array(0.0, dtype=pvec.dtype)
+        # ---- Projection (pure XLA) ---------------------------------------------
+        HinvXyZ = sol_all[:, :ctx.n_XyZ_cols]
+        if ctx.xmat is not None and ctx.xmat.shape[1] > 0:
+            x_cols = ctx.xmat.shape[1]
+            HinvX   = HinvXyZ[:, :x_cols]
+            XtHinvX = ctx.xmat.T @ HinvX
+            chol    = _stable_cho_factor_spd(XtHinvX)
+
+            def proj(mat):
+                mid = jsp.linalg.cho_solve(chol, ctx.xmat.T @ mat, check_finite=False)
+                return mat - HinvX @ mid
+        else:
+            proj = lambda mat: mat
+
+        PYstar = proj(HinvXyZ[:, ctx.y_col : ctx.rand_stop])
+
+        Py = PYstar[:, :1]
+        yPy = jnp.dot(ctx.y, PYstar[:, 0])
+
+        if ctx.xmat is not None and ctx.xmat.shape[1] > 0:
+            logdet_x = 2.0 * jnp.sum(jnp.log(jnp.clip(jnp.diag(chol[0]), 1e-30)))
+        else:
+            logdet_x = jnp.array(0.0, dtype=pvec.dtype)
 
     # The sparse mean is still an offset: the quadratic uses P_C, not
     # P_[C,Z]. Its information determinant is needed even on rejected trials,
     # but its score correction can wait until the likelihood is accepted.
     mean_state = None
     mean_logdet = 0.0
-    if ctx.mean_information is not None:
+    joint_information = (None if ctx.mean_information is None else
+                         getattr(ctx.mean_information, "joint_logdet_and_score", None))
+    if ctx.mean_information is not None and joint_information is None:
         mean_state = ctx.mean_information.evaluate(
             pvec, Hv, M_cur,
             HinvX if ctx.xmat is not None and ctx.xmat.shape[1] else None,
@@ -830,6 +887,14 @@ def _eval_once_impl(
     # ---- SLQ logdet — Python loop, Hv in Python scope ----------------------
     if taylor_logdet is not None:
         logdet = taylor_logdet
+    elif joint_information is not None:
+        combined, trace_pg_sel = joint_information(
+            ctx, Hv, pvec, key_slq, nsamples=slq_samples, m=slq_m,
+            accept_logdet=(None if min_loglik is None else
+                           lambda value: bool((-0.5*(yPy+value)/scale) >= min_loglik)),
+        )
+        # loglik adds logdet_x; the joint value already contains it.
+        logdet = combined-logdet_x
     elif ctx.affine_slq_cache is not None:
         logdet, trace_pg_sel = _affine_slq_logdet(
             ctx.affine_slq_cache,
@@ -865,6 +930,10 @@ def _eval_once_impl(
         trace_pg_sel = _compute_score_traces(
             ctx, PYstar[:, 1:], ctx.rhs_const[:, ctx.y_col + 1 : ctx.rand_stop],
         )
+    elif joint_information is not None:
+        # This derivative already includes BOTH nuisance and selected-mean
+        # determinant corrections. Keep P_C in the quadratic and AI below.
+        pass
     elif ctx.affine_slq_cache is not None:
         # Make the score the derivative of the same fixed-probe affine-SLQ
         # restricted likelihood used by the strict line search.  For
@@ -912,15 +981,16 @@ def _eval_once_impl(
     fisher_stats.free_dim = int(ctx.G + ctx.E)
     fisher_stats.frozen_genetic = 0
     GPy_cols = jnp.swapaxes(GPy_stack[:, :, 0], 0, 1)  # (n, G+E)
+    ai_rhs = GPy_cols if contrast_project is None else contrast_project(GPy_cols)
     if warm_ai_ready and warm_ai is not None and warm_ai.shape[1] == ctx.G + ctx.E:
         X0_ai = warm_ai
-    elif M_cur is not None:
-        X0_ai = M_cur(GPy_cols)
+    elif solve_precond is not None:
+        X0_ai = solve_precond(ai_rhs)
     else:
-        X0_ai = jnp.zeros_like(GPy_cols)
+        X0_ai = jnp.zeros_like(ai_rhs)
     ai_t0 = time.perf_counter()
     HinvGPy, ai_rel_res, k_ai = solve_pcg(
-        Hv, GPy_cols, M=M_cur, tol=minq_tol, maxiter=maxiter, X0=X0_ai,
+        solve_hv, ai_rhs, M=solve_precond, tol=minq_tol, maxiter=maxiter, X0=X0_ai,
     )
     del X0_ai
     ai_rel_res_host = float(jax.device_get(ai_rel_res))
@@ -1533,8 +1603,10 @@ def fit_reml(
     if full_log and use_trace_probes:
         logger.info("[REML] K_i @ Vrand done elapsed=%.1fs", time.time() - _t_kv_cache)
 
+    projected_information = callable(getattr(mean_information, "joint_logdet_and_score", None))
     affine_slq_cache = probe_cache.affine_slq if cache_hit else None
-    if G == 1 and E == 1 and residual_diag_stack is None and affine_slq_cache is None:
+    if (not projected_information and G == 1 and E == 1
+            and residual_diag_stack is None and affine_slq_cache is None):
         if full_log:
             _t_affine_slq = time.time()
             logger.info(
@@ -1563,7 +1635,8 @@ def fit_reml(
         slq_precond_conf = precond_conf
     slq_reference_runtime = None
     if (
-        slq_mode == "projected_core_residual"
+        not projected_information
+        and slq_mode == "projected_core_residual"
         and affine_slq_cache is None
         and slq_precond_conf is not None
         and getattr(slq_precond_conf, "diag_mode", None) == "scalar_identity"
@@ -1643,7 +1716,8 @@ def fit_reml(
     del KVrand_stack
     del Vrand_fixed
 
-    n_warm_cols   = rhs_const.shape[1]
+    n_warm_cols   = (1 if getattr(mean_information, "covariate_project", None) is not None
+                     else rhs_const.shape[1])
     warm_all      = jnp.full((n, n_warm_cols), jnp.nan, dtype=jnp.float32)
     warm_ai       = jnp.full((n, G + E), jnp.nan, dtype=jnp.float32)
     warm_ready    = False       # Python flag — avoids GPU→CPU sync on NaN check

@@ -16,10 +16,3 @@ effect_estimate/
 *.log
 *.csv
 *.png
-
-# Local backup snapshot
-bolt_jax_副本 22-47-38-277/
-
-report.md
-
-mph-main

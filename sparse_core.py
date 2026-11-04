@@ -6,6 +6,52 @@ from typing import Any
 import numpy as np
 
 
+class CandidateDesignCache:
+    """Keep the previous candidate design within one fixed genotype scope.
+
+    The extractor owns sample order, variant order and standardization. A new
+    cache is required when any of those changes. Only newly requested columns
+    are read; retained columns are copied in column-major order. Dropped SNPs
+    are released, so the cache never grows beyond the current candidate set.
+    """
+
+    def __init__(self, extractor, n_samples):
+        self.extractor = extractor
+        self.indices = np.empty(0, dtype=np.int64)
+        self.design = np.empty((int(n_samples), 0), dtype=np.float32, order="F")
+        self.reused_columns = 0
+
+    def extract(self, indices):
+        indices = np.asarray(indices, dtype=np.int64)
+        if indices.ndim != 1 or np.unique(indices).size != indices.size:
+            raise ValueError("Candidate design requires unique marker IDs.")
+        if np.array_equal(indices, self.indices):
+            self.reused_columns = int(indices.size)
+            return self.design
+        _, old_positions, retained = np.intersect1d(
+            self.indices, indices, assume_unique=True, return_indices=True,
+        )
+        fresh = np.setdiff1d(np.arange(indices.size), retained, assume_unique=True)
+        design = None
+        if retained.size or not fresh.size:
+            design = np.empty((self.design.shape[0], indices.size), dtype=np.float32, order="F")
+            for old, new in zip(old_positions, retained):
+                design[:, new] = self.design[:, old]
+        if fresh.size:
+            added = self.extractor(indices[fresh])
+            if added.shape != (self.design.shape[0], fresh.size):
+                raise ValueError("Candidate extractor returned a misaligned design.")
+            if not retained.size:
+                design = np.asarray(added, dtype=np.float32, order="F")
+            else:
+                for column, position in enumerate(fresh):
+                    design[:, position] = added[:, column]
+        self.indices = indices.copy()
+        self.design = design
+        self.reused_columns = int(retained.size)
+        return design
+
+
 def validate_component_partition(
     groups: list[np.ndarray], *, n_markers: int
 ) -> list[np.ndarray]:

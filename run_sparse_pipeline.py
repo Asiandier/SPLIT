@@ -390,6 +390,8 @@ def _low_level_command(
         format(float(args.lam_min_ratio), ".8g"),
         "--lasso-n-lambda",
         str(int(args.n_lambda)),
+        "--lasso-path-solver",
+        str(getattr(args, "lasso_path_solver", "basil")),
         "--lasso-cd-max-iter",
         str(int(args.lasso_cd_max_iter)),
         "--validation-early-stopping-lag",
@@ -1082,6 +1084,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--lam-min-ratio", type=float, default=1e-3)
     parser.add_argument("--n-lambda", type=int, default=80)
+    parser.add_argument("--lasso-path-solver", choices=("basil", "residual"), default="basil",
+        help="Validation-path numerical solver; does not alter statistical settings.")
     parser.add_argument("--lasso-cd-max-iter", type=int, default=10000)
     parser.add_argument("--validation-early-stopping-lag", type=int, default=5)
     parser.add_argument("--outer-max", type=int, default=20)

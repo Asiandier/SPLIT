@@ -21,6 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 pgen = ["pgenlib>=0.90"]
+sparse-fp64 = ["jax>=0.6.2", "nvidia-cublas>=13.1,<14"]
 dev = ["pytest>=7", "pyflakes>=3.2"]
 
 [project.scripts]
@@ -31,3 +32,6 @@ gpu-reml-gwas = "GPU_REML.run_gwas_pipeline:main"
 [tool.setuptools]
 packages = ["GPU_REML"]
 package-dir = { "GPU_REML" = "." }
+
+[tool.setuptools.package-data]
+GPU_REML = ["*.cc", "*.cu"]
