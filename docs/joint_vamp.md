@@ -151,7 +151,32 @@ PCG solves and cached Lanczos trace quadrature. It does not construct a dense
 sample Gram, a full FP64 genotype matrix or a SNP-by-SNP LD matrix. The solver
 and trace setup are reused across a retry; component scoring is batched in
 at most eight groups. The sparse planner's memory budget applies without
-changing ordinary REML planning. Inference uses scoped FP64.
+changing ordinary REML planning. Messages, posterior moments, trace quadrature
+and residual verification use scoped FP64.
+
+Joint refinement opts into the deterministic packed CUDA products for narrow
+right-hand sides. Both the complete packed GPU cache and the host-streamed
+path use the same operators and fitting standardization. If the optional
+extension is unavailable, native JAX products remain available; wider products
+also retain their native implementation. Ordinary REML and background-only
+mode do not enable this option by default.
+
+Linear solves use FP32 PCG corrections with FP64 accumulation and independent
+FP64 evaluation of the original residual. Each correction solves the same
+shifted system; there is no low-rank replacement of the covariance or change
+to the requested tolerance. If the mixed solve stagnates, encounters a
+floating-point breakdown, or fails its residual check, the original FP64 PCG
+algorithm retries that system. Each precision attempt has the same iteration
+limit (400 by default); a rescue can therefore use up to twice that limit.
+Only a verified solution becomes the next warm start. Failure of both
+precision attempts follows the existing joint numerical-retry policy; invalid
+inputs, resource failures and backend errors propagate instead.
+
+The constrained EM moments use fixed group reductions, replacing scatter
+additions into a small number of bins. This changes floating-point summation
+order, not the prior, Bernoulli counts, objective or convergence thresholds.
+Accordingly, numerical equivalence is assessed using verified residuals and
+predictions, rather than requiring bit-identical coefficients.
 
 Under a supplied GPU budget, joint products use up to 2 GiB per block,
 bounded by one eighth of that budget. The trace workspace targets all required
@@ -190,6 +215,12 @@ covariates and variance components remain available for audit. Background
 output also stores total posterior variance and alpha/background covariance
 on S. The `conditioning_*` arrays identify the paired predictor components;
 they do not imply a separate conditional background fit.
+
+Solver metadata records `packed_narrow_cuda`, `linear_solve_arithmetic`,
+`fp64_rescue_calls` and the verified residuals. Per-solve diagnostics distinguish
+mixed and FP64 iterations. If a floating-point exception prevents the mixed
+routine from returning its iteration count, `pcg_iterations_complete` is false
+and the reported total includes only the known completed work.
 
 The update is one shared timed stage. `total_prediction_refinement_seconds`
 is its full duration, including trace/solver setup, attempts and training

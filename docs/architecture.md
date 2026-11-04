@@ -98,6 +98,12 @@ roles are described in [sparse_numerics.md](sparse_numerics.md).
 - A bounded packed GPU cache avoids repeated host transfers when a complete
   source fits. SS uses compiled block loops over this cache; larger sources
   retain the streaming path. Both phases share the planner's cache reservation.
+- Joint VAMP opts into narrow packed CUDA products for both cached and streamed
+  genotypes, with native JAX available when the extension is absent. It reuses
+  the sparse fitting solver's FP32 corrections and FP64 residual verification,
+  retrying the same system with FP64 PCG after numerical breakdown or
+  stagnation. Background-only and ordinary REML defaults remain unchanged.
+  Groupwise EM moments use fixed reductions without changing the model counts.
 - `K_i @ Vrand` is persistent state. Score traces use symmetry to avoid applying
   every `K_i` to all projected probes on every iteration.
 - Single-GRM identity-residual SLQ uses Krylov shift/scale invariance. It scans

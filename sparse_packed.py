@@ -108,6 +108,14 @@ def transpose_product(packed, means, inverse, value, true_width, missing):
     return scale[:, None]*inner
 
 
+def forward_product(packed, means, inverse, value, true_width, missing):
+    """Apply the same stored standardization as the transpose/Gram products."""
+    width = packed.shape[1]*4
+    scale = jnp.where(jnp.arange(width) < true_width, inverse[:width], 0).astype(value.dtype)
+    return _centered_product(packed, means, scale[:, None]*value[:width],
+                             true_width, missing, transpose=False)
+
+
 def gram_product(packed, means, inverse, value, true_width, missing):
     inner = _centered_product(packed, means, value, true_width, missing, transpose=True)
     width = packed.shape[1]*4

@@ -303,6 +303,16 @@ def fit_joint(
         raise ValueError("Invalid initial pi")
     prob = jnp.where(d > 0, jnp.maximum(jnp.asarray(initial), cfg.pi_min), 0.0)
     group_ids = jnp.asarray(groups)
+    # Native partitions are contiguous: use reductions rather than contended
+    # scatter-adds into a handful of bins. Arbitrary label order is supported
+    # by fixed gathers. This changes summation order, not the EM counts.
+    group_selections = []
+    for group in range(ng):
+        positions = np.flatnonzero(groups == group)
+        contiguous = len(positions) and np.all(np.diff(positions) == 1)
+        group_selections.append(
+            slice(int(positions[0]), int(positions[-1])+1)
+            if contiguous else jnp.asarray(positions))
     smask = jnp.asarray(smask[:, None])
     active_j = jnp.asarray(active[:, None])
     y = jnp.asarray(np.asarray(response, float).reshape(products.n, 1))
@@ -332,17 +342,15 @@ def fit_joint(
         a = jnp.concatenate(
             [
                 posterior["pip_alpha"].sum(0),
-                jnp.bincount(
-                    group_ids, weights=posterior["pip_background"][:, 0], length=ng
-                ),
+                jnp.stack([jnp.sum(posterior["pip_background"][selection, 0])
+                           for selection in group_selections]),
             ]
         )
         b = jnp.concatenate(
             [
                 posterior["second_alpha"].sum(0),
-                jnp.bincount(
-                    group_ids, weights=posterior["second_background"][:, 0], length=ng
-                ),
+                jnp.stack([jnp.sum(posterior["second_background"][selection, 0])
+                           for selection in group_selections]),
             ]
         )
         return a, b

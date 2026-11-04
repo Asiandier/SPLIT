@@ -723,8 +723,13 @@ validation-based tuning and never uses held-out test phenotypes.
 
 Production inference uses streamed/packed genotype products, verified PCG and
 fixed-probe Lanczos trace quadrature. It builds neither a full FP64 genotype
-matrix nor a dense sample Gram or SNP LD matrix. Numerical controls remain
-`--background-ss-pcg-tol` (1e-9), `--background-ss-trace-probes` (32) and
+matrix nor a dense sample Gram or SNP LD matrix. Joint refinement uses
+deterministic packed CUDA products when available, including when genotypes
+must be streamed. FP32 linear-solve corrections are accepted only after FP64
+verification of the original residual; the original FP64 solver provides a
+numerical rescue. Priors and convergence thresholds are unchanged. Numerical
+controls remain `--background-ss-pcg-tol` (1e-7 for joint refinement, 1e-9 for
+background-only mode), `--background-ss-trace-probes` (32) and
 `--background-ss-lanczos-steps` (64). Ordinary REML planning is unchanged.
 
 The explicit `--background-ss` mode without `--alpha-vamp` keeps native LASSO

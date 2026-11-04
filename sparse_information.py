@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def solve_sparse_pcg(hv, rhs, M=None, tol=1e-2, maxiter=200, X0=None,
-                     check_every=2):
+                     check_every=2, *, log_diagnostics=True):
     """Use FP32 PCG, with FP64 residual correction below its accuracy floor.
 
     Every correction solves H delta = b-Hx for the SAME H. The total PCG
@@ -63,11 +63,12 @@ def solve_sparse_pcg(hv, rhs, M=None, tol=1e-2, maxiter=200, X0=None,
             if not math.isfinite(actual):
                 raise FloatingPointError("Non-finite FP64 information residual.")
             if actual <= tol or used >= maxiter or actual >= previous:
-                logger.info(
-                    "[information PCG] FP64 residual correction: columns=%s "
-                    "corrections=%s iterations=%s/%s true_residual=%.3e tol=%.3e",
-                    rhs.shape[1], corrections, used, maxiter, actual, tol,
-                )
+                if log_diagnostics:
+                    logger.info(
+                        "[information PCG] FP64 residual correction: columns=%s "
+                        "corrections=%s iterations=%s/%s true_residual=%.3e tol=%.3e",
+                        rhs.shape[1], corrections, used, maxiter, actual, tol,
+                    )
                 return value, actual, used
             previous = actual
             # Solving H delta = r to relative error eta gives the original

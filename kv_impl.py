@@ -108,7 +108,8 @@ def _genotype_gram_product(diff, inverse, value, fp64_workspace_bytes):
                       precision=jax.lax.Precision.HIGHEST)
 
 
-@partial(jax.jit, donate_argnums=(6,), static_argnames=("fp64_workspace_bytes",))
+@partial(jax.jit, donate_argnums=(6,),
+         static_argnames=("fp64_workspace_bytes", "sparse_packed_enabled"))
 def _kv_one_call_jit(
     g_dev_packed: Array,   # (n, ceil(W / 4)) uint8 packed 2-bit genotypes
     true_width: Array,     # () int32, number of valid SNP columns
@@ -117,10 +118,10 @@ def _kv_one_call_jit(
     V: Array,              # (n, rhs)
     miss_u8: Array,        # () uint8
     acc: Array,            # (n, rhs)
-    *, fp64_workspace_bytes: int = 0,
+    *, fp64_workspace_bytes: int = 0, sparse_packed_enabled: bool = False,
 ) -> Array:
     """Accumulate one call-block contribution from packed 2-bit genotypes."""
-    if fp64_workspace_bytes > 0 and sparse_packed.supports(V):
+    if (sparse_packed_enabled or fp64_workspace_bytes > 0) and sparse_packed.supports(V):
         return acc + sparse_packed.gram_product(
             g_dev_packed, means_call, inv_call, V, true_width, miss_u8)
     diff, inv_f = _unpack_impute_center(
@@ -234,7 +235,7 @@ def _zxb_one_call_jit(
     )
 
 
-@jax.jit
+@partial(jax.jit, static_argnames=("sparse_packed_enabled",))
 def _zxb_multi_one_call_jit(
     g_dev_packed: Array,
     true_width: Array,
@@ -242,8 +243,12 @@ def _zxb_multi_one_call_jit(
     inv_call: Array,
     b_call: Array,
     miss_u8: Array,
+    *, sparse_packed_enabled: bool = False,
 ) -> Array:
     """Compute one block of predictions for several effects sharing a stream."""
+    if sparse_packed_enabled and sparse_packed.supports(b_call):
+        return sparse_packed.forward_product(
+            g_dev_packed, means_call, inv_call, b_call, true_width, miss_u8)
     fp = b_call.dtype
     diff, inv_f = _unpack_impute_center(
         g_dev_packed, true_width, means_call, inv_call, b_call, miss_u8
@@ -383,11 +388,13 @@ def xtv_impl_streamed(
     return out[:, 0] if squeeze else out
 
 
-@jax.jit
-def _xv_call_accumulate(acc, packed, width, means, inv, effects, start, missing):
+@partial(jax.jit, static_argnames=('sparse_packed_enabled',))
+def _xv_call_accumulate(acc, packed, width, means, inv, effects, start, missing,
+                        *, sparse_packed_enabled=False):
     indices = start+jnp.arange(means.shape[0], dtype=start.dtype)
     block = jnp.take(effects, indices, axis=0, mode='fill', fill_value=0)
-    return acc+_zxb_multi_one_call_jit(packed, width, means, inv, block, missing)
+    return acc+_zxb_multi_one_call_jit(packed, width, means, inv, block, missing,
+                                      sparse_packed_enabled=sparse_packed_enabled)
 
 
 @partial(jax.jit, donate_argnums=(0,))
@@ -396,8 +403,9 @@ def _store_packed_call(cache, block, index):
     return jax.lax.dynamic_update_slice(cache, block[None, :, :], (index, zero, zero))
 
 
-@jax.jit
-def packed_cache_gram(cache, widths, means, inverse, selected, value, missing):
+@partial(jax.jit, static_argnames=('sparse_packed_enabled',))
+def packed_cache_gram(cache, widths, means, inverse, selected, value, missing,
+                      *, sparse_packed_enabled=False):
     """Bounded decode workspace, with the packed-block loop on the device."""
     squeeze = value.ndim == 1
     if squeeze:
@@ -405,34 +413,39 @@ def packed_cache_gram(cache, widths, means, inverse, selected, value, missing):
     def body(position, total):
         call = selected[position]
         return _kv_one_call_jit(cache[call], widths[call], means[call],
-                                inverse[call], value, missing, total)
+                                inverse[call], value, missing, total,
+                                sparse_packed_enabled=sparse_packed_enabled)
     initial = jnp.zeros_like(value)
     result = initial if selected.shape[0] == 0 else jax.lax.fori_loop(0, selected.shape[0], body, initial)
     return result[:, 0] if squeeze else result
 
 
-@jax.jit
-def packed_cache_forward(cache, starts, widths, means, inverse, selected, effects, missing):
+@partial(jax.jit, static_argnames=('sparse_packed_enabled',))
+def packed_cache_forward(cache, starts, widths, means, inverse, selected, effects, missing,
+                         *, sparse_packed_enabled=False):
     squeeze = effects.ndim == 1
     if squeeze:
         effects = effects[:, None]
     def body(position, total):
         call = selected[position]
         return _xv_call_accumulate(total, cache[call], widths[call], means[call],
-                                  inverse[call], effects, starts[call], missing)
+                                  inverse[call], effects, starts[call], missing,
+                                  sparse_packed_enabled=sparse_packed_enabled)
     initial = jnp.zeros((cache.shape[1], effects.shape[1]), effects.dtype)
     result = initial if selected.shape[0] == 0 else jax.lax.fori_loop(0, selected.shape[0], body, initial)
     return result[:, 0] if squeeze else result
 
 
-@partial(jax.jit, static_argnames=('p',))
-def packed_cache_transpose(cache, starts, widths, means, inverse, selected, value, missing, *, p):
+@partial(jax.jit, static_argnames=('p', 'sparse_packed_enabled'))
+def packed_cache_transpose(cache, starts, widths, means, inverse, selected, value, missing,
+                           *, p, sparse_packed_enabled=False):
     squeeze = value.ndim == 1
     if squeeze:
         value = value[:, None]
     def body(position, total):
         call = selected[position]
-        block = _xtv_one_call_jit(cache[call], widths[call], means[call], inverse[call], value, missing)
+        block = _xtv_one_call_jit(cache[call], widths[call], means[call], inverse[call], value, missing,
+                                 sparse_packed_enabled=sparse_packed_enabled)
         return _xtv_scatter_jit(total, block, starts[call])
     initial = jnp.zeros((p+means.shape[1], value.shape[1]), value.dtype)
     result = initial if selected.shape[0] == 0 else jax.lax.fori_loop(0, selected.shape[0], body, initial)
@@ -451,7 +464,7 @@ def packed_cache_diagonal(cache, widths, means, inverse, selected, missing):
 
 
 def xv_impl_streamed(effects, snp_starts, true_widths, means_by_call, inv_by_call,
-                     *, n, m, n_calls, pop_block, missing_val=3):
+                     *, n, m, n_calls, pop_block, missing_val=3, sparse_packed_enabled=False):
     """Stream X @ effects using training normalization and caller precision."""
     squeeze = effects.ndim == 1
     if squeeze:
@@ -468,7 +481,8 @@ def xv_impl_streamed(effects, snp_starts, true_widths, means_by_call, inv_by_cal
             if call+1 < n_calls:
                 pending = _device_put_block(pop_block(call+1), dev)
             total = _xv_call_accumulate(total, packed, true_widths[call],
-                means_by_call[call], inv_by_call[call], effects, snp_starts[call], missing)
+                means_by_call[call], inv_by_call[call], effects, snp_starts[call], missing,
+                sparse_packed_enabled=sparse_packed_enabled)
             del packed
     return total[:, 0] if squeeze else total
 

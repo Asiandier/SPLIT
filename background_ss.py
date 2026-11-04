@@ -26,7 +26,7 @@ class StreamedGenotypeProducts:
     that fallback retains only one memory-bounded genotype block.
     """
     def __init__(self, index, n, normalizers, *, block_bytes=64*1024**2,
-                 device_cache_bytes=0):
+                 device_cache_bytes=0, accelerate_packed=False):
         self.index, self.n, self.p = index, int(n), int(index.m_total)
         self.streamer = getattr(index, 'streamer', None)
         self.normalizers = np.asarray(normalizers, float)
@@ -35,6 +35,7 @@ class StreamedGenotypeProducts:
         self.packed_calls = None
         self._device_packed = None
         self.device_cache_bytes = 0
+        self.sparse_packed_enabled = False
         if (self.streamer is not None and getattr(self.streamer, '_packed_buf', None) is not None
                 and getattr(self.streamer, '_means_host', None) is not None
                 and getattr(self.streamer, '_inv_sds_host', None) is not None):
@@ -63,6 +64,10 @@ class StreamedGenotypeProducts:
             self.widths = jax.device_put(np.array([c[4] for c in calls], np.int32), self.streamer.dev)
             self._all_calls = jnp.arange(len(calls), dtype=jnp.int32)
             self._missing = jnp.asarray(self.streamer._missing_val, jnp.uint8)
+            if accelerate_packed and getattr(self.streamer.dev, 'platform', None) == 'gpu':
+                from . import sparse_packed
+                with jax.default_device(self.streamer.dev):
+                    self.sparse_packed_enabled = sparse_packed.initialize()
             needed = len(calls)*self.n*(self.packed_width//4)
             if (getattr(self.streamer.dev, 'platform', None) == 'gpu'
                     and 0 < needed <= device_cache_bytes):
@@ -90,16 +95,26 @@ class StreamedGenotypeProducts:
 
     def restricted(self, active):
         """Restrict VAMP linear products; general foreground products stay unmasked."""
-        if self._device_packed is None:
-            return self
         from types import SimpleNamespace
+        active = np.asarray(active)
+        if active.shape != (self.p,) or active.dtype != np.dtype(bool):
+            raise ValueError('Active SNP mask must be Boolean in logical SNP order')
+        if self._device_packed is None:
+            mask = jnp.asarray(active)
+            def masked(value):
+                return jnp.where(mask if value.ndim == 1 else mask[:, None], value, 0.)
+            return SimpleNamespace(
+                forward=lambda effects: self.forward(masked(effects)),
+                transpose=lambda value: masked(self.transpose(value)))
         from .kv_impl import packed_cache_forward, packed_cache_transpose
-        selected, inverse = self._active_calls(np.asarray(active, bool))
+        selected, inverse = self._active_calls(active)
         return SimpleNamespace(
             forward=lambda effects: packed_cache_forward(self._device_packed, self.starts,
-                self.widths, self.means, inverse, selected, effects, self._missing),
+                self.widths, self.means, inverse, selected, effects, self._missing,
+                sparse_packed_enabled=self.sparse_packed_enabled),
             transpose=lambda value: packed_cache_transpose(self._device_packed, self.starts,
-                self.widths, self.means, inverse, selected, value, self._missing, p=self.p))
+                self.widths, self.means, inverse, selected, value, self._missing, p=self.p,
+                sparse_packed_enabled=self.sparse_packed_enabled))
 
     def _packed(self, k):
         call, first, last, _, _ = self.packed_calls[k]
@@ -118,12 +133,14 @@ class StreamedGenotypeProducts:
         if self._device_packed is not None:
             from .kv_impl import packed_cache_forward
             return packed_cache_forward(self._device_packed, self.starts, self.widths,
-                self.means, self.inverse, self._all_calls, effects, self._missing)
+                self.means, self.inverse, self._all_calls, effects, self._missing,
+                sparse_packed_enabled=self.sparse_packed_enabled)
         if self.packed_calls is not None:
             from .kv_impl import xv_impl_streamed
             return xv_impl_streamed(effects, self.starts, self.widths, self.means, self.inverse,
                 n=self.n, m=self.p, n_calls=len(self.packed_calls), pop_block=self._packed,
-                missing_val=int(self.streamer._missing_val))
+                missing_val=int(self.streamer._missing_val),
+                sparse_packed_enabled=self.sparse_packed_enabled)
         if self.streamer is not None and hasattr(self.streamer, 'xv'):
             return self.streamer.xv(effects)
         total = jnp.zeros((self.n, effects.shape[1]), effects.dtype)
@@ -136,12 +153,14 @@ class StreamedGenotypeProducts:
         if self._device_packed is not None:
             from .kv_impl import packed_cache_transpose
             return packed_cache_transpose(self._device_packed, self.starts, self.widths,
-                self.means, self.inverse, self._all_calls, residual, self._missing, p=self.p)
+                self.means, self.inverse, self._all_calls, residual, self._missing, p=self.p,
+                sparse_packed_enabled=self.sparse_packed_enabled)
         if self.packed_calls is not None:
             from .kv_impl import xtv_impl_streamed
             return xtv_impl_streamed(residual, self.p, self.starts, self.widths,
                 self.means, self.inverse, n_calls=len(self.packed_calls),
-                pop_block=self._packed, missing_val=int(self.streamer._missing_val))
+                pop_block=self._packed, missing_val=int(self.streamer._missing_val),
+                sparse_packed_enabled=self.sparse_packed_enabled)
         if self.streamer is not None:
             return self.streamer.xtv(residual, normalize=False)
         total = jnp.zeros((self.p, residual.shape[1]), residual.dtype)
@@ -156,7 +175,8 @@ class StreamedGenotypeProducts:
             from .kv_impl import packed_cache_gram
             selected, inverse = self._active_calls(active)
             return lambda value: packed_cache_gram(self._device_packed, self.widths,
-                self.means, inverse, selected, value, self._missing)
+                self.means, inverse, selected, value, self._missing,
+                sparse_packed_enabled=self.sparse_packed_enabled)
         if self.packed_calls is not None:
             from .kv_impl import _device_put_block, _kv_one_call_jit
             selected, inverse = [], []
@@ -175,7 +195,8 @@ class StreamedGenotypeProducts:
                         if position+1 < len(selected):
                             pending = _device_put_block(self._packed(selected[position+1]), self.streamer.dev)
                         total = _kv_one_call_jit(packed, self.widths[k], self.means[k],
-                            inverse[position], value, missing, total)
+                            inverse[position], value, missing, total,
+                            sparse_packed_enabled=self.sparse_packed_enabled)
                         del packed
                 return total
             return packed_operator

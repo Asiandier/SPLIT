@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from .pcg import pcg_solve
+from .sparse_information import solve_sparse_pcg
 from .slq import _set_row, _step
 
 
@@ -122,7 +123,8 @@ class MatrixFreeSampleSolver:
     def __init__(self, products, active, *, pcg_tolerance=1e-9,
                  pcg_max_iterations=400, probes=32, lanczos_steps=64,
                  workspace_bytes=256*1024**2, seed=20261011,
-                 exact_probe_limit=128, trace_tolerance=1e-6, max_probe_batch=8):
+                 exact_probe_limit=128, trace_tolerance=1e-6, max_probe_batch=8,
+                 mixed_precision=False):
         if not jax.config.jax_enable_x64:
             raise RuntimeError('Enable jax_enable_x64 before matrix-free SS setup')
         active = np.asarray(active, bool)
@@ -150,6 +152,8 @@ class MatrixFreeSampleSolver:
         self.pcg_max_iterations = pcg_max_iterations
         self.trace_tolerance = trace_tolerance
         self.max_probe_batch = max_probe_batch
+        self.mixed_precision = bool(mixed_precision)
+        self.fp64_rescue_calls = 0
         self._warm = None
         self.last_diagnostics = {}
         self.solve_calls = self.total_pcg_iterations = 0
@@ -162,6 +166,8 @@ class MatrixFreeSampleSolver:
             trace_estimator='randomly_signed_Walsh_without_replacement',
             maximum_lanczos_steps=self.maximum_lanczos_steps,
             packed_device_cache_bytes=int(getattr(products, 'device_cache_bytes', 0)),
+            packed_narrow_cuda=bool(getattr(products, 'sparse_packed_enabled', False)),
+            linear_solve_arithmetic=('fp32_corrections_verified_fp64' if self.mixed_precision else 'fp64'),
             setup_seconds=0., quadrature_refinements=0)
         if hasattr(products, 'chunk_size'):
             self.setup_diagnostics['genotype_chunk_snps'] = int(products.chunk_size)
@@ -324,15 +330,43 @@ class MatrixFreeSampleSolver:
         estimate, gap, error = self.trace(shifts)
         shift = jnp.asarray(shifts)
         def operator(value):
-            return self.matvec(value)+value*shift[None, :]
+            return self.matvec(value)+value*shift.astype(value.dtype)[None, :]
         modes, coarse = self.coarse_vectors, self.coarse_values
         def precondition(value):
             if modes is None:
-                return value/(self.diagonal[:, None]+shift[None, :])
-            return _coarse_precondition(value, self.diagonal, shift, modes, coarse)
+                return value/(self.diagonal.astype(value.dtype)[:, None]+shift.astype(value.dtype)[None, :])
+            return _coarse_precondition(value, self.diagonal.astype(value.dtype), shift.astype(value.dtype),
+                                        modes.astype(value.dtype), coarse.astype(value.dtype))
         warm = self._warm if self._warm is not None and self._warm.shape == rhs.shape else None
-        solved, relative, iterations = pcg_solve(operator, rhs, M=precondition,
-            tol=self.pcg_tolerance, maxiter=self.pcg_max_iterations, X0=warm)
+        rescue_reason = None
+        mixed_iterations = 0
+        if self.mixed_precision:
+            solved = warm
+            try:
+                solved, relative, mixed_iterations = solve_sparse_pcg(
+                    operator, rhs, M=precondition, tol=self.pcg_tolerance,
+                    maxiter=self.pcg_max_iterations, X0=warm, log_diagnostics=False)
+                if not np.isfinite(relative) or relative > self.pcg_tolerance*1.05:
+                    rescue_reason = f'mixed solve true residual {relative:.3e}'
+            except FloatingPointError as failure:
+                # Numerical breakdown permits the original FP64 algorithm.
+                # Invalid input, allocation, I/O and backend errors propagate.
+                rescue_reason = str(failure)
+                mixed_iterations = None
+            if rescue_reason is not None:
+                self.fp64_rescue_calls += 1
+                if solved is not None and not bool(jnp.all(jnp.isfinite(solved))):
+                    solved = warm
+                solved, relative, fp64_iterations = pcg_solve(
+                    operator, rhs, M=precondition, tol=self.pcg_tolerance,
+                    maxiter=self.pcg_max_iterations, X0=solved)
+            else:
+                fp64_iterations = 0
+            iterations = (mixed_iterations or 0)+fp64_iterations
+        else:
+            solved, relative, iterations = pcg_solve(operator, rhs, M=precondition,
+                tol=self.pcg_tolerance, maxiter=self.pcg_max_iterations, X0=warm)
+            fp64_iterations = iterations
         relative = float(relative)
         if not np.isfinite(relative) or relative > self.pcg_tolerance*1.05:
             raise ArithmeticError(f'SS PCG did not converge: true relative residual {relative:.3e}')
@@ -348,11 +382,18 @@ class MatrixFreeSampleSolver:
             pcg_iterations=iterations, trace_fraction=estimate.tolist(),
             trace_quadrature_relative_gap=gap.tolist(),
             trace_sampling_standard_error=error.tolist())
+        if self.mixed_precision:
+            self.last_diagnostics.update(
+                pcg_mixed_iterations=mixed_iterations, pcg_fp64_iterations=fp64_iterations,
+                pcg_iterations_complete=mixed_iterations is not None,
+                pcg_fp64_rescue=rescue_reason is not None, pcg_fp64_rescue_reason=rescue_reason)
         return solved, jnp.asarray(estimate)
 
     def diagnostics(self):
         return dict(self.setup_diagnostics, pcg_tolerance=self.pcg_tolerance,
             pcg_max_iterations=self.pcg_max_iterations,
+            pcg_max_iterations_scope='per_precision_attempt',
+            fp64_rescue_calls=self.fp64_rescue_calls,
             solve_calls=self.solve_calls, total_pcg_iterations=self.total_pcg_iterations,
             maximum_pcg_true_relative_residual=self.maximum_pcg_residual,
             maximum_trace_quadrature_relative_gap=self.maximum_quadrature_gap,

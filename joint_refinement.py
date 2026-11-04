@@ -417,6 +417,7 @@ def refine_native_fit(
             normalizers,
             block_bytes=block_bytes,
             device_cache_bytes=cache_bytes,
+            accelerate_packed=True,
         )
         logger.info('[joint VAMP setup] n=%s, SNPs=%s, packed cache=%.3f GiB, '
                     'product block=%s SNPs, trace workspace=%.1f MiB',
@@ -439,6 +440,7 @@ def refine_native_fit(
                 exact_probe_limit=config.trace_exact_probe_limit,
                 trace_tolerance=config.trace_tolerance,
                 max_probe_batch=None,
+                mixed_precision=True,
             )
             diagnostics = solver.diagnostics()
             logger.info('[joint VAMP setup] trace ready in %.2fs; batch=%s, depth=%s',
@@ -501,6 +503,7 @@ def refine_native_fit(
         original_h2_and_variance_components_unchanged=True,
         original_pair_restored=fitted.status == "fallback_native",
         packed_device_cache_bytes=products.device_cache_bytes,
+        packed_narrow_cuda=products.sparse_packed_enabled,
         blup_pcg_metadata_describes_initial_fit=True,
         sample_gram_materialized=False,
         joint_summary=fitted.summary,
