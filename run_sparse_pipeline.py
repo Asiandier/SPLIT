@@ -6,7 +6,7 @@ Two modes are intentionally supported:
 ``fixed``
     Fit a user-specified fixed GRM partition (or one whole-genome GRM), with
     validation predictive R2 selecting lambda inside every alpha/theta outer
-    iteration.
+    iteration, or training-only AIC using all fitting individuals directly.
 
 ``adaptive``
     Fit K=1 as above, freeze its sparse mean, refit the ordinary offset-REML
@@ -15,10 +15,9 @@ Two modes are intentionally supported:
     with validation-selected lambda at the endpoint, and then perform the same
     final combined-sample refit as fixed mode.
 
-Neither mode accepts or reads a prediction phenotype.  Once model selection is
-complete, the selected lambda/lambda-max ratio is frozen and the model is
-warm-refit on training + validation samples before effects and predictions are
-emitted.
+Neither mode accepts or reads a prediction phenotype. Validation-based selection
+freezes lambda/lambda-max before a training+validation refit. Fixed-mode AIC
+fits the supplied fitting cohort directly, without a validation split or refit.
 """
 
 from __future__ import annotations
@@ -332,9 +331,10 @@ def _low_level_command(
     theta_init: Sequence[float] | None = None,
     fixed_lam_ratio: float | None = None,
     final_outputs: bool = False,
+    training_aic: bool = False,
 ) -> list[str]:
-    if validation_selection == (fixed_lam_ratio is not None):
-        raise ValueError("Choose validation selection or a frozen lambda ratio.")
+    if sum((bool(validation_selection), fixed_lam_ratio is not None, bool(training_aic))) != 1:
+        raise ValueError("Choose validation selection, training AIC, or a frozen lambda ratio.")
     command = [
         str(args.python_bin),
         str(args.low_level_pipeline),
@@ -398,6 +398,8 @@ def _low_level_command(
         "--validation-early-stopping-lag",
         str(int(args.validation_early_stopping_lag)),
     ]
+    if getattr(args, 'checkpoint', False):
+        command.append('--checkpoint')
     if args.covar_txt:
         command.extend(["--covar-txt", str(args.covar_txt)])
     if component_spec is not None:
@@ -418,6 +420,8 @@ def _low_level_command(
         )
         if args.covar_txt:
             command.extend(["--prediction-covar-txt", str(args.covar_txt)])
+    elif training_aic:
+        command.extend(["--lasso-selection-criterion", "aic"])
     else:
         command.extend(
             [
@@ -562,11 +566,26 @@ def _validate_summary(
             raise ValueError("Validation lambda was not selected inside the outer loop.")
         if summary.get("sparse_prediction", {}).get("status") != "emitted":
             raise ValueError("Validation selection did not emit its validation predictions.")
+    elif expected_method == "training_gaussian_AIC":
+        if (not summary.get("aic_selection_inside_outer_loop")
+                or summary.get("validation_selection_inside_outer_loop")):
+            raise ValueError("AIC selection must use training data inside the outer loop.")
+        try:
+            aic = read_json(Path(str(prefix) + ".aic.json"))
+        except (FileNotFoundError, ValueError) as error:
+            raise IncompleteOutputError("Missing or invalid AIC selection trace") from error
+        if (aic.get("validation_phenotypes_read") is not False
+                or aic.get("data_role") != "training_only"
+                or not aic.get("outer_selection_trace")
+                or int(aic.get("n", -1)) != int(summary["n_samples"])):
+            raise ValueError("Invalid training-only AIC selection trace")
     elif summary.get("lasso_path_role") != "frozen_ratio_target_only":
         raise ValueError("Final refit did not use the frozen-ratio target path.")
     if require_prediction and summary.get("sparse_prediction", {}).get("status") != "emitted":
         raise ValueError("Requested prediction output was not emitted.")
     required = [str(prefix) + suffix for suffix in (".history.json", ".selected_snps.tsv")]
+    if expected_method == "training_gaussian_AIC":
+        required.append(str(prefix) + ".aic.json")
     if require_prediction:
         required.extend(str(prefix) + suffix for suffix in (".sparse_prediction.tsv", ".sparse_prediction_metadata.json"))
     if require_effects:
@@ -577,7 +596,7 @@ def _validate_summary(
         refinement = summary.get('alpha_vamp', {})
         background = summary.get('background_ss', {})
         for component in (refinement, background):
-            if (expected_method != 'fixed_lam_ratio'
+            if (expected_method not in ('fixed_lam_ratio', 'training_gaussian_AIC')
                     or component.get('joint_refinement_schema') != 2
                     or component.get('numerical_policy') != 'prediction_guarded_v2'
                     or component.get('model') != 'joint_global_budget_p'
@@ -1030,10 +1049,47 @@ def _run_final_refit(
     return final
 
 
+def _run_training_aic(args: argparse.Namespace) -> dict[str, Any]:
+    """Fit the complete supplied cohort once; no held-out selection stage."""
+    state = args.work_dir / "fixed" / "aic_state.npz"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    requirements = dict(
+        expected_k=_component_count(args.component_spec),
+        expected_method="training_gaussian_AIC",
+        require_prediction=args.prediction_prefix is not None,
+        require_effects=args.compute_effects,
+        require_alpha_vamp=bool(args.alpha_vamp),
+        required_state=state,
+    )
+    final = _completed_summary(args.out_prefix, **requirements)
+    if final is None:
+        command = _low_level_command(
+            args=args, phenotype=args.pheno_txt, keep=args.keep_path,
+            component_spec=args.component_spec, out_prefix=args.out_prefix,
+            validation_selection=False, training_aic=True,
+            warm_state_out=state, final_outputs=True,
+        )
+        _run_command(command, args.work_dir / "aic_fit.log")
+        final = _validate_summary(args.out_prefix, **requirements)
+    return final
+
+
+def _publish_result(result_path: Path, status_path: Path, result: dict[str, Any]) -> int:
+    atomic_json(result_path, result)
+    atomic_json(status_path, dict(state="complete", stage="complete",
+                                 result=str(result_path.resolve()), finished_at=_now()))
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     add_h2_se_arguments(parser)
     parser.add_argument("--mode", choices=("fixed", "adaptive"), default="fixed")
+    parser.add_argument("--checkpoint", action="store_true",
+                        help="Save/resume completed outer iterations within each native fit.")
+    parser.add_argument("--selection-criterion", choices=("validation", "aic"), default="validation",
+                        help="Lambda selection: validation/refit (default), or fixed-mode AIC on the full fitting cohort.")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--bed-prefix", default="")
     source.add_argument("--pgen-prefix", default="")
@@ -1054,10 +1110,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ld-rank-bins", type=int, default=1024)
     parser.add_argument("--plink2", default="plink2")
     parser.add_argument("--pheno-txt", required=True)
-    parser.add_argument("--validation-pheno-txt", required=True)
+    parser.add_argument("--validation-pheno-txt", default="")
     parser.add_argument("--covar-txt", default="")
     parser.add_argument("--keep-path", required=True)
-    parser.add_argument("--validation-keep-path", required=True)
+    parser.add_argument("--validation-keep-path", default="")
     parser.add_argument(
         "--fit-pheno-txt",
         default="",
@@ -1092,7 +1148,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--lam-min-ratio", type=float, default=1e-3)
     parser.add_argument("--n-lambda", type=int, default=80)
-    parser.add_argument("--lasso-path-solver", choices=("basil", "residual"), default="basil",
+    parser.add_argument("--lasso-path-solver", choices=("basil", "residual"), default=None,
         help="Validation-path numerical solver; does not alter statistical settings.")
     parser.add_argument("--lasso-cd-max-iter", type=int, default=10000)
     parser.add_argument("--validation-early-stopping-lag", type=int, default=5)
@@ -1124,7 +1180,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--call-width", type=int, default=0)
     parser.add_argument("--ring-depth", type=int, default=0)
     parser.add_argument("--n-rand-vec", type=int, default=100)
-    parser.add_argument("--slq-samples", type=int, default=100)
+    parser.add_argument("--slq-samples", type=int, default=50)
     parser.add_argument("--slq-m", type=int, default=50)
     parser.add_argument("--slq-quadrature-tol", type=float, default=1e-6,
                         help="Log quadrature error bound per sample; 0 uses fixed SLQ depth.")
@@ -1141,6 +1197,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
+    if args.selection_criterion == "aic":
+        if args.mode != "fixed":
+            parser.error("AIC selection currently supports fixed GRM groups.")
+        if args.validation_pheno_txt or args.validation_keep_path or args.fit_pheno_txt or args.fit_keep_path:
+            parser.error("AIC uses --pheno-txt/--keep-path for the full fitting cohort; omit validation and combined-refit inputs.")
+        if args.lasso_path_solver == "basil":
+            parser.error("AIC selection requires the residual Lasso solver.")
+    elif not args.validation_pheno_txt or not args.validation_keep_path:
+        parser.error("Validation selection requires --validation-pheno-txt and --validation-keep-path.")
+    args.lasso_path_solver = args.lasso_path_solver or ("residual" if args.selection_criterion == "aic" else "basil")
     if args.background_ss_pcg_tol is None:
         args.background_ss_pcg_tol = 1e-7 if args.alpha_vamp else 1e-9
     if bool(args.fit_pheno_txt) != bool(args.fit_keep_path):
@@ -1233,14 +1299,14 @@ def _resolve_args(args: argparse.Namespace) -> argparse.Namespace:
     )
     for name in (
         "pheno_txt",
-        "validation_pheno_txt",
         "keep_path",
-        "validation_keep_path",
         "python_bin",
         "low_level_pipeline",
     ):
         setattr(args, name, _resolved_file(str(getattr(args, name)), name))
     for name in (
+        "validation_pheno_txt",
+        "validation_keep_path",
         "covar_txt",
         "component_spec",
         "ld_score",
@@ -1262,9 +1328,13 @@ def _resolve_args(args: argparse.Namespace) -> argparse.Namespace:
     args.out_prefix = Path(args.out_prefix).expanduser().resolve(strict=False)
     args.work_dir = Path(str(args.out_prefix) + ".work")
     args.work_dir.mkdir(parents=True, exist_ok=True)
-    args.fit_pheno_txt, args.fit_keep_path, args.fit_inputs_constructed = (
-        _prepare_combined_fit_inputs(args)
-    )
+    if args.selection_criterion == "aic":
+        args.fit_pheno_txt, args.fit_keep_path = args.pheno_txt, args.keep_path
+        args.fit_inputs_constructed = False
+    else:
+        args.fit_pheno_txt, args.fit_keep_path, args.fit_inputs_constructed = (
+            _prepare_combined_fit_inputs(args)
+        )
     return args
 
 
@@ -1297,11 +1367,12 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": 1,
         "algorithm_source_digest": _algorithm_source_digest(),
         "mode": args.mode,
+        "selection_criterion": args.selection_criterion,
         "genotype": _genotype_signature(
             args.genotype_prefix, args.genotype_format
         ),
         "inputs": {
-            name: _input_signature(path) for name, path in input_paths.items()
+            name: _input_signature(path) for name, path in input_paths.items() if path is not None
         },
         "fit_inputs_constructed": bool(args.fit_inputs_constructed),
         "prediction": (
@@ -1419,6 +1490,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         {"state": "running", "stage": "model_selection", "started_at": _now()},
     )
     try:
+        if args.selection_criterion == "aic":
+            atomic_json(status_path, dict(state="running", stage="training_aic_fit",
+                                         started_at=_now()))
+            final = _run_training_aic(args)
+            endpoint = dict(
+                **_stage_snapshot(final), fit_samples=int(final["n_samples"]),
+                lambda_ratio_frozen=False,
+                h2_se=final.get("h2_se"), h2_se_status=final.get("h2_se_status"),
+                heritability_uncertainty=final.get("heritability_uncertainty"),
+                component_spec=str(args.component_spec) if args.component_spec else None,
+                summary=str(Path(str(args.out_prefix) + ".summary.json")),
+                selected_snps=str(Path(str(args.out_prefix) + ".selected_snps.tsv")),
+                effects=str(Path(str(args.out_prefix) + ".sparse_effects.tsv")) if args.compute_effects else None,
+                prediction=str(Path(str(args.out_prefix) + ".sparse_prediction.tsv")) if args.prediction_prefix else None,
+            )
+            result = dict(
+                schema_version=1, status="complete", mode=args.mode,
+                selection_criterion="aic", algorithm="fixed_k_training_aic_single_fit",
+                selection=dict(criterion="AIC", data_role="fitting_samples",
+                               samples=int(final["n_samples"]), validation_samples=0,
+                               trace=str(Path(str(args.out_prefix) + ".aic.json"))),
+                final_fit=endpoint, refit_performed=False,
+                prediction_phenotype_used=False, config=str(config_path.resolve()),
+                finished_at=_now(),
+            )
+            if args.alpha_vamp:
+                result["alpha_vamp"] = final["alpha_vamp"]
+            return _publish_result(result_path, status_path, result)
         if args.mode == "adaptive":
             component_spec, state, selected_summary, selection_result = (
                 _run_adaptive_selection(args)
@@ -1484,18 +1583,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "config": str(config_path.resolve()),
             "finished_at": _now(),
         }
-        atomic_json(result_path, result)
-        atomic_json(
-            status_path,
-            {
-                "state": "complete",
-                "stage": "complete",
-                "result": str(result_path.resolve()),
-                "finished_at": _now(),
-            },
-        )
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return 0
+        return _publish_result(result_path, status_path, result)
     except Exception as error:
         atomic_json(
             status_path,

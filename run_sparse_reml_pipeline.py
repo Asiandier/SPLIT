@@ -77,6 +77,8 @@ _sparsity_selection_mod = importlib.import_module(
     f"{pkg_name}.sparsity_selection"
 )
 _h2_se_mod = importlib.import_module(f"{pkg_name}.sparse_heritability_se")
+_aic_selection_mod = importlib.import_module(f"{pkg_name}.aic_selection")
+_checkpoint_mod = importlib.import_module(f"{pkg_name}.sparse_checkpoint")
 
 InfinitesimalREMLFitter = _inf_mod.InfinitesimalREMLFitter
 FitConfig = _inf_mod.FitConfig
@@ -786,6 +788,9 @@ def _emit_lasso_prediction(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run sparse REML + LASSO pipeline on real genotype data.")
     _h2_se_mod.add_h2_se_arguments(p)
+    p.add_argument("--lasso-selection-criterion", choices=("validation", "aic"), default="validation")
+    p.add_argument("--checkpoint", action="store_true",
+                   help="Atomically save/resume completed sparse outer iterations.")
     # Exactly one genotype source must be supplied. It may be partitioned into
     # disjoint GRM components by --component-spec.
     p.add_argument("--bed-prefix", default=env("BED_PREFIX", ""),
@@ -895,7 +900,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ring-depth", type=int, default=int(env("RING_DEPTH", "0")),
                    help="Pinned ring buffer depth (0 = auto, default 32)")
     p.add_argument("--n-rand-vec", type=int, default=100)
-    p.add_argument("--slq-samples", type=int, default=100)
+    p.add_argument("--slq-samples", type=int, default=50)
     p.add_argument("--slq-m", type=int, default=int(env("SLQ_M", "50")))
     p.add_argument("--slq-quadrature-tol", type=float, default=float(env("SLQ_QUADRATURE_TOL", "1e-6")),
                    help="Log quadrature error bound per sample; 0 uses fixed SLQ depth.")
@@ -1488,6 +1493,7 @@ def _materialize_validation_selected_lasso(
     selected_index: int,
     path_prediction_pcg_res: float,
     path_prediction_pcg_iters: int,
+    selection_method: str = "validation_predictive_r2",
 ) -> tuple[dict, dict]:
     """Make one validation-selected path row the alpha used downstream."""
     path_rows = list(lasso_path["path"])
@@ -1518,6 +1524,7 @@ def _materialize_validation_selected_lasso(
     merged_path = merge_path_diagnostics(path_rows, metrics)
     selection_record = {
         "selection_metric": (
+            "training_gaussian_AIC" if selection_method == "training_gaussian_AIC" else
             "predictive_r2_one_minus_sse_over_sst_total_phenotype_prediction"
         ),
         "selected": {
@@ -1540,7 +1547,7 @@ def _materialize_validation_selected_lasso(
             "active_idx": active_idx,
             "lam": float(selected_row["lam"]),
             "selected_index": index,
-            "selection_method": "validation_predictive_r2",
+            "selection_method": selection_method,
             "selected_lam_ratio": float(selected_row["lam_ratio"]),
             "validation_selection": selection_record,
         }
@@ -1619,6 +1626,7 @@ def _evaluate_lasso_path_on_validation(
     validation_outcome: np.ndarray,
     hinv_residual_path: np.ndarray | None = None,
     training_score_path: np.ndarray | None = None,
+    training_fixed_score_path: np.ndarray | None = None,
 ) -> dict[str, object]:
     """Evaluate one already-certified coefficient block on validation data."""
     validation_candidate = (
@@ -1645,6 +1653,7 @@ def _evaluate_lasso_path_on_validation(
         max_pcg_iters=int(args.max_pcg_iters),
         hinv_residual_path=hinv_residual_path,
         training_score_path=training_score_path,
+        training_fixed_score_path=training_fixed_score_path,
     )
     return {
         "metrics": evaluate_prediction_path(
@@ -3367,8 +3376,8 @@ def main() -> None:
         raise SystemExit('Invalid background SS matrix-free numerical settings.')
     if args.alpha_vamp_max_iterations < 1:
         raise SystemExit('alpha-vamp-max-iterations must be positive.')
-    if args.alpha_vamp and args.lasso_fixed_lam_ratio is None:
-        raise SystemExit('alpha-vamp requires a frozen-lambda final refit.')
+    if args.alpha_vamp and args.lasso_fixed_lam_ratio is None and args.lasso_selection_criterion != "aic":
+        raise SystemExit('alpha-vamp requires a frozen-lambda final refit or a training-AIC fit.')
     if int(args.screen_topk) < int(args.candidate_k):
         raise SystemExit("screen-topk must be >= candidate-k.")
     if int(args.outer_max) < 1:
@@ -3429,6 +3438,11 @@ def main() -> None:
         raise SystemExit("lasso-n-lambda must be >= 1.")
     fixed_ratio_refit = args.lasso_fixed_lam_ratio is not None
     iterative_validation_selection = not fixed_ratio_refit
+    aic_selection = iterative_validation_selection and args.lasso_selection_criterion == "aic"
+    if args.lasso_selection_criterion == "aic" and fixed_ratio_refit:
+        raise SystemExit("Training AIC and a frozen lambda ratio are mutually exclusive.")
+    if aic_selection and args.lasso_path_solver != "residual":
+        raise SystemExit("Experimental AIC requires the native residual Lasso solver.")
     if fixed_ratio_refit:
         args.lasso_fixed_lam_ratio = _canonical_fixed_lam_ratio(
             float(args.lasso_fixed_lam_ratio)
@@ -3469,6 +3483,8 @@ def main() -> None:
         args.sparsity_validation_pheno_txt
         or args.sparsity_validation_out
     )
+    if aic_selection and sparsity_validation_requested:
+        raise SystemExit("Training AIC does not accept validation-phenotype selection inputs.")
     if bool(args.sparsity_validation_pheno_txt) != bool(
         args.sparsity_validation_out
     ):
@@ -3476,7 +3492,7 @@ def main() -> None:
             "--sparsity-validation-pheno-txt and "
             "--sparsity-validation-out must be supplied together."
     )
-    if iterative_validation_selection and not sparsity_validation_requested:
+    if iterative_validation_selection and not aic_selection and not sparsity_validation_requested:
         raise SystemExit(
             "Sparse fitting requires both --sparsity-validation-pheno-txt "
             "and --sparsity-validation-out so validation predictive R2 can select "
@@ -3488,7 +3504,7 @@ def main() -> None:
             "Validation selection inputs and --lasso-fixed-lam-ratio are "
             "mutually exclusive stages."
         )
-    if iterative_validation_selection:
+    if iterative_validation_selection and not aic_selection:
         if not os.path.exists(args.sparsity_validation_pheno_txt):
             raise SystemExit(
                 "--sparsity-validation-pheno-txt does not exist: "
@@ -3624,6 +3640,14 @@ def main() -> None:
 
     out_prefix = args.out_prefix.strip() or "sparse_reml"
     ensure_parent_dir(out_prefix)
+    checkpoint = None
+    if args.checkpoint:
+        checkpoint = _checkpoint_mod.OuterCheckpoint(
+            out_prefix + '.outer_checkpoint.npz',
+            _checkpoint_mod.run_identity(args, bed_list=bed_list,
+                                         prediction_bed_list=prediction_bed_list),
+        )
+        atexit.register(checkpoint.close)
     if args.keep_out:
         ensure_parent_dir(args.keep_out)
         with open(args.keep_out, "w") as f:
@@ -3834,10 +3858,18 @@ def main() -> None:
         theta = np.concatenate([theta_g0, theta_e0], axis=0)
         theta_init_source = "equal_kernel_coefficients"
     theta_initial = theta.copy()
-    fitter._ensure_projected_core_precond_ready(
-        ops,
-        var_components_init=jnp.asarray(theta, dtype=jnp.float32),
-    )
+    restored_outer_state = checkpoint.load() if checkpoint is not None else None
+    if restored_outer_state is not None:
+        execution = dict(call_width=call_width, precond_rank=plan.precond_rank,
+                         ring_depth=plan.ring_depth)
+        if restored_outer_state['execution'] != execution:
+            raise RuntimeError('Checkpoint numerical layout differs from the current resource plan')
+        fitter.precond_conf = restored_outer_state['preconditioner']
+    else:
+        fitter._ensure_projected_core_precond_ready(
+            ops,
+            var_components_init=jnp.asarray(theta, dtype=jnp.float32),
+        )
     logger.info(
         "[INFO] init theta (%s) @ %s: %s",
         theta_init_source,
@@ -3857,7 +3889,9 @@ def main() -> None:
         verbose=args.verbose,
     )
 
-    if iterative_validation_selection:
+    if aic_selection:
+        logger.info("[training AIC] Native Lasso/REML with training-only marginal Gaussian AIC selection.")
+    elif iterative_validation_selection:
         logger.info(
             "[validation alpha] full-marker-KKT Lasso prefix will be evaluated "
             "incrementally with validation early stopping inside every "
@@ -3867,7 +3901,8 @@ def main() -> None:
     prediction_context: _PredictionFitContext | None = None
     validation_outcome: np.ndarray | None = None
     iterative_validation_trace: list[dict[str, object]] = []
-    if iterative_validation_selection:
+    aic_path = _aic_selection_mod.TrainingAIC(y_np, covar_np) if aic_selection else None
+    if iterative_validation_selection and not aic_selection:
         prediction_context = _build_prediction_fit_context(
             args=args,
             training_fitter=fitter,
@@ -4067,7 +4102,25 @@ def main() -> None:
         ),
     }
     outer = 0
-    while outer < int(args.outer_max) or final_alignment_pending:
+    fit_finished = False
+    if restored_outer_state is not None:
+        (
+            outer, theta, theta_lasso, support, candidate_cache,
+            previous_fixed_mean, previous_outer_h2, history, warm_screen,
+            warm_z_dict, warm_lasso_candidate, warm_lasso_beta_path,
+            sparse_path_performance, final_candidate, final_lasso,
+            variance_blocks_completed, outer_converged, outer_stop_reason,
+            final_alignment_pending, provisional_convergence,
+            final_alignment_completed, final_pair_available, final_pair_source,
+            final_alignment_warning, last_aligned_pair,
+            last_covariance_reml_diagnostics, final_information,
+            information_markers, mean_information, lasso_reml_stop_reason,
+            penalized_failure_reason, final_kkt_certificate,
+            iterative_validation_trace, lasso_warm_state_in_summary,
+        ) = (restored_outer_state[name] for name in _checkpoint_mod.STATE_NAMES)
+        fit_finished = restored_outer_state['checkpoint_stage'] == 'fit_complete'
+        del restored_outer_state
+    while not fit_finished and (outer < int(args.outer_max) or final_alignment_pending):
         final_alignment = bool(final_alignment_pending)
         final_alignment_pending = False
         if not final_alignment:
@@ -4183,6 +4236,7 @@ def main() -> None:
         # ---- Step 3/4: candidate LASSO with global KKT refinement ----------
         kkt_trace: list[dict] = []
         Z_cand = np.empty((n_samples, 0), dtype=np.float32)
+        extract_candidate_design = None
         sol_z_np = np.empty((n_samples, 0), dtype=np.float32)
         res_all = np.asarray(0.0, dtype=np.float32)
         it_all = 0
@@ -4212,7 +4266,7 @@ def main() -> None:
         # prefix can enter the validation comparison.
         if iterative_validation_selection:
             try:
-                if prediction_context is None or validation_outcome is None:
+                if not aic_selection and (prediction_context is None or validation_outcome is None):
                     raise RuntimeError(
                         "Iterative validation selection context is unavailable."
                     )
@@ -4225,7 +4279,14 @@ def main() -> None:
                     beta_snp_path,
                     hinv_residual_path,
                     training_score_path,
+                    training_fixed_score_path=None,
                 ):
+                    if aic_selection:
+                        return aic_path.evaluate(candidate=candidate, train_candidate=train_candidate,
+                            beta_cov_path=beta_cov_path, beta_snp_path=beta_snp_path,
+                            hinv_residual_path=hinv_residual_path, training_score_path=training_score_path,
+                            hv=hv, precond=precond, sigma=float(theta[-1]),
+                            pcg_tolerance=float(args.pcg_tol), maxiter=int(args.max_pcg_iters))
                     return _evaluate_lasso_path_on_validation(
                         args=args,
                         fitter=fitter,
@@ -4240,6 +4301,7 @@ def main() -> None:
                         validation_outcome=validation_outcome,
                         hinv_residual_path=hinv_residual_path,
                         training_score_path=training_score_path,
+                        training_fixed_score_path=training_fixed_score_path,
                     )
 
                 if args.lasso_path_solver == "residual":
@@ -4253,7 +4315,11 @@ def main() -> None:
                         max_iterations=int(args.basil_max_iterations),
                         workspace_bytes=int(getattr(fitter.streamers[0], "_sparse_fp64_workspace_bytes", 0)),
                         validation_evaluator=evaluate_basil_validation_block,
-                        stopping_rule=lambda values: _validation_path_early_stopping_decision(
+                        validation_requires_training_design=bool(aic_selection),
+                        previous_candidate=warm_lasso_candidate,
+                        previous_beta_path=warm_lasso_beta_path,
+                        materialize_result_design=False,
+                        stopping_rule=lambda values: (_aic_selection_mod.stopping_decision if aic_selection else _validation_path_early_stopping_decision)(
                             values, stopping_lag=int(args.validation_early_stopping_lag)),
                     )
                     residual_performance = basil_result["lasso_path"]["basil"]["performance"]
@@ -4286,7 +4352,9 @@ def main() -> None:
                 candidate = np.asarray(
                     basil_result["candidate"], dtype=np.int64
                 )
-                Z_cand = np.asarray(basil_result["geno"], dtype=np.float32)
+                Z_cand = (None if basil_result["geno"] is None else
+                          np.asarray(basil_result["geno"], dtype=np.float32))
+                extract_candidate_design = basil_result.get("extract_geno")
                 sol_z_np = (None if basil_result["hinv_geno"] is None else
                     np.asarray(basil_result["hinv_geno"], dtype=np.float32))
                 warm_z_dict = dict(basil_result["hinv_z_dict"])
@@ -4296,7 +4364,7 @@ def main() -> None:
                 validation_bundle = dict(basil_result["validation"])
                 del basil_result
                 validation_metrics = list(validation_bundle["metrics"])
-                selected_index = _select_converged_validation_path_index(
+                selected_index = (_aic_selection_mod.select_index if aic_selection else _select_converged_validation_path_index)(
                     list(lasso_path["path"]), validation_metrics
                 )
                 lasso, validation_record = (
@@ -4310,6 +4378,7 @@ def main() -> None:
                         path_prediction_pcg_iters=int(
                             validation_bundle["pcg_max_iters"]
                         ),
+                        selection_method="training_gaussian_AIC" if aic_selection else "validation_predictive_r2",
                     )
                 )
                 validation_record["early_stopping"] = dict(
@@ -4318,6 +4387,11 @@ def main() -> None:
                 validation_record["incremental_batches"] = list(
                     validation_bundle["trace"]
                 )
+                if aic_selection:
+                    validation_record.pop("path_prediction_pcg_true_res", None)
+                    validation_record.pop("path_prediction_pcg_iters", None)
+                    validation_record["prediction_requested"] = False
+                    validation_record["native_training_dual_pcg_max_residual"] = float(residual_performance["max_pcg_residual"])
                 lasso["validation_selection"] = validation_record
                 validation_selection_seconds = float(
                     validation_bundle["seconds"]
@@ -4401,7 +4475,12 @@ def main() -> None:
                     **validation_record,
                 }
                 iterative_validation_trace.append(trace_record)
-                logger.info(
+                if aic_selection:
+                    logger.info("[outer %s training AIC] ratio=%.6g active=%s AIC=%.8f",
+                        outer, float(lasso["selected_lam_ratio"]), int(active_local.size),
+                        float(validation_record["selected"]["aic"]))
+                else:
+                    logger.info(
                     "[outer %s validation alpha/BASIL] ever_active=%s "
                     "ratio=%.6g active=%s validation_predictive_R2=%.8f",
                     outer,
@@ -5008,12 +5087,23 @@ def main() -> None:
             lasso.get("beta_cov", np.empty((0,))), dtype=np.float64
         )
         beta_snp_current = np.asarray(lasso["beta_snp"], dtype=np.float64)
+        # The path may visit tens of thousands of variants while selecting
+        # only a few thousand. Materialize the selected span once, rather than
+        # rebuilding the complete path union and multiplying its zero columns.
+        if Z_cand is None:
+            active_design = extract_candidate_design(candidate[active_local])
+            extract_candidate_design = None
+            residual_design = active_design
+            residual_beta = beta_snp_current[active_local]
+        else:
+            active_design = Z_cand[:, active_local]
+            residual_design, residual_beta = Z_cand, beta_snp_current
         residual = _lasso_residual(
             y=y_np,
             covar=covar_np,
-            geno=Z_cand,
+            geno=residual_design,
             beta_cov=beta_cov_current,
-            beta_snp=beta_snp_current,
+            beta_snp=residual_beta,
         )
         fixed_mean_current = np.asarray(y_np, dtype=np.float64) - residual
         sparse_mean_current = fixed_mean_current.copy()
@@ -5023,7 +5113,7 @@ def main() -> None:
         active_markers = candidate[active_local]
         if information_markers is None or not np.array_equal(active_markers, information_markers):
             mean_information = SparseMeanInformation(
-                Z_cand[:, active_local], covar_np,
+                active_design, covar_np,
                 hinv_active=None if sol_z_np is None else sol_z_np[:, active_local],
                 batch_size=int(args.candidate_pcg_rhs_batch_size),
             )
@@ -5070,7 +5160,7 @@ def main() -> None:
             )
         selected_validation_r2 = (
             float(lasso["validation_selection"]["selected"]["predictive_r2"])
-            if lasso.get("validation_selection") is not None else None
+            if lasso.get("validation_selection") is not None and not aic_selection else None
         )
         # Every score-bearing record describes alpha and its actual covariance.
         if iterative_validation_selection:
@@ -5337,8 +5427,8 @@ def main() -> None:
                         "predictive_r2"
                     ]
                 )
-                if lasso.get("validation_selection") is not None
-                else "fixed"
+                if lasso.get("validation_selection") is not None and not aic_selection
+                else "AIC" if aic_selection else "fixed"
             ),
             "deferred" if selected_h2 is None else "%.6f" % selected_h2,
             outer_h2,
@@ -5373,6 +5463,10 @@ def main() -> None:
                 int(args.outer_max),
                 str(lasso["selection_method"]),
             )
+        if checkpoint is not None:
+            checkpoint.save(_checkpoint_mod.capture_state(locals(), stage='outer_complete'))
+    if checkpoint is not None and not fit_finished and final_pair_available and penalized_failure_reason is None:
+        checkpoint.save(_checkpoint_mod.capture_state(locals(), stage='fit_complete'))
     # Freeze the primary COHERIT branch.  The final Lasso and theta now come
     # from the same covariance, with convergence checked on this returned pair.
     theta_lasso_ml = np.asarray(theta, dtype=np.float64).copy()
@@ -5736,7 +5830,17 @@ def main() -> None:
         "requested": bool(prediction_active),
         "status": "not_requested",
     }
-    if iterative_validation_selection and lasso_branch_valid:
+    if aic_selection and lasso_branch_valid:
+        atomic_json(out_prefix + ".aic.json", _json_safe_value(dict(
+            criterion="training_gaussian_AIC", data_role="training_only", n=n_samples,
+            validation_phenotypes_read=False, outer_converged=lasso_ml_outer_converged,
+            outer_selection_trace=iterative_validation_trace,
+            final_selected=final_lasso["validation_selection"]["selected"],
+            path=final_lasso["validation_selection"]["path"],
+            early_stopping_is_heuristic=True)))
+        sparsity_validation_summary = {"requested": False, "status": "not_requested",
+            "selection_criterion": "training_gaussian_AIC"}
+    elif iterative_validation_selection and lasso_branch_valid:
         if validation_outcome is None or final_lasso is None:
             raise RuntimeError(
                 "Iterative validation selection completed without a final model."
@@ -5905,6 +6009,7 @@ def main() -> None:
         ),
         "grm_variance_scale": "trace_weighted",
         "genetic_trace_atoms": genetic_trace_atoms.tolist(),
+        "selection_criterion": "fixed_ratio_refit" if fixed_ratio_refit else args.lasso_selection_criterion,
         "lambda_selection_method": (
             str(final_lasso["selection_method"])
             if final_lasso is not None
@@ -5928,15 +6033,20 @@ def main() -> None:
         "lasso_validation_early_stopping": (
             dict(final_lasso.get("validation_early_stopping", {}))
             if final_lasso is not None
-            and iterative_validation_selection
+            and iterative_validation_selection and not aic_selection
             else None
+        ),
+        "lasso_aic_early_stopping": (
+            dict(final_lasso.get("validation_early_stopping", {}))
+            if final_lasso is not None and aic_selection else None
         ),
         "sparse_path_performance_optimizations": dict(
             sparse_path_performance
         ),
         "validation_selection_inside_outer_loop": bool(
-            iterative_validation_selection
+            iterative_validation_selection and not aic_selection
         ),
+        "aic_selection_inside_outer_loop": bool(aic_selection),
         "lasso_fixed_lam_ratio_requested": args.lasso_fixed_lam_ratio,
         "lasso_selected_lam_ratio": (
             float(final_lasso["selected_lam_ratio"])
@@ -5950,7 +6060,7 @@ def main() -> None:
                 ]
             )
             if final_lasso is not None
-            and final_lasso.get("validation_selection") is not None
+            and final_lasso.get("validation_selection") is not None and not aic_selection
             else None
         ),
         "var_components_lasso_ml": theta_lasso_ml.tolist(),
@@ -6107,6 +6217,8 @@ def main() -> None:
     # Summary is the completion marker: publish it only after every requested
     # artifact is closed, including selected SNPs and reusable sparse state.
     artifacts = [out_prefix + ".history.json", out_prefix + ".selected_snps.tsv"]
+    if aic_selection and lasso_branch_valid:
+        artifacts.append(out_prefix + ".aic.json")
     if args.h2_se:
         artifacts.append(h2_se_path)
     if args.lasso_warm_state_out:

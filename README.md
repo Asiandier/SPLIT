@@ -100,13 +100,19 @@ update, the covariance, covariate, and selected-span determinants are evaluated
 jointly in an orthogonal contrast space. This equivalent objective avoids
 solving for every selected column at each line-search point; the residual
 quadratic still profiles only the covariates, leaving the LASSO mean fixed.
-The existing SLQ probe count and numerical tolerances are retained, although
-the finite-probe representation changes. Projection buffers are released
+The sparse entry points default to 50 fixed SLQ probes (`--slq-samples 50`),
+with the existing Lanczos quadrature tolerance and maximum depth. The probe
+count controls Monte Carlo precision; different counts or determinant
+representations need not produce identical numerical trajectories. Projection buffers are released
 before the endpoint calibration. If the additional basis does not fit the
 sparse memory plan, the original direct calculation is used.
 The sparse quadratic subtracts
 `tr{B (B' P_C B)^-1 B'}/n`. These are paired local mean-information corrections;
 the Lasso residual quadratic itself retains `P_C`.
+For long sparse fits, `--checkpoint` saves completed outer iterations and
+resumes the same command after interruption. See [checkpoint scope and
+compatibility](docs/sparse_checkpoints.md).
+
 See [sparse numerical contracts](docs/sparse_numerics.md) for the determinant
 identity, KKT certificates, precision policy and the roles of both solvers.
 The projected covariance update does not require this trace before taking a
@@ -180,6 +186,11 @@ configured physical window (1 Mb by default), validates it by variant ID, and
 caches the compact score table. PLINK's large temporary pair table is removed
 after successful conversion.
 
+Fixed-GRM runs can use `--selection-criterion aic` to fit the full supplied
+cohort without validation inputs or a second combined-sample refit. The default
+validation workflow is unchanged. See [training-only AIC selection](docs/aic_selection.md)
+for the model, numerical checks, outputs and interpretation.
+
 Sparse-run output semantics are deliberately explicit:
 
 - `estimator_mode` is `coherit` and `computed_estimators` contains only
@@ -210,7 +221,12 @@ Sparse-run output semantics are deliberately explicit:
   Within each fixed covariance, previous solution directions provide a Galerkin
   initial guess and a balanced PCG preconditioner; every accepted solve still
   passes an independent true-residual check. The bounded working-set batches
-  are retained, and both caches are local to one Lasso path. The lambda grid,
+  are retained, and both caches are local to one Lasso path. Decoded columns
+  stay on the host; their FP64 device copies use a bounded cache that reserves
+  operator and matrix-product workspace. A full cache evicts unpinned blocks
+  and reloads their identical values on demand, without limiting the number
+  of candidate SNPs. Live matrix operands remain pinned until completion.
+  The lambda grid,
   validation rule and KKT tolerance are unchanged. The default remains `basil`;
   fixed-lambda refits retain their existing solver.
 - `var_components_lasso_ml` contains one kernel coefficient per fixed GRM

@@ -10,6 +10,8 @@ import logging
 import json
 import math
 import time
+from collections import OrderedDict
+from contextlib import contextmanager
 
 import jax
 import jax.numpy as jnp
@@ -145,7 +147,15 @@ def expand_bfgs_metric(metric, cross, block, pairs, old_indices, new_indices):
         sla.blas.dger(-1/pair['denominator'], new_product, new_product, a=block, overwrite_a=1)
         sla.blas.dger(1/pair['target'], new_change, new_change, a=block, overwrite_a=1)
         pair['product'] = np.concatenate([old_product, new_product])
-    return np.asfortranarray(np.block([[metric, cross], [cross.T, block]]))
+    # np.block followed by asfortranarray temporarily duplicates the complete
+    # k-by-k metric. Populate the final column-major buffer directly instead.
+    old_size, new_size = metric.shape[0], block.shape[0]
+    expanded = np.empty((old_size+new_size, old_size+new_size), order='F')
+    expanded[:old_size, :old_size] = metric
+    expanded[:old_size, old_size:] = cross
+    expanded[old_size:, :old_size] = cross.T
+    expanded[old_size:, old_size:] = block
+    return expanded
 
 
 def extrapolate(beta, score, indices, previous_beta, previous_score,
@@ -248,10 +258,83 @@ def _matmul(a, b, *, transpose_a=False, workspace_limit=0):
     return (a.T if transpose_a else a)@b
 
 
+class _DeviceColumnCache:
+    """Keep decoded columns on the host and cache FP64 device copies on demand.
+
+    Eviction changes storage only. Columns, their order, and every arithmetic
+    operation remain the same. Pinned operands survive until their operation
+    completes; scratch and operator workspaces are reserved independently.
+    """
+    def __init__(self, host_blocks, device, *, memory_limit=None, reserve_bytes=0):
+        self.host_blocks = host_blocks
+        self.device = device
+        self.memory_limit = memory_limit
+        self.reserve_bytes = int(reserve_bytes)
+        self.arrays = OrderedDict()
+        self.pins = {}
+        self.evictions = self.uploads = self.uploaded_bytes = 0
+        self.peak_resident_bytes = 0
+
+    def _make_room(self, additional_bytes=0):
+        stats = self.device.memory_stats()
+        if stats is None:
+            return
+        capacity = int(stats['bytes_limit'])
+        if self.memory_limit is not None and self.memory_limit > 0:
+            capacity = min(capacity, int(self.memory_limit))
+        required = int(additional_bytes)+self.reserve_bytes
+        while int(stats['bytes_in_use'])+required > capacity:
+            victim = next((i for i in self.arrays if not self.pins.get(i, 0)), None)
+            if victim is None:
+                raise MemoryError(
+                    'Residual Lasso needs more device memory for two column blocks '
+                    'and its operator workspace, even after evicting cached columns')
+            value = self.arrays.pop(victim)
+            value.block_until_ready()
+            value.delete()
+            self.evictions += 1
+            stats = self.device.memory_stats()
+
+    @contextmanager
+    def hold(self, index):
+        if index not in self.arrays:
+            host = self.host_blocks[index]
+            size = int(host.size)*np.dtype(np.float64).itemsize
+            self._make_room(size)
+            with jax.default_device(self.device):
+                self.arrays[index] = jnp.asarray(host, dtype=jnp.float64)
+            self.uploads += 1
+            self.uploaded_bytes += size
+            self.peak_resident_bytes = max(self.peak_resident_bytes,
+                sum(int(a.size)*a.dtype.itemsize for a in self.arrays.values()))
+        self.arrays.move_to_end(index)
+        self.pins[index] = self.pins.get(index, 0)+1
+        try:
+            yield self.arrays[index]
+        finally:
+            self.pins[index] -= 1
+
+    def clear(self):
+        if any(self.pins.values()):
+            raise RuntimeError('Cannot evict a live Lasso matrix operand')
+        for value in self.arrays.values():
+            value.block_until_ready()
+            value.delete()
+        self.arrays.clear()
+
+    def metrics(self):
+        return dict(evictions=self.evictions, uploads=self.uploads,
+            uploaded_bytes=self.uploaded_bytes, peak_resident_bytes=self.peak_resident_bytes,
+            reserve_bytes=self.reserve_bytes)
+
+
 def fit_weighted_residual_path(*, fitter, grm_index, hv, precond, theta, y,
         covar, lam_max, path_cfg, pcg_tol, max_pcg_iters, pcg_ridge,
         marker_batch, max_iterations, workspace_bytes, validation_evaluator,
-        stopping_rule, use_preconditioned_metric=True):
+        stopping_rule, use_preconditioned_metric=True,
+        validation_requires_training_design=True,
+        previous_candidate=None, previous_beta_path=None,
+        materialize_result_design=True):
     """Fit a validation path without inverse-covariance candidate columns.
 
     ``stopping_rule`` and ``validation_evaluator`` are supplied by the supported
@@ -266,13 +349,17 @@ def fit_weighted_residual_path(*, fitter, grm_index, hv, precond, theta, y,
             pcg_ridge=pcg_ridge, marker_batch=marker_batch,
             max_iterations=max_iterations, workspace_bytes=workspace_bytes,
             validation_evaluator=validation_evaluator, stopping_rule=stopping_rule,
-            use_preconditioned_metric=use_preconditioned_metric)
+            use_preconditioned_metric=use_preconditioned_metric,
+            validation_requires_training_design=validation_requires_training_design,
+            previous_candidate=previous_candidate, previous_beta_path=previous_beta_path,
+            materialize_result_design=materialize_result_design)
 
 
 def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         path_cfg, pcg_tol, max_pcg_iters, pcg_ridge, marker_batch,
         max_iterations, workspace_bytes, validation_evaluator, stopping_rule,
-        use_preconditioned_metric):
+        use_preconditioned_metric, validation_requires_training_design,
+        previous_candidate, previous_beta_path, materialize_result_design):
     started = time.perf_counter()
     n = np.asarray(y).size
     if len(fitter.streamers) != 1 or path_cfg.fixed_lam_ratio is not None:
@@ -323,8 +410,17 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
             c_features = np.empty((c.shape[1], 0))
     indices = np.empty(0, dtype=np.int64)
     beta = np.empty(0)
-    blocks = []
     host_blocks = []
+    # The old append-only device list could fill VRAM on later outer rounds.
+    # Keep its exact host values and reuse available VRAM without constraining
+    # the statistical working set. Reserve the existing operator/GEMM scratch
+    # plus a conversion block and small products while two operands are live.
+    scratch = (workspace_bytes if workspace_bytes > 0 else
+        16*n*int(getattr(stream, 'call_width', 0)))
+    max_block = 2*max(1, int(marker_batch))
+    cache = _DeviceColumnCache(host_blocks, next(iter(yj.devices())),
+        memory_limit=getattr(getattr(fitter, 'cfg', None), 'gpu_budget_bytes', None),
+        reserve_bytes=scratch+8*n*max_block+8*max_block**2+64*n)
     block_of_marker = np.full(int(grm_index.m_total), -1, dtype=np.int32)
     column_of_marker = np.zeros(int(grm_index.m_total), dtype=np.int32)
 
@@ -347,6 +443,23 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         fitted_seconds=0., covariance_solve_seconds=0., score_seconds=0.,
         gradient_events=[], certificate_reuses=0,
         max_pcg_iterations=0, validation_pcg_residual=0., validation_pcg_iterations=0)
+    # Reuse only coefficients, never old gradients or curvature after H changes.
+    # A previous outer path supplies an optional CD starting point at the same
+    # lambda-grid index. Restrict it to this working set and accept it only if
+    # it lowers the CURRENT convex quadratic subproblem. The unchanged inner
+    # and full-marker KKT checks still determine every returned solution.
+    old_column = np.full(int(grm_index.m_total), -1, dtype=np.int64)
+    prior_path = None
+    if previous_beta_path is not None:
+        prior_indices = np.asarray(previous_candidate, dtype=np.int64)
+        prior_path = np.asarray(previous_beta_path, dtype=np.float64)
+        if (prior_indices.ndim != 1 or np.unique(prior_indices).size != prior_indices.size
+                or np.any(prior_indices < 0) or np.any(prior_indices >= grm_index.m_total)
+                or prior_path.ndim != 2 or prior_path.shape[1] != len(prior_indices)
+                or not np.isfinite(prior_path).all()):
+            raise ValueError('Previous Lasso coefficient path has an invalid marker layout')
+        old_column[prior_indices] = np.arange(len(prior_indices))
+    warm_rows_used = set()
     lambdas = make_lambda_sequence(lam_max, path_cfg.lam_min_ratio, path_cfg.n_lambda)
     lam = float(lambdas[0])
 
@@ -356,9 +469,11 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
     def fitted(coef):
         value = jnp.zeros((n, 1), dtype=jnp.float64)
         start = 0
-        for block in blocks:
-            end = start+block.shape[1]
-            value = value+block@jnp.asarray(coef[start:end, None])
+        for index, host in enumerate(host_blocks):
+            end = start+host.shape[1]
+            if np.any(coef[start:end] != 0.):
+                with cache.hold(index) as block:
+                    value = (value+block@jnp.asarray(coef[start:end, None])).block_until_ready()
             start = end
         return value
 
@@ -412,6 +527,7 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         tolerance = tolerance_at(lam)
         old_state = dict(beta=beta.copy(), score=gradient.copy(), warm=warm,
             lam=previous_lam, bound=diagnostic['gradient_error_bound'])
+        prior_attempted = False
         if previous_state is not None:
             guess = extrapolate(beta, gradient, indices,
                 previous_state['beta'], previous_state['score'], lam, previous_lam,
@@ -449,31 +565,23 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
             fresh = eligible[np.argsort(-outside[eligible], kind='stable')[:batch]]
             if len(fresh):
                 tick = time.perf_counter()
-                stats = next(iter(yj.devices())).memory_stats()
-                if stats is not None:
-                    # Leave the requested GEMM workspace and a second block
-                    # for conversion/validation. This is a capacity check, not
-                    # a statistical restriction on the number of candidates.
-                    scratch = (workspace_bytes if workspace_bytes > 0 else
-                        16*n*int(getattr(stream, 'call_width', 0)))
-                    need = int(stats['bytes_in_use'])+16*n*len(fresh)+scratch
-                    capacity = int(stats['bytes_limit'])
-                    configured = getattr(getattr(fitter, 'cfg', None), 'gpu_budget_bytes', None)
-                    if configured is not None and configured > 0:
-                        capacity = min(capacity, int(configured))
-                    if need > capacity:
-                        raise MemoryError('Residual Lasso working set exceeds device headroom')
                 host_new = grm_index.extract_standardized_columns(fresh)
-                new = jnp.asarray(host_new, dtype=jnp.float64)
-                cross = np.concatenate([np.asarray(_matmul(old, new,
-                    transpose_a=True, workspace_limit=workspace_bytes)) for old in blocks],
-                    axis=0) if blocks else np.empty((0, len(fresh)))
-                block = np.asarray(_matmul(new, new, transpose_a=True,
-                    workspace_limit=workspace_bytes))
+                block_id = len(host_blocks)
+                host_blocks.append(host_new)
+                with cache.hold(block_id) as new:
+                    crosses = []
+                    for previous in range(block_id):
+                        with cache.hold(previous) as old:
+                            crosses.append(np.asarray(_matmul(old, new,
+                                transpose_a=True, workspace_limit=workspace_bytes)))
+                    cross = np.concatenate(crosses, axis=0) if crosses else np.empty((0, len(fresh)))
+                    block = np.asarray(_matmul(new, new, transpose_a=True,
+                        workspace_limit=workspace_bytes))
+                    if geometry is not None:
+                        uz = np.asarray(_matmul(u_basis, new,
+                            transpose_a=True, workspace_limit=workspace_bytes))
+                        cz = geometry.covar_features(np.asarray(jnp.asarray(c).T@new), uz)
                 if geometry is not None:
-                    uz = np.asarray(_matmul(u_basis, new,
-                        transpose_a=True, workspace_limit=workspace_bytes))
-                    cz = geometry.covar_features(np.asarray(jnp.asarray(c).T@new), uz)
                     cross = geometry.block(cross, u_features, uz, c_features, cz)
                     block = geometry.block(block, uz, uz, cz, cz)
                     u_features = np.concatenate([u_features, uz], axis=1)
@@ -481,16 +589,28 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
                 else:
                     cross, block = cross/sigma, block/sigma
                 metric = expand_bfgs_metric(metric, cross, block, pairs, indices, fresh)
-                block_of_marker[fresh] = len(host_blocks)
+                block_of_marker[fresh] = block_id
                 column_of_marker[fresh] = np.arange(len(fresh), dtype=np.int32)
-                host_blocks.append(host_new)
-                blocks.append(new)
                 indices = np.concatenate([indices, fresh])
                 beta = np.pad(beta, (0, len(fresh)))
                 counters['metric_seconds'] += time.perf_counter()-tick
             tick = time.perf_counter()
+            cd_start = beta
+            if prior_path is not None and path_index < len(prior_path) and not prior_attempted:
+                prior_attempted = True
+                mapped = old_column[indices]
+                known = mapped >= 0
+                seed = np.zeros_like(beta)
+                seed[known] = prior_path[path_index, mapped[known]]
+                direction = seed-beta
+                change = (.5*float(direction@(metric@direction))
+                          -float(gradient[indices]@direction)
+                          +lam*float(np.abs(seed).sum()-np.abs(beta).sum()))
+                if np.isfinite(change) and change < 0:
+                    cd_start = seed
+                    warm_rows_used.add(path_index)
             proposal, _, _, passed = solve_lasso_cd_gram(metric,
-                metric@beta+gradient[indices], lam, beta0=beta,
+                metric@beta+gradient[indices], lam, beta0=cd_start,
                 max_iter=path_cfg.max_cd_iter, tol=min(path_cfg.cd_tol, 1e-8),
                 kkt_abs_tol=.1*path_cfg.kkt_abs_tol,
                 kkt_rel_tol=.1*path_cfg.kkt_rel_tol)
@@ -541,7 +661,8 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
             raise RuntimeError(f'Residual Lasso failed KKT at path index {path_index}')
         active = np.flatnonzero(beta != 0.)
         selected = indices[active]
-        gamma = sla.solve_triangular(rc, np.asarray(qc.T@(yj-fitted(beta))-hqc.T@warm),
+        fixed_train = fitted(beta)
+        gamma = sla.solve_triangular(rc, np.asarray(qc.T@(yj-fixed_train)-hqc.T@warm),
             check_finite=False).reshape(-1) if c.shape[1] else np.empty(0)
         row = dict(path_index=path_index, k=len(active), lam=lam, lam_ratio=lam/lam_max,
             converged=True, kkt_passed=True, global_kkt_passed=True,
@@ -550,10 +671,13 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
             global_kkt_max_outside_score=lam+check['inactive_error'],
             score_error_bound=diagnostic['gradient_error_bound'], iterations=iteration)
         tick = time.perf_counter()
+        prediction_reuse = ({} if validation_requires_training_design else
+                            dict(training_fixed_score_path=np.asarray(fixed_train)))
         evaluated = validation_evaluator(candidate=selected,
-            train_candidate=cached_design(selected),
+            train_candidate=(cached_design(selected) if validation_requires_training_design else None),
             beta_cov_path=gamma[None, :], beta_snp_path=beta[active][None, :],
-            hinv_residual_path=np.asarray(warm), training_score_path=gradient[:, None])
+            hinv_residual_path=np.asarray(warm), training_score_path=gradient[:, None],
+            **prediction_reuse)
         counters['validation_seconds'] += time.perf_counter()-tick
         counters['validation_pcg_residual'] = max(counters['validation_pcg_residual'], evaluated['pcg_rel_res'])
         counters['validation_pcg_iterations'] = max(counters['validation_pcg_iterations'], evaluated['pcg_iters'])
@@ -562,9 +686,11 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         gammas.append(gamma)
         metrics.append(dict(evaluated['metrics'][0], path_index=path_index))
         stopping = stopping_rule(metrics)
-        logger.info('[residual Lasso] point=%s/%s support=%s KKT=%.3g/%.3g validation=%.8f time=%.1fs',
+        label='AIC' if 'aic' in metrics[-1] else 'validation'
+        value=metrics[-1]['aic'] if label=='AIC' else metrics[-1]['predictive_r2']
+        logger.info('[residual Lasso] point=%s/%s support=%s KKT=%.3g/%.3g %s=%.8f time=%.1fs',
             path_index+1, len(lambdas), len(active), check['upper_bound'], tolerance,
-            metrics[-1]['predictive_r2'], time.perf_counter()-started)
+            label, value, time.perf_counter()-started)
         if stopping['stopped']:
             break
         if path_index >= 1:
@@ -577,6 +703,8 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
     counters['recycling_rank'] = recycling.rank
     counters['recycling_dependent'] = recycling.dependent
     counters['recycling_memory_skips'] = recycling.memory_skips
+    counters['device_column_cache'] = cache.metrics()
+    cache.clear()
     counters['total_seconds'] = time.perf_counter()-started
     metadata = dict(algorithm='residual_proximal_quasi_newton_global_kkt', n_iterations=len(trace),
         base_marker_batch_size=marker_batch, lambda_block_size=1,
@@ -587,12 +715,17 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
     return dict(lasso_path=dict(path=rows, beta_snp_path=beta_path,
         beta_cov_path=np.asarray(gammas), lam_max=lam_max, selected_index=None,
         selection_method=None, selected_lam_ratio=None,
-        path_role='kkt_certified_validation_prefix_residual_lasso',
+        path_role=('kkt_certified_training_aic_prefix_residual_lasso'
+                   if metrics and 'aic' in metrics[-1]
+                   else 'kkt_certified_validation_prefix_residual_lasso'),
         requested_n_lambda=len(lambdas), evaluated_n_lambda=len(rows),
         validation_metrics=metrics, validation_early_stopping=stopping,
-        external_beta_path_warm_start_used=False, external_beta_path_warm_start_rows_used=0,
+        external_beta_path_warm_start_used=bool(warm_rows_used),
+        external_beta_path_warm_start_rows_used=len(warm_rows_used),
         basil=metadata), candidate=final_candidate,
-        geno=cached_design(final_candidate), hinv_geno=None,
+        geno=cached_design(final_candidate) if materialize_result_design else None,
+        extract_geno=None if materialize_result_design else cached_design,
+        hinv_geno=None,
         hinv_z_dict={}, kkt_trace=trace,
         candidate_pcg=dict(n_columns=0, n_batches=0, batch_size=0,
             max_true_relative_residual=counters['max_pcg_residual'],

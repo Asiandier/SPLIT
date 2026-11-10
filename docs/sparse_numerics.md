@@ -27,6 +27,25 @@ steps; they do not replace the covariance in the fitted objective. Exact
 quadratic changes along a proposed direction, together with propagated solve
 error bounds, control line-search acceptance.
 
+The residual solver retains FP64 proposal geometry and score certificates.
+Previous outer coefficients may initialize a quadratic subproblem only when
+they lower that subproblem's current objective. Old gradients are never reused
+after the covariance changes.
+
+Validation reuses the already computed training score $Zb$. It still checks
+the covariance solve against $y-C\gamma-Zb$ and refines it when needed. Only
+the final selected design is materialized for the following information
+correction; the entire path's candidate union is not needed for that step.
+These changes retain the lambda grid, validation stopping rule and full-marker
+KKT conditions. Finite-tolerance iterates can differ with warm starts.
+
+The sparse entry points default to 50 fixed SLQ probes. The maximum Lanczos
+depth remains 50, with its existing
+quadrature tolerance. Probe count controls Monte Carlo trace precision;
+reducing it from 100 does not imply an identical numerical likelihood.
+Explicit `--slq-samples` values remain supported and are recorded in the run
+configuration. Ordinary REML code and its settings are unchanged.
+
 The acceptance conditions for every path point are
 
 $$

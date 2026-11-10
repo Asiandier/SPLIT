@@ -280,6 +280,7 @@ def _predict_sparse_path(
     max_pcg_iters: int,
     hinv_residual_path: np.ndarray | None = None,
     training_score_path: np.ndarray | None = None,
+    training_fixed_score_path: np.ndarray | None = None,
 ) -> SparsePathPrediction:
     y = np.asarray(y_train, dtype=np.float64).reshape(-1)
     n_train = int(y.size)
@@ -288,11 +289,14 @@ def _predict_sparse_path(
     n_test = int(test_streamer.n)
     c_train = _as_design(train_covar, n_rows=n_train, name="train_covar")
     c_test = _as_design(test_covar, n_rows=n_test, name="test_covar")
-    z_train = _as_design(
-        train_candidate_geno,
-        n_rows=n_train,
-        name="train_candidate_geno",
-    )
+    # Residual-path fitting has already computed Z_train @ alpha in FP64.
+    # Reuse that n-by-path score rather than reconstructing and promoting an
+    # n-by-support design at every lambda. The dual is still independently
+    # checked against the resulting residual below.
+    z_train = None
+    if training_fixed_score_path is None:
+        z_train = _as_design(train_candidate_geno, n_rows=n_train,
+                             name="train_candidate_geno")
     z_test = _as_design(
         test_candidate_geno,
         n_rows=n_test,
@@ -300,7 +304,7 @@ def _predict_sparse_path(
     )
     if c_train.shape[1] != c_test.shape[1]:
         raise ValueError("Training and validation covariate widths do not match.")
-    if z_train.shape[1] != z_test.shape[1]:
+    if z_train is not None and z_train.shape[1] != z_test.shape[1]:
         raise ValueError("Training and validation candidate widths do not match.")
 
     beta_cov_path = _as_coefficient_path(
@@ -310,7 +314,7 @@ def _predict_sparse_path(
     )
     beta_candidate_path = _as_coefficient_path(
         beta_candidate_path,
-        n_columns=z_train.shape[1],
+        n_columns=z_test.shape[1],
         name="beta_candidate_path",
     )
     if beta_cov_path.shape[0] != beta_candidate_path.shape[0]:
@@ -339,7 +343,13 @@ def _predict_sparse_path(
         raise ValueError(theta_error)
 
     nuisance_train = c_train @ beta_cov_path.T
-    fixed_train = z_train @ beta_candidate_path.T
+    if training_fixed_score_path is None:
+        fixed_train = z_train @ beta_candidate_path.T
+    else:
+        fixed_train = _as_design(training_fixed_score_path, n_rows=n_train,
+                                 name="training_fixed_score_path")
+        if fixed_train.shape[1] != n_path:
+            raise ValueError("Training fixed scores and coefficient paths differ in length.")
     residual = y[:, None] - nuisance_train - fixed_train
 
     ops = fitter._assemble_reml_operators()
@@ -510,6 +520,7 @@ def predict_sparse_path_partitioned(
     max_pcg_iters: int,
     hinv_residual_path: np.ndarray | None = None,
     training_score_path: np.ndarray | None = None,
+    training_fixed_score_path: np.ndarray | None = None,
 ) -> SparsePathPrediction:
     """Predict a Lasso path for one source partitioned into multiple GRMs."""
     train_streamer = getattr(fitter, "_partitioned_streamer", None)
@@ -548,6 +559,7 @@ def predict_sparse_path_partitioned(
         max_pcg_iters=max_pcg_iters,
         hinv_residual_path=hinv_residual_path,
         training_score_path=training_score_path,
+        training_fixed_score_path=training_fixed_score_path,
     )
 
 
@@ -567,6 +579,7 @@ def predict_sparse_path_single_grm(
     max_pcg_iters: int,
     hinv_residual_path: np.ndarray | None = None,
     training_score_path: np.ndarray | None = None,
+    training_fixed_score_path: np.ndarray | None = None,
 ) -> SparsePathPrediction:
     """Predict an entire Lasso path in one PCG and one genotype pass.
 
@@ -625,6 +638,7 @@ def predict_sparse_path_single_grm(
         max_pcg_iters=max_pcg_iters,
         hinv_residual_path=hinv_residual_path,
         training_score_path=training_score_path,
+        training_fixed_score_path=training_fixed_score_path,
     )
 
 
