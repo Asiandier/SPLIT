@@ -127,6 +127,14 @@ Q reported by the point estimator.
   $UU^T+(I-U(HU)^T)M(I-(HU)U^T)$, which is positive definite for positive
   definite $M$ and full-rank coarse directions. It changes convergence speed,
   not the linear system or its acceptance test.
+- The residual Lasso's final FP64 covariance product can also return the
+  unweighted standardized transpose $Z^T w$ used in its global score. This is
+  retained only for the identical verified solution and its covariate-projected
+  vector, then discarded at the next solve. Component weights affect $Hw$,
+  not this score; zero-variance components still receive their SNP scores.
+  The separate transpose remains the fallback for other operator backends.
+- Quadratic subproblems reuse the already evaluated $B b$ when their starting
+  coefficient is $b$. A different warm start computes its own matching product.
 - Design caches are local to one sample/standardization scope. Weighted Gram
   caches additionally require a fixed covariance; both cross blocks are
   computed because separately converged inverse columns need not be exactly

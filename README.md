@@ -103,24 +103,26 @@ quadratic still profiles only the covariates, leaving the LASSO mean fixed.
 The sparse entry points default to 50 fixed SLQ probes (`--slq-samples 50`),
 with the existing Lanczos quadrature tolerance and maximum depth. The probe
 count controls Monte Carlo precision; different counts or determinant
-representations need not produce identical numerical trajectories. Projection buffers are released
-before the endpoint calibration. If the additional basis does not fit the
-sparse memory plan, the original direct calculation is used.
-The sparse quadratic subtracts
-`tr{B (B' P_C B)^-1 B'}/n`. These are paired local mean-information corrections;
-the Lasso residual quadratic itself retains `P_C`.
+representations need not produce identical numerical trajectories. Projection
+buffers are released before endpoint GLS profiling. If the additional basis
+does not fit the sparse memory plan, the direct selected-information
+determinant is used instead.
+The endpoint sparse variance is `Q_s = (g'g + 2g'r)/n`, where `g = Zb` and
+`r = y - C gamma - g` uses the GLS-profiled covariate coefficients. It omits
+the earlier selected-mean trace subtraction at convergence checks, final h²
+output and construction of the prediction-stage variance budget. The REML
+determinant correction above remains in place; the Lasso residual quadratic
+itself retains `P_C`.
 For long sparse fits, `--checkpoint` saves completed outer iterations and
 resumes the same command after interruption. See [checkpoint scope and
 compatibility](docs/sparse_checkpoints.md).
 
 See [sparse numerical contracts](docs/sparse_numerics.md) for the determinant
 identity, KKT certificates, precision policy and the roles of both solvers.
-The projected covariance update does not require this trace before taking a
-step. Intermediate updates therefore profile the covariates with one contrast
-solve and defer the trace calculation until after the covariance update.
-Every h² convergence decision and final output retains the calibrated trace.
-Endpoint solves batch the selected directions, covariates and response together;
-mixed-precision corrections stop only after the original FP64 residual check.
+Endpoint GLS profiling requires a covariate-contrast response solve, without
+solving for every selected direction. Optional standard errors still require
+selected-space solves for local coefficient and variance uncertainty.
+Mixed-precision corrections stop only after the original FP64 residual check.
 Within each candidate problem, coordinate descent is accepted solely when the
 active and inactive score-KKT conditions pass at the configured numerical
 tolerance; coefficient change is only an active-set scheduling heuristic.
@@ -160,7 +162,7 @@ The maximum absolute standardized score is calibrated against one shared
 Gaussian quadratic-form reference over all available candidates. Its joint
 p-value must pass `--split-alpha` before the maximizing boundary is added.
 A covariance-only REML refit follows each split, keeping both the K=1 sparse
-mean and its information-corrected sparse quadratic fixed.
+mean and its endpoint sparse-variance estimate fixed.
 The process stops when evidence is insufficient or no contrast is identifiable.
 The common quadratic reference retains dependence and non-Gaussian score tails.
 Non-finite inputs or unresolved trace precision cause an explicit numerical error.
@@ -198,15 +200,15 @@ Sparse-run output semantics are deliberately explicit:
 - New sparse runs use output schema version 11. Raw/standardized duplicate
   estimator fields and downstream phenotype-scale conversions no longer exist.
 - In each `outer_update` history record, `theta` and validation predictive R²
-  describe the selected LASSO state. With the projected covariance update,
-  `information_calibration_before_update` is `deferred` and the pre-update
-  `coherit_h2`, `q_sparse` and trace fields are null. The subsequent covariance
-  update is recorded as `theta_after_variance_update` and the fully calibrated
-  `coherit_h2_after_variance_update`; its h² convergence fields use the
-  `variance_update_` prefix. Final covariance-alignment records compute both
-  the information correction and h² for the returned LASSO state.
-  `q_sparse_after_variance_update` includes information and nuisance effects
-  recomputed at that new covariance, rather than reusing the pre-update Q.
+  describe the selected LASSO state. `information_calibration_before_update`
+  is `omitted`; the projected route leaves pre-update `coherit_h2`, `q_sparse`
+  and trace fields null when endpoint GLS profiling is deferred. The subsequent
+  covariance update is recorded as `theta_after_variance_update`, with
+  `coherit_h2_after_variance_update` and `q_sparse_after_variance_update`
+  recomputed using covariates profiled at that covariance. Its h² convergence
+  fields use the `variance_update_` prefix. Final covariance-alignment records
+  report h² for the returned LASSO state. Endpoint trace fields are zero when
+  evaluated; no selected-mean trace is subtracted from Q.
 - BASIL validation reuses its training dual and marker scores after a true
   residual check; only inaccurate columns are refined. Fixed-K variance blocks
   reuse response-independent REML probe products and single-GRM Lanczos work.

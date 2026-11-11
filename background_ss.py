@@ -169,16 +169,23 @@ class StreamedGenotypeProducts:
             total = total.at[start:stop].set(values)
         return total
 
-    def gram_operator(self, active):
+    def _packed_gram_operator(self, active, *, with_transpose=False):
+        """Packed Gram scan, optionally retaining its standardized inner product."""
         active = np.asarray(active, bool)
         if self._device_packed is not None:
-            from .kv_impl import packed_cache_gram
+            from .kv_impl import packed_cache_gram, packed_cache_gram_transpose
             selected, inverse = self._active_calls(active)
+            if with_transpose:
+                return lambda value: packed_cache_gram_transpose(self._device_packed,
+                    self.starts, self.widths, self.means, inverse, selected, value,
+                    self._missing, p=self.p, sparse_packed_enabled=self.sparse_packed_enabled)
             return lambda value: packed_cache_gram(self._device_packed, self.widths,
                 self.means, inverse, selected, value, self._missing,
                 sparse_packed_enabled=self.sparse_packed_enabled)
         if self.packed_calls is not None:
-            from .kv_impl import _device_put_block, _kv_one_call_jit
+            from .kv_impl import (
+                _device_put_block, _kv_one_call_jit, _kv_xtv_one_call_jit, _xtv_scatter_jit,
+            )
             selected, inverse = [], []
             for k, (_, _, _, start, actual) in enumerate(self.packed_calls):
                 if np.any(active[start:start+actual]):
@@ -187,18 +194,48 @@ class StreamedGenotypeProducts:
                     selected.append(k); inverse.append(self.inverse[k]*jnp.asarray(mask))
             missing = jnp.asarray(self.streamer._missing_val, jnp.uint8)
             def packed_operator(value):
+                squeeze = value.ndim == 1
+                if squeeze:
+                    value = value[:, None]
                 total = jnp.zeros_like(value)
+                if with_transpose:
+                    projection = jnp.zeros((self.p+self.packed_width, value.shape[1]), value.dtype)
                 if selected:
                     pending = _device_put_block(self._packed(selected[0]), self.streamer.dev)
                     for position, k in enumerate(selected):
                         packed = pending
                         if position+1 < len(selected):
                             pending = _device_put_block(self._packed(selected[position+1]), self.streamer.dev)
-                        total = _kv_one_call_jit(packed, self.widths[k], self.means[k],
-                            inverse[position], value, missing, total,
-                            sparse_packed_enabled=self.sparse_packed_enabled)
+                        if with_transpose:
+                            total, block = _kv_xtv_one_call_jit(packed, self.widths[k],
+                                self.means[k], inverse[position], value, missing, total,
+                                sparse_packed_enabled=self.sparse_packed_enabled)
+                            projection = _xtv_scatter_jit(projection, block, self.starts[k])
+                        else:
+                            total = _kv_one_call_jit(packed, self.widths[k], self.means[k],
+                                inverse[position], value, missing, total,
+                                sparse_packed_enabled=self.sparse_packed_enabled)
                         del packed
+                if with_transpose:
+                    return (total[:, 0], projection[:self.p, 0]) if squeeze else (total, projection[:self.p])
+                if squeeze:
+                    return total[:, 0]
                 return total
+            return packed_operator
+        return None
+
+    def gram_transpose_operator(self, active):
+        """Return a shared packed scan, or None for custom non-packed backends.
+
+        Both outputs use the same active mask and training standardization.
+        Callers without this capability keep their existing separate products.
+        """
+        return self._packed_gram_operator(active, with_transpose=True)
+
+    def gram_operator(self, active):
+        active = np.asarray(active, bool)
+        packed_operator = self._packed_gram_operator(active)
+        if packed_operator is not None:
             return packed_operator
         if self.streamer is not None:
             if np.all(active):

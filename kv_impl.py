@@ -129,6 +129,27 @@ def _kv_one_call_jit(
     return acc + _genotype_gram_product(diff, inv_f, V, fp64_workspace_bytes)
 
 
+@partial(jax.jit, donate_argnums=(6,), static_argnames=('sparse_packed_enabled',))
+def _kv_xtv_one_call_jit(packed, width, means, inverse, value, missing, acc, *,
+                         sparse_packed_enabled=False):
+    """Accumulate XX' value and retain X' value from the same block read.
+
+    Preserve the existing Gram order (inverse squared before the forward
+    product), rather than rounding twice through standardized coefficients.
+    This narrow VAMP operator does not select the wide-REML GEMM backend.
+    """
+    if sparse_packed_enabled and sparse_packed.supports(value):
+        gram, transpose = sparse_packed.gram_product(
+            packed, means, inverse, value, width, missing, return_transpose=True)
+    else:
+        diff, inv = _unpack_impute_center(packed, width, means, inverse, value, missing)
+        inner = jnp.matmul(diff.T, value, precision=jax.lax.Precision.HIGHEST)
+        gram = jnp.matmul(diff, (inv*inv)[:, None]*inner,
+                          precision=jax.lax.Precision.HIGHEST)
+        transpose = inv[:, None]*inner
+    return acc+gram, transpose
+
+
 @partial(jax.jit, donate_argnums=(7,), static_argnames=("fp64_workspace_bytes",))
 def _kv_one_call_scaled_jit(
     g_dev_packed: Array,   # (n, ceil(W / 4)) uint8 packed 2-bit genotypes
@@ -148,6 +169,32 @@ def _kv_one_call_scaled_jit(
     diff, inv_f = _unpack_impute_center(
         g_dev_packed, true_width, means_call, inv_call, V, miss_u8)
     return acc + scale * _genotype_gram_product(diff, inv_f, V, fp64_workspace_bytes)
+
+
+@partial(jax.jit, donate_argnums=(7,), static_argnames=("fp64_workspace_bytes",))
+def _kv_xtv_scaled_one_call_jit(packed, width, means, inverse, value, missing,
+                               scale, acc, *, fp64_workspace_bytes=0):
+    """Weighted covariance product and its unweighted standardized transpose.
+
+    The covariance accumulation order matches _kv_one_call_scaled_jit. Retain
+    the inner product before applying component weights, including zero-weight
+    components: their SNPs still participate in the Lasso KKT equations.
+    """
+    if fp64_workspace_bytes > 0 and sparse_packed.supports(value):
+        gram, transpose = sparse_packed.gram_product(
+            packed, means, inverse, value, width, missing, return_transpose=True)
+    else:
+        diff, inv = _unpack_impute_center(packed, width, means, inverse, value, missing)
+        if value.dtype in (jnp.float32, jnp.float64) and value.shape[1] >= 256 and fp64_workspace_bytes > 0:
+            from .sparse_fp64 import matmul
+            inner = matmul(diff, value, transpose_a=True, workspace_limit=fp64_workspace_bytes)
+            gram = matmul(diff, (inv*inv)[:, None]*inner, workspace_limit=fp64_workspace_bytes)
+        else:
+            inner = jnp.matmul(diff.T, value, precision=jax.lax.Precision.HIGHEST)
+            gram = jnp.matmul(diff, (inv*inv)[:, None]*inner,
+                              precision=jax.lax.Precision.HIGHEST)
+        transpose = inv[:, None]*inner
+    return acc + scale*gram, transpose
 
 
 @partial(jax.jit, static_argnames=("sparse_packed_enabled",))
@@ -418,6 +465,25 @@ def packed_cache_gram(cache, widths, means, inverse, selected, value, missing,
     initial = jnp.zeros_like(value)
     result = initial if selected.shape[0] == 0 else jax.lax.fori_loop(0, selected.shape[0], body, initial)
     return result[:, 0] if squeeze else result
+
+
+@partial(jax.jit, static_argnames=('p', 'sparse_packed_enabled'))
+def packed_cache_gram_transpose(cache, starts, widths, means, inverse, selected,
+                                value, missing, *, p, sparse_packed_enabled=False):
+    """One packed scan for XX' value and X' value, in logical SNP order."""
+    squeeze = value.ndim == 1
+    if squeeze:
+        value = value[:, None]
+    def body(position, state):
+        total, projection = state
+        call = selected[position]
+        total, block = _kv_xtv_one_call_jit(cache[call], widths[call], means[call],
+            inverse[call], value, missing, total, sparse_packed_enabled=sparse_packed_enabled)
+        return total, _xtv_scatter_jit(projection, block, starts[call])
+    initial = (jnp.zeros_like(value), jnp.zeros((p+means.shape[1], value.shape[1]), value.dtype))
+    gram, projection = (initial if selected.shape[0] == 0 else
+                        jax.lax.fori_loop(0, selected.shape[0], body, initial))
+    return (gram[:, 0], projection[:p, 0]) if squeeze else (gram, projection[:p])
 
 
 @partial(jax.jit, static_argnames=('sparse_packed_enabled',))
@@ -1131,7 +1197,8 @@ def kv_impl_partitioned_weighted(
     *,
     theta_e: Array | None = None,
     missing_val: int = 3,
-) -> Array:
+    return_transpose: bool = False,
+):
     """Single-stream weighted H·V for contiguous block-partitioned GRMs."""
     squeeze = V.ndim == 1
     if squeeze:
@@ -1142,9 +1209,11 @@ def kv_impl_partitioned_weighted(
     miss_u8 = jnp.asarray(np.uint8(missing_val), dtype=jnp.uint8)
     n = int(streamer.n)
     acc = theta_e * V if theta_e is not None else jnp.zeros((n, V.shape[1]), dtype=fp)
+    transpose = jnp.zeros((int(streamer.m), V.shape[1]), dtype=fp) if return_transpose else None
 
     if streamer._n_calls == 0:
-        return acc[:, 0] if squeeze else acc
+        result = acc[:, 0] if squeeze else acc
+        return (result, transpose[:, 0] if squeeze else transpose) if return_transpose else result
 
     g_dev_next = _device_put_block(streamer._pop_cached(0), dev)
     for c in range(streamer._n_calls):
@@ -1158,7 +1227,7 @@ def kv_impl_partitioned_weighted(
             theta_g[comp_idx] / eff,
             jnp.asarray(0.0, dtype=fp),
         )
-        acc = _kv_one_call_scaled_jit(
+        product = (_kv_xtv_scaled_one_call_jit if return_transpose else _kv_one_call_scaled_jit)(
             g_dev_cur,
             streamer._true_widths_dev[c],
             streamer._means_by_call[c],
@@ -1169,9 +1238,16 @@ def kv_impl_partitioned_weighted(
             acc,
             fp64_workspace_bytes=getattr(streamer, "_sparse_fp64_workspace_bytes", 0),
         )
+        if return_transpose:
+            acc, block = product
+            width = int(streamer._call_true_widths[c])
+            transpose = _xtv_scatter_jit(transpose, block[:width], streamer._snp_starts_dev[c])
+        else:
+            acc = product
         del g_dev_cur
 
-    return acc[:, 0] if squeeze else acc
+    result = acc[:, 0] if squeeze else acc
+    return (result, transpose[:, 0] if squeeze else transpose) if return_transpose else result
 
 
 def kv_impl_partitioned_stacked(

@@ -172,6 +172,34 @@ Only a verified solution becomes the next warm start. Failure of both
 precision attempts follows the existing joint numerical-retry policy; invalid
 inputs, resource failures and backend errors propagate instead.
 
+The mixed solver also retains the unshifted FP64 Gram product of its accepted
+warm start. Writing G = X_active X_active', the next initial residual is
+`rhs_new - G*u_old - shift_new*u_old`. G and the active SNP set are fixed
+within a joint fit, so this avoids one repeated genome scan per iteration
+without approximating the operator. Every corrected solution still receives
+the original FP64 residual verification. The cache is tied to the immutable
+accepted solution and the operator object; a changed RHS width, replacement
+operator or unverified result cannot populate a matching cache. Zero RHS
+columns are zeroed in both the solution and the cached product. An already
+converged warm start can reuse its exact product without another solve.
+Only one additional sample-by-RHS FP64 array is retained (about 0.42 MiB
+for 55,000 samples and one RHS). Background-only FP64 solves and ordinary
+REML do not enable this optimization.
+
+For packed genotypes, the final FP64 Gram evaluation also retains its
+standardized inner product `X_active' * u`. The joint linear-module update
+uses this verified product instead of scanning the same genotypes again.
+The Gram arithmetic retains its original order, including the squared
+inverse standard deviations; retaining the inner product does not change
+the operator. Both the device-resident and host-streamed packed paths use
+the same logical SNP order, missing-value treatment and active mask.
+Only a product belonging to the accepted solution and unchanged operator
+can be reused. A zero-step warm solve also zeros newly zero RHS columns in
+the retained transpose. Unsupported backends and cache misses use the
+original separate transpose. The extra retained array is SNP-by-RHS FP64
+(about 4.96 MiB for 649,608 SNPs and one RHS), not a sample covariance.
+The statistical model, stopping rules and precision checks are unchanged.
+
 The constrained EM moments use fixed group reductions, replacing scatter
 additions into a small number of bins. This changes floating-point summation
 order, not the prior, Bernoulli counts, objective or convergence thresholds.
@@ -217,7 +245,9 @@ on S. The `conditioning_*` arrays identify the paired predictor components;
 they do not imply a separate conditional background fit.
 
 Solver metadata records `packed_narrow_cuda`, `linear_solve_arithmetic`,
-`fp64_rescue_calls` and the verified residuals. Per-solve diagnostics distinguish
+`fp64_rescue_calls`, `warm_products_reused`, `warm_product_cache_bytes`,
+`transpose_products_reused`, `transpose_cache_bytes` and
+the verified residuals. Per-solve diagnostics distinguish
 mixed and FP64 iterations. If a floating-point exception prevents the mixed
 routine from returning its iteration count, `pcg_iterations_complete` is false
 and the reported total includes only the known completed work.

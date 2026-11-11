@@ -454,7 +454,11 @@ def fit_joint(
             solved, fraction = solver.solve_and_trace(
                 y - linear_products.forward(r2), gamma2 * noise_j
             )
-            correction = jnp.where(active_j, linear_products.transpose(solved), 0.0)
+            verified_transpose = getattr(solver, 'verified_transpose', None)
+            correction = None if verified_transpose is None else verified_transpose(solved)
+            if correction is None:
+                correction = linear_products.transpose(solved)
+            correction = jnp.where(active_j, correction, 0.0)
             m2 = r2 + correction
             newprecision = gamma2 * fraction / (1 - fraction)
             newr = r2 + correction / fraction[None, :]

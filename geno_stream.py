@@ -2856,7 +2856,9 @@ class GenoBlockStreamer:
         theta_g: jnp.ndarray,
         theta_e: jnp.ndarray | None,
         V: jnp.ndarray,
-    ) -> jnp.ndarray:
+        *,
+        return_transpose: bool = False,
+    ):
         if int(theta_g.shape[0]) != self._n_components:
             raise ValueError(
                 f"theta_g length mismatch: expected {self._n_components}, got {int(theta_g.shape[0])}."
@@ -2870,6 +2872,7 @@ class GenoBlockStreamer:
             theta_g,
             theta_e=theta_e,
             missing_val=int(self._missing_val),
+            return_transpose=return_transpose,
         )
 
     def xtv(self, V: jnp.ndarray, normalize: bool = False) -> jnp.ndarray:

@@ -22,15 +22,29 @@ logger = logging.getLogger(__name__)
 
 
 def solve_sparse_pcg(hv, rhs, M=None, tol=1e-2, maxiter=200, X0=None,
-                     check_every=2, *, log_diagnostics=True):
+                     check_every=2, *, log_diagnostics=True,
+                     initial_operator_product=None):
     """Use FP32 PCG, with FP64 residual correction below its accuracy floor.
 
     Every correction solves H delta = b-Hx for the SAME H. The total PCG
     iteration budget and the final requested residual tolerance are unchanged.
     Ordinary REML and its PCG implementation do not use this helper.
+
+    ``initial_operator_product`` may supply a previously evaluated FP64
+    ``hv(X0)`` for a tight solve. The caller must own the matching immutable
+    warm start and operator. It replaces only the first residual product;
+    every corrected solution is verified with ``hv`` as usual.
     """
     inner_tol = max(float(tol), math.sqrt(float(tol)))
     tight = tol < math.sqrt(np.finfo(np.float32).eps)
+    if initial_operator_product is not None and (
+        not tight
+        or getattr(X0, "dtype", None) != np.float64
+        or getattr(initial_operator_product, "dtype", None) != np.float64
+        or X0.shape != rhs.shape
+        or initial_operator_product.shape != rhs.shape
+    ):
+        raise ValueError("Cached operator product requires a matching FP64 warm start and tight solve")
     if tight and getattr(X0, "dtype", None) == np.float64:
         # Accepted REML states already carry a precise solution. Do not round
         # away that work before checking an unchanged or nearby covariance.
@@ -52,12 +66,18 @@ def solve_sparse_pcg(hv, rhs, M=None, tol=1e-2, maxiter=200, X0=None,
         target = jnp.asarray(rhs, dtype=jnp.float64)
         value = jnp.asarray(solution, dtype=jnp.float64)
         scale = jnp.linalg.norm(target, axis=0)
-        value = jnp.where(scale > 0, value, 0.)
-        scale = jnp.where(scale > 0, scale, 1.)
+        nonzero = scale > 0
+        value = jnp.where(nonzero, value, 0.)
+        scale = jnp.where(nonzero, scale, 1.)
         previous = math.inf
         corrections = 0
+        cached_product = initial_operator_product
+        if cached_product is not None:
+            # The solver zeros warm-start columns whose new RHS is zero.
+            cached_product = jnp.where(nonzero, cached_product, 0.)
         while True:
-            residual = target-hv(value)
+            residual = target-(hv(value) if cached_product is None else cached_product)
+            cached_product = None
             actual = float(jax.device_get(jnp.max(
                 jnp.linalg.norm(residual, axis=0)/scale
             )))

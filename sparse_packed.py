@@ -116,9 +116,12 @@ def forward_product(packed, means, inverse, value, true_width, missing):
                              true_width, missing, transpose=False)
 
 
-def gram_product(packed, means, inverse, value, true_width, missing):
+def gram_product(packed, means, inverse, value, true_width, missing, *,
+                 return_transpose=False):
+    """Optionally retain X' value without changing the Gram arithmetic."""
     inner = _centered_product(packed, means, value, true_width, missing, transpose=True)
     width = packed.shape[1]*4
     inverse = jnp.where(jnp.arange(width) < true_width, inverse[:width], 0).astype(value.dtype)
-    return _centered_product(packed, means, (inverse*inverse)[:, None]*inner,
+    gram = _centered_product(packed, means, (inverse*inverse)[:, None]*inner,
                              true_width, missing, transpose=False)
+    return (gram, inverse[:, None]*inner) if return_transpose else gram

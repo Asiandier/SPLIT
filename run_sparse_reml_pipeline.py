@@ -4303,6 +4303,10 @@ def main() -> None:
                     )
 
                 if args.lasso_path_solver == "residual":
+                    paired_hv = None
+                    if getattr(fitter, '_partitioned_streamer', None) is fitter.streamers[0]:
+                        paired_hv = lambda value: fitter.streamers[0].weighted_component_hv(
+                            theta_g, theta_e, value, return_transpose=True)
                     basil_result = _residual_lasso_mod.fit_weighted_residual_path(
                         fitter=fitter, grm_index=grm_index, hv=hv, precond=precond,
                         theta=theta, y=y_np, covar=covar_np,
@@ -4317,6 +4321,7 @@ def main() -> None:
                         previous_candidate=warm_lasso_candidate,
                         previous_beta_path=warm_lasso_beta_path,
                         materialize_result_design=False,
+                        hv_with_score=paired_hv,
                         stopping_rule=lambda values: (_aic_selection_mod.stopping_decision if aic_selection else _validation_path_early_stopping_decision)(
                             values, stopping_lag=int(args.validation_early_stopping_lag)),
                     )

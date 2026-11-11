@@ -27,7 +27,7 @@ from .precond import scalar_diag_from_precond_conf, build_projected_core_runtime
 logger = logging.getLogger(__name__)
 
 def solve_adaptive_pcg(hv, rhs, M=None, tol=1e-8, maxiter=400, X0=None,
-                       check_every=2, recycle=None):
+                       check_every=2, recycle=None, verified_hv=None):
     with jax.experimental.enable_x64():
         rhs = jnp.asarray(rhs, dtype=jnp.float64)
         value = jnp.zeros_like(rhs) if X0 is None else jnp.asarray(X0, dtype=jnp.float64)
@@ -46,7 +46,7 @@ def solve_adaptive_pcg(hv, rhs, M=None, tol=1e-8, maxiter=400, X0=None,
         while True:
             verified = coarse_residual is None
             if verified:
-                product = hv(value)
+                product = (hv if verified_hv is None else verified_hv)(value)
                 residual = rhs-product
             else:
                 residual, coarse_residual = coarse_residual, None
@@ -334,7 +334,7 @@ def fit_weighted_residual_path(*, fitter, grm_index, hv, precond, theta, y,
         stopping_rule, use_preconditioned_metric=True,
         validation_requires_training_design=True,
         previous_candidate=None, previous_beta_path=None,
-        materialize_result_design=True):
+        materialize_result_design=True, hv_with_score=None):
     """Fit a validation path without inverse-covariance candidate columns.
 
     ``stopping_rule`` and ``validation_evaluator`` are supplied by the supported
@@ -352,14 +352,16 @@ def fit_weighted_residual_path(*, fitter, grm_index, hv, precond, theta, y,
             use_preconditioned_metric=use_preconditioned_metric,
             validation_requires_training_design=validation_requires_training_design,
             previous_candidate=previous_candidate, previous_beta_path=previous_beta_path,
-            materialize_result_design=materialize_result_design)
+            materialize_result_design=materialize_result_design,
+            hv_with_score=hv_with_score)
 
 
 def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         path_cfg, pcg_tol, max_pcg_iters, pcg_ridge, marker_batch,
         max_iterations, workspace_bytes, validation_evaluator, stopping_rule,
         use_preconditioned_metric, validation_requires_training_design,
-        previous_candidate, previous_beta_path, materialize_result_design):
+        previous_candidate, previous_beta_path, materialize_result_design,
+        hv_with_score):
     started = time.perf_counter()
     n = np.asarray(y).size
     if len(fitter.streamers) != 1 or path_cfg.fixed_lam_ratio is not None:
@@ -493,15 +495,26 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         if not np.isfinite(budget) or budget <= 0:
             raise ValueError('Score-error budget must be positive and finite')
         requested = min(float(pcg_tol), budget/max(bound_scale, 1.))
+        retained = None
+        def verified_product(value):
+            nonlocal retained
+            w = project(value)
+            product, score = hv_with_score(w)
+            retained = (value, w, score)
+            return project(product)+(value-w)
         solved, error, count = solve_adaptive_pcg(projected_hv, rhs,
-            M=projected_pre, tol=requested, maxiter=max_pcg_iters, X0=initial, recycle=recycling)
+            M=projected_pre, tol=requested, maxiter=max_pcg_iters, X0=initial, recycle=recycling,
+            verified_hv=verified_product if hv_with_score is not None else None)
         if error > requested:
             raise RuntimeError('Lasso residual solve failed its requested accuracy')
-        dual = project(solved)
+        reused = retained is not None and retained[0] is solved
+        dual = retained[1] if reused else project(solved)
         dual.block_until_ready()
         solve_seconds = time.perf_counter()-solve_started
         score_started = time.perf_counter()
-        score = np.array(stream.xtv(dual, normalize=False), copy=True).reshape(-1)
+        score = np.array(retained[2] if reused else stream.xtv(dual, normalize=False),
+                         copy=True).reshape(-1)
+        counters['transpose_products_reused'] = counters.get('transpose_products_reused', 0)+int(reused)
         score_seconds = time.perf_counter()-score_started
         seconds = time.perf_counter()-tick
         event = dict(reason=reason, lam=float(lam), support=int(np.count_nonzero(coef)),
@@ -596,6 +609,8 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
                 counters['metric_seconds'] += time.perf_counter()-tick
             tick = time.perf_counter()
             cd_start = beta
+            metric_beta = metric@beta
+            cd_product = metric_beta
             if prior_path is not None and path_index < len(prior_path) and not prior_attempted:
                 prior_attempted = True
                 mapped = old_column[indices]
@@ -608,9 +623,10 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
                           +lam*float(np.abs(seed).sum()-np.abs(beta).sum()))
                 if np.isfinite(change) and change < 0:
                     cd_start = seed
+                    cd_product = None
                     warm_rows_used.add(path_index)
             proposal, _, _, passed = solve_lasso_cd_gram(metric,
-                metric@beta+gradient[indices], lam, beta0=cd_start,
+                metric_beta+gradient[indices], lam, beta0=cd_start, _Qb0=cd_product,
                 max_iter=path_cfg.max_cd_iter, tol=min(path_cfg.cd_tol, 1e-8),
                 kkt_abs_tol=.1*path_cfg.kkt_abs_tol,
                 kkt_rel_tol=.1*path_cfg.kkt_rel_tol)

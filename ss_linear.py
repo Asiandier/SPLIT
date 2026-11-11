@@ -153,8 +153,17 @@ class MatrixFreeSampleSolver:
         self.trace_tolerance = trace_tolerance
         self.max_probe_batch = max_probe_batch
         self.mixed_precision = bool(mixed_precision)
+        paired_factory = getattr(products, 'gram_transpose_operator', None)
+        paired = paired_factory(active) if self.mixed_precision and paired_factory is not None else None
+        self._paired_matvec = None if paired is None else (self.matvec, paired)
+        self._solution_transpose = None
+        self.transpose_products_reused = 0
         self.fp64_rescue_calls = 0
         self._warm = None
+        # (accepted immutable solution, fixed Gram operator, its FP64 product).
+        # A changed shift does not change this unshifted product.
+        self._warm_product = None
+        self.warm_products_reused = 0
         self.last_diagnostics = {}
         self.solve_calls = self.total_pcg_iterations = 0
         self.maximum_pcg_residual = self.maximum_quadrature_gap = 0.
@@ -329,8 +338,17 @@ class MatrixFreeSampleSolver:
             raise ValueError('SS shifts must be finite and positive')
         estimate, gap, error = self.trace(shifts)
         shift = jnp.asarray(shifts)
+        last_fp64 = [None, None, None]
         def operator(value):
-            return self.matvec(value)+value*shift.astype(value.dtype)[None, :]
+            projection = None
+            pair = self._paired_matvec
+            if value.dtype == jnp.float64 and pair is not None and pair[0] is self.matvec:
+                product, projection = pair[1](value)
+            else:
+                product = self.matvec(value)
+            if self.mixed_precision and value.dtype == jnp.float64:
+                last_fp64[:] = [value, product, projection]
+            return product+value*shift.astype(value.dtype)[None, :]
         modes, coarse = self.coarse_vectors, self.coarse_values
         def precondition(value):
             if modes is None:
@@ -338,14 +356,24 @@ class MatrixFreeSampleSolver:
             return _coarse_precondition(value, self.diagonal.astype(value.dtype), shift.astype(value.dtype),
                                         modes.astype(value.dtype), coarse.astype(value.dtype))
         warm = self._warm if self._warm is not None and self._warm.shape == rhs.shape else None
+        cached_gram = None
+        cache = self._warm_product
+        if (self.mixed_precision and self.pcg_tolerance < np.sqrt(np.finfo(np.float32).eps)
+                and warm is not None and cache is not None
+                and cache[0] is warm and cache[1] is self.matvec):
+            cached_gram = cache[2]
         rescue_reason = None
         mixed_iterations = 0
         if self.mixed_precision:
             solved = warm
+            if cached_gram is not None:
+                self.warm_products_reused += 1
             try:
                 solved, relative, mixed_iterations = solve_sparse_pcg(
                     operator, rhs, M=precondition, tol=self.pcg_tolerance,
-                    maxiter=self.pcg_max_iterations, X0=warm, log_diagnostics=False)
+                    maxiter=self.pcg_max_iterations, X0=warm, log_diagnostics=False,
+                    initial_operator_product=(None if cached_gram is None
+                                              else cached_gram+warm*shift[None, :]))
                 if not np.isfinite(relative) or relative > self.pcg_tolerance*1.05:
                     rescue_reason = f'mixed solve true residual {relative:.3e}'
             except FloatingPointError as failure:
@@ -370,7 +398,26 @@ class MatrixFreeSampleSolver:
         relative = float(relative)
         if not np.isfinite(relative) or relative > self.pcg_tolerance*1.05:
             raise ArithmeticError(f'SS PCG did not converge: true relative residual {relative:.3e}')
+        accepted_gram = accepted_transpose = None
+        if self.mixed_precision:
+            if last_fp64[0] is solved:
+                # This product was used in the successful final verification.
+                accepted_gram = last_fp64[1]
+                accepted_transpose = last_fp64[2]
+            elif cached_gram is not None and iterations == 0 and rescue_reason is None:
+                # The cached residual already certified the unchanged warm
+                # start, except for any newly zero RHS columns.
+                accepted_gram = jnp.where(jnp.linalg.norm(rhs, axis=0) > 0, cached_gram, 0.)
+                projection = self._solution_transpose
+                if (projection is not None and projection[0] is warm
+                        and projection[1] is self.matvec):
+                    accepted_transpose = jnp.where(jnp.linalg.norm(rhs, axis=0) > 0,
+                                                  projection[2], 0.)
         self._warm = solved
+        self._warm_product = (None if accepted_gram is None
+                              else (solved, self.matvec, accepted_gram))
+        self._solution_transpose = (None if accepted_transpose is None
+                                    else (solved, self.matvec, accepted_transpose))
         self.solve_calls += 1
         self.total_pcg_iterations += iterations
         self.maximum_pcg_residual = max(self.maximum_pcg_residual, relative)
@@ -386,14 +433,33 @@ class MatrixFreeSampleSolver:
             self.last_diagnostics.update(
                 pcg_mixed_iterations=mixed_iterations, pcg_fp64_iterations=fp64_iterations,
                 pcg_iterations_complete=mixed_iterations is not None,
+                pcg_warm_product_reused=cached_gram is not None,
                 pcg_fp64_rescue=rescue_reason is not None, pcg_fp64_rescue_reason=rescue_reason)
         return solved, jnp.asarray(estimate)
+
+    def verified_transpose(self, solution):
+        """X' solution from its accepted FP64 residual check, if still valid.
+
+        Immutable solution and operator identities prevent stale reuse. A
+        missing or mismatched cache requires the caller's usual transpose.
+        """
+        cached = self._solution_transpose
+        if cached is not None and cached[0] is solution and cached[1] is self.matvec:
+            self.transpose_products_reused += 1
+            return cached[2]
+        return None
 
     def diagnostics(self):
         return dict(self.setup_diagnostics, pcg_tolerance=self.pcg_tolerance,
             pcg_max_iterations=self.pcg_max_iterations,
             pcg_max_iterations_scope='per_precision_attempt',
             fp64_rescue_calls=self.fp64_rescue_calls,
+            warm_products_reused=self.warm_products_reused,
+            warm_product_cache_bytes=(0 if self._warm_product is None
+                                      else int(self._warm_product[2].nbytes)),
+            transpose_products_reused=self.transpose_products_reused,
+            transpose_cache_bytes=(0 if self._solution_transpose is None
+                                   else int(self._solution_transpose[2].nbytes)),
             solve_calls=self.solve_calls, total_pcg_iterations=self.total_pcg_iterations,
             maximum_pcg_true_relative_residual=self.maximum_pcg_residual,
             maximum_trace_quadrature_relative_gap=self.maximum_quadrature_gap,
