@@ -251,11 +251,13 @@ Sparse-run output semantics are deliberately explicit:
   It uses native matrix-free operators without refitting models; the production
   runner computes it only after the final combined-sample fit. `--no-h2-se`
   disables it. See [SE derivation and controls](docs/sparse_h2_se.md).
-- `q_chive_components` retains the squared fitted-mean and residual-correction terms,
-  and `term3_mean_uncertainty_subtracted`, which is subtracted from their sum
-  to form the COHERIT sparse
-  variance contribution; the squared fitted-mean term is not exposed as a
-  standalone heritability estimator.
+- Sparse variance uses `(g.T @ g + 2*g.T @ residual)/n`, with covariates
+  profiled at the final covariance. `q_chive_components` records both terms;
+  `term3_mean_uncertainty_subtracted` is retained as zero and
+  `endpoint_trace_correction` is `omitted`. The REML information determinant
+  is retained. This is a different point estimator from the earlier version
+  that subtracted selected-mean uncertainty, rather than a numerically
+  equivalent speed optimization.
 - Sparse prediction emits only the `lasso_*` branch: the Lasso
   fixed-SNP score plus its matched background BLUP.
 - `--compute-effects` emits nuisance effects and one source-order SNP table

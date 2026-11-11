@@ -2,8 +2,8 @@
 
 For D=[C,B]=QR, Pi=I-QQ', the determinant identity is
   log|H| + log|C'H^-1 C| + log|B'P_C B| = log|Pi H Pi+QQ'| + log|D'D|.
-Only the determinant uses D. The quadratic and AI retain P_C, and endpoint
-heritability calibration delegates to the original exact information class.
+Only the determinant uses D. The quadratic and AI retain P_C. Endpoint
+heritability profiles ordinary covariates without a selected-mean trace.
 """
 from __future__ import annotations
 

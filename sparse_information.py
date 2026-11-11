@@ -1,8 +1,9 @@
 """Selected-mean information correction, without sample-by-sample matrices.
 
 The Lasso mean is an offset, NOT an additional profiled fixed effect. For a
-fixed selected span Z, add log|Z' P_C Z| to the negative REML determinant and
-subtract tr{Z (Z' P_C Z)^-1 Z'}/n from the calibrated sparse quadratic.
+fixed selected span Z, add log|Z' P_C Z| to the negative REML determinant.
+Endpoint sparse variance uses (g'g + 2g'r)/n, without a selected-mean trace
+subtraction. Covariates are still profiled at the current covariance.
 """
 from __future__ import annotations
 
@@ -161,7 +162,6 @@ class SparseMeanInformation:
         self._theta = None
         self._tol = None
         self._state = None
-        self._response_cache = None
         logger.info("[information basis] selected=%s rank=%s time=%.2fs",
                     x.shape[1], self.rank, time.perf_counter()-started)
 
@@ -211,64 +211,34 @@ class SparseMeanInformation:
             }
             logger.info("[information evaluation] rank=%s solves=%.2fs projection_and_factor=%.2fs",
                         self.rank, solve_seconds, time.perf_counter()-started)
-        # The REML block already solved C at this theta. Keep that exact factor
-        # for the subsequent paired h2 calculation, rather than solving C again.
+        # Keep verified covariance solves available to optional endpoint SE.
         state.update(hinv_covar=hc, covar_factor=cf)
         self._theta, self._state, self._tol = theta.copy(), state, tol
         return state
 
     def statistics(self, theta, hv, precond, residual, *, tol, maxiter):
-        """Profile C at this covariance and return the paired trace correction."""
-        theta = np.asarray(theta, dtype=np.float64)
-        response = np.asarray(residual, dtype=np.float32).reshape(-1)
-        cached = self._response_cache
-        reuse_response = (cached is not None and cached[1] <= tol
-                          and np.array_equal(cached[0], theta)
-                          and np.array_equal(cached[2], response))
-        state = self._state if self._cached(theta, tol) else None
-        response_tol = tol
-        if state is None:
-            # H is shared by every column. Include the small response/covariate
-            # block in the last selected-span batch to avoid a separate genome
-            # pass for only a handful of columns. Each RHS keeps its own PCG
-            # recurrence and the same verified residual tolerance.
-            rhs = np.column_stack([self.basis, self.covar, response])
-            warm = None
-            if self.hinv_warm is not None:
-                warm = np.column_stack([
-                    self.hinv_warm,
-                    np.zeros((self.n, self.covar.shape[1] + 1)),
-                ])
-            solved = solve_columns(hv, rhs, precond, tol=tol, maxiter=maxiter,
-                                   batch_size=self.batch_size, warm=warm)
-            solved_response = solved[:, -1]
-            state = self.evaluate(
-                theta, hv, precond, solved[:, self.rank:-1], tol=tol,
-                maxiter=maxiter, _solved_basis=solved[:, :self.rank],
-            )
-        elif reuse_response:
-            solved_response = cached[3]
-            response_tol = cached[1]
-        else:
-            solved_response = solve_columns(
-                hv, response[:, None], precond, tol=tol, maxiter=maxiter,
-                batch_size=self.batch_size,
-            )[:, 0]
-        self._response_cache = (theta.copy(), response_tol, response.copy(), solved_response.copy())
-        if self.covar.shape[1]:
-            gamma = sla.cho_solve(state["covar_factor"], self.covar.T @ solved_response,
-                                 check_finite=False)
-        else:
-            gamma = np.empty(0)
-        return state, np.asarray(residual)-self.covar @ gamma, gamma
+        """Profile C for endpoint Q without selected-column covariance solves.
+
+        The zero trace describes the endpoint estimator only. It must not be
+        stored in the likelihood cache: evaluate() still supplies the REML
+        determinant and its score factors at the requested covariance.
+        """
+        started = time.perf_counter()
+        profiled, gamma = self.profile_response(
+            hv, precond, residual, tol=tol, maxiter=maxiter)
+        state = {"trace": 0.0, "rank": self.rank,
+                 "endpoint_trace_correction": "omitted"}
+        logger.info("[sparse endpoint] rank=%s trace_correction=omitted profile_time=%.2fs",
+                    self.rank, time.perf_counter()-started)
+        return state, profiled, gamma
 
     def profile_response(self, hv, precond, residual, *, tol, maxiter):
         """Profile C with one contrast solve, without computing selected trace.
 
         For Pi=I-Q_C Q_C', P_C=Pi(Pi H Pi+Q_C Q_C')^-1 Pi.
         H P_C r = r-C gamma then recovers the same GLS covariate estimate.
-        This is for intermediate projected-likelihood updates only. Final h2
-        and all convergence decisions still use statistics().
+        Intermediate, convergence and final-output profiles use this same
+        GLS calculation. It does not request a selected-mean variance trace.
         """
         if not self.covar.shape[1]:
             return np.asarray(residual), np.empty(0)

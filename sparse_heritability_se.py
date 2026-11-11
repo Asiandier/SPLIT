@@ -156,7 +156,6 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
     else:
         mi_host, mean_condition = np.empty((0, 0)), 1.
     mi = b.array(mi_host)
-    gram = b.host(z.T @ z)
     if progress is not None:progress('selected_information',time.perf_counter()-started)
 
     def project_hinv(v):
@@ -201,8 +200,7 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
     u = project_hinv(bank.solve(factor, y-g, initial=hy-hz @ alpha))
     residual = y-g-c @ (ci @ (hc.T @ (y-g)))
     a = project(anchor)
-    correction = float(np.sum(mi_host*gram.T)/n)
-    q_reconstructed = float(b.host(g@g+2*g@residual)/n-correction)
+    q_reconstructed = float(b.host(g@g+2*g@residual)/n)
     q = q_reconstructed if q_saved is None else float(q_saved)
     lam = ratio*float(b.host(anchor @ py))*anchor_sign
     kkt = b.host(z.T @ u)-lam*b.host(signs)
@@ -220,19 +218,12 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
         tr = np.array([[float(b.host(b.inner(x, v)).mean()) for v in ps_ki] for x in ki_psi])
         tr = (tr+tr.T)/2
         del inv_draw, psi, ki_psi, ps_ki
-        probe = b.array(rng.normal(size=(n, trace_probes)))
-        phi = pz @ (mi @ (z.T @ probe))
-        dc = np.array([float(b.host(b.inner(phi, bank.mv(i, phi))).mean())/n for i in range(nc)])
-        del probe, phi
     else:
         # Small-n independent algebra checks only; production uses matrix probes.
         ps = selected_project(xp.eye(n, dtype=b.dtype))
         pski = [bank.mv(i, ps) for i in range(nc)]
         tr = np.array([[float(b.host(xp.sum(x*v.T))) for v in pski] for x in pski])
-        uu = pz @ mi
-        dc = np.array([float(b.host(xp.sum((uu.T @ bank.mv(i, uu))*b.array(gram))))/n
-                       for i in range(nc)])
-        del ps, pski, uu
+        del ps, pski
 
     ku = [bank.mv(i, u) for i in range(nc)]
     pku = project(xp.column_stack(ku))
@@ -244,7 +235,7 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
     for j in range(nc):
         dg = z @ dalpha[j]
         dr = -dg+c @ (ci @ (hc.T @ ku[j]+c.T @ hz @ dalpha[j]))
-        dq.append(float(b.host(2*dg @ (g+residual)+2*g @ dr))/n-dc[j])
+        dq.append(float(b.host(2*dg @ (g+residual)+2*g @ dr))/n)
     dq = np.asarray(dq)
     if progress is not None:progress('observed_derivative',time.perf_counter()-started)
     del ku, pku, kpy, dalpha, du
@@ -277,7 +268,8 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
                kkt_max_error=float(np.max(abs(kkt), initial=0)),
                lambda_reconstructed=float(lam),
                alpha_branch_max_difference=float(np.max(abs(branch_alpha-b.host(alpha)), initial=0)),
-               information_rank=int(p), mean_uncertainty=correction,
+               information_rank=int(p), mean_uncertainty=0.,
+               endpoint_trace_correction='omitted',
                anchor_index_within_support=anchor_index,
                mean_information_condition=float(mean_condition),
                trace_probes=trace_probes,moment_probes=moment_probes,
@@ -380,22 +372,20 @@ def endpoint_h2_se(bank, *, theta, y, z, covar, alpha, ratio, lam, q, atoms,
     if mean_information is not None:
         info = mean_information
         c_input = np.empty((len(y), 0)) if covar is None else np.asarray(covar)
-        if (info.n != len(y) or not np.array_equal(info.covar, c_input)
-                or info._state is None or not np.array_equal(np.asarray(theta), info._theta)):
+        if info.n != len(y) or not np.array_equal(info.covar, c_input):
             raise ValueError('Cached fitting information does not match the SE endpoint')
         cached_basis = info.basis
-        cache = dict(hinv_covar=info._state['hinv_covar'], hinv_selected=info.hinv_warm)
+        # Projected fits no longer build the wide endpoint information state.
+        # Its immutable selected basis is still useful; covariance solutions
+        # are reused only when evaluate() has an exact matching cache.
+        if info._state is not None and np.array_equal(np.asarray(theta), info._theta):
+            cache = dict(hinv_covar=info._state['hinv_covar'], hinv_selected=info.hinv_warm)
     basis, coef, signs = selected_coordinates(z, alpha, basis=cached_basis)
     if cached_basis is not None:
         original_mean = np.asarray(z, float) @ np.asarray(alpha, float)
         represented_mean = basis @ coef
         if not np.allclose(represented_mean, original_mean, rtol=solve_tol, atol=solve_tol):
             raise ValueError('Cached selected span does not preserve the fitted sparse mean')
-        response = getattr(mean_information, '_response_cache', None)
-        if (response is not None and np.array_equal(response[0], np.asarray(theta))
-                and np.array_equal(response[2], np.asarray(y-original_mean, dtype=np.float32))):
-            hinv_mean = cache['hinv_selected'] @ coef if coef.size else np.zeros(len(y))
-            cache['hinv_response'] = response[3] + hinv_mean
     c = np.empty((len(y), 0)) if covar is None else np.asarray(covar)
     estimate = calculate(bank, theta, np.asarray(y), basis, c, coef, ratio, None, 1.,
         q_saved=q, atoms=atoms, trace_probes=trace_probes, moment_probes=moment_probes,

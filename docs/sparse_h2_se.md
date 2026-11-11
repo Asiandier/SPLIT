@@ -74,13 +74,16 @@ F_i=\tfrac12\{y^TD^TK_iDy-\operatorname{tr}(P_SK_i)\},\quad
 P_S=P-PZM^{-1}Z^TP,
 $$
 
-where the residual kernel is `I`. The calibrated sparse variance is
+where the residual kernel is `I`. The sparse variance is
 
 $$
-Q=y^TA_Qy-c,\quad
-A_Q=(T^TT+T^TR+R^TT)/n,\quad
-c=\operatorname{tr}(ZM^{-1}Z^T)/n.
+Q=y^TA_Qy,\qquad
+A_Q=(T^TT+T^TR+R^TT)/n.
 $$
+
+This is the endpoint estimator without selected-mean trace subtraction.
+Consequently `b=dQ/dtheta` also omits that subtraction's derivative. The REML
+score F and its selected-space information correction remain as given above.
 
 At the fitted endpoint, compute the observed Jacobian `A=-dF/dtheta` and
 `b=dQ/dtheta`, retaining changes in alpha and the absolute lambda. With
@@ -142,15 +145,16 @@ The routine runs in a scoped JAX x64 context and restores the caller's precision
 configuration. The supplied covariance coefficients and Lasso effects are not
 updated. Explicit numerical/endpoint failures produce an unavailable SE status.
 
-The final fitting stage supplies its immutable selected-space information cache.
-SE reuses the already computed basis and covariance solutions after checking the
-sample/covariate scope and exact covariance coefficients. Cached solutions are
-warm starts, never unverified substitutes: every column is checked against the
+The final fitting stage supplies its immutable selected-space basis. SE reuses
+that basis after checking the sample/covariate scope and fitted-mean mapping.
+Projected fits need not have computed selected-column covariance solutions;
+SE computes the solutions required for its own local derivative. If the direct
+REML likelihood already has a cache at the exact covariance coefficients, SE
+uses its solutions as checked warm starts. Every column is checked against the
 current FP64 covariance operator and refined if necessary. Tighter requested SE
-solve tolerances still trigger refinement. This avoids cold-solving the selected
-space again. `fitting_information_reused`, `warm_solve_batches`, and
-`pcg_iterations` record the reuse and actual extra solve work. Standalone saved
-endpoints without this cache use the independent cold path.
+solve tolerances still trigger refinement. `fitting_information_reused`,
+`warm_solve_batches`, and `pcg_iterations` record the reuse and extra solve work.
+Standalone saved endpoints without a cache use the independent cold path.
 
 The default `--h2-se-batch-size 0` reuses the selected-information/native sparse
 RHS batch width already included in the fitting memory plan, capped by the
@@ -174,14 +178,18 @@ full inference for the support/tuning selection event, and it does not remove
 point-estimator bias. A sandwich expression here does not imply robustness to
 arbitrary model misspecification.
 
-The initial saved-endpoint study tested this formula on 900 simulation fits and
+The initial saved-endpoint study tested the earlier trace-subtracted estimator
+on 900 simulation fits and
 12 real traits. On 868 cases also successful for GREML-LDMS, equal-setting mean
 95% interval coverage was approximately 94.5% for the fixed-boundary SPLIT
 approximation and 93.7% for GREML-LDMS. SPLIT was somewhat more conservative by
 SE/empirical-SD comparison; low-h2 High-LD settings retained point-estimator bias.
 The boundary recommendation was exploratory after comparing both variants.
-The production matrix-free implementation preserves these working moments and
-derivatives; random-probe realizations differ from the original dense backend.
+Those coverage results do not establish coverage for the current estimator
+without trace subtraction. The current SE uses the same local Gaussian working
+moments with the updated Q and its derivative; its interval coverage requires
+separate validation. Random-probe realizations also differ from the original
+dense backend.
 
 Use `h2 +/- h2_se` for a one-SE display, and identify SPLIT's SE as approximate.
 It is not an exact confidence interval or a guarantee of coverage in every setting.

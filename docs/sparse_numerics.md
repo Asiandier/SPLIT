@@ -94,17 +94,27 @@ quadrature. The exact determinant identities agree, but their finite-probe
 approximations need not be identical. Numerical trajectories and boundary
 coefficients can therefore differ without a change of statistical objective.
 
-The endpoint sparse-variance correction still computes
+The endpoint sparse variance uses the fitted sparse mean $g=Zb$ and the
+GLS-profiled residual $r=y-C\hat\gamma-g$:
 
 $$
-\operatorname{tr}\{B(B^TP_CB)^{-1}B^T\}
-=\operatorname{tr}\{(B^TP_CB)^{-1}\}.
+Q_s=\frac{g^Tg+2g^Tr}{n}.
 $$
 
-Intermediate pre-update traces may be deferred; every h² convergence decision
-and final h² output uses the calibrated trace. The direct information routine
-remains necessary for these endpoints and for low-memory fallback. Its
-presence alongside the projected routine is intentional.
+The earlier selected-mean subtraction
+$\operatorname{tr}\{(B^TP_CB)^{-1}\}/n$ is omitted at convergence checks,
+final h² output and construction of the prediction-stage variance budget.
+Only a covariate-contrast response solve is needed for GLS profiling at these
+endpoints. This changes the sparse-variance estimator; it is not an algebraic
+identity or a claim of unbiasedness. Holding $g,r,H$ fixed, Q increases by the
+omitted positive trace divided by n. Full refits can also change stopping
+decisions and prediction through the new variance budget.
+
+The REML determinant and score above remain information-corrected. The direct
+information routine is still used for their low-memory fallback and may supply
+warm starts to optional SE calculations. SE retains the selected-space solves
+needed for local coefficient/variance uncertainty, and differentiates the same
+Q reported by the point estimator.
 
 ## Precision, reuse and device execution
 
@@ -121,7 +131,7 @@ presence alongside the projected routine is intentional.
   caches additionally require a fixed covariance; both cross blocks are
   computed because separately converged inverse columns need not be exactly
   symmetric. Projected-likelihood device buffers are released before the
-  wide endpoint solves.
+  subsequent endpoint processing.
 - Optional private cuBLAS and packed CUDA kernels are enabled only on sparse
   GPU streamers. They preserve $KV=Z(Z^TV)/m_{\mathrm{eff}}$, missing-value
   imputation and variant order. Native FP32 and dynamic-precision FP64 use
