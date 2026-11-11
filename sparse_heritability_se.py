@@ -445,10 +445,13 @@ def pipeline_h2_se(*, args, fitter, grm_index, valid, theta, y, z, covar,
                 seed=args.h2_se_seed, solve_tol=args.h2_se_pcg_tol,
                 mean_information=mean_information)
             estimate.update(backend='matrix_free_native_kernels', batch_size=batch_size,
+                linear_solve_arithmetic='fp32_corrections_verified_fp64',
                 batch_size_requested=args.h2_se_batch_size,
                 pcg_tolerance=args.h2_se_pcg_tol, max_solve_residual=bank.max_solve_residual,
                 solve_batches=bank.solve_batches,
                 pcg_iterations=getattr(bank, 'pcg_iterations', None),
+                fp64_rescue_batches=bank.fp64_rescue_batches,
+                fp64_rescue_iterations=bank.fp64_rescue_iterations,
                 warm_solve_batches=getattr(bank, 'warm_solve_batches', None))
     except (ValueError, FloatingPointError, RuntimeError, MemoryError, np.linalg.LinAlgError) as exc:
         estimate = dict(status='unavailable', reason=f'{type(exc).__name__}: {exc}',

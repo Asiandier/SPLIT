@@ -125,6 +125,18 @@ All sparse/background/residual cross-covariances are retained.
 dense-kernel public reference backend for saved-endpoint use.
 `sparse_se_operator.py` connects the production path to the native fitter.
 It uses checked PCG solves with the existing covariance operator/preconditioner.
+FP32 correction solves use FP32 covariance coefficients and native FP32
+preconditioner factors, with both operators preserving the input precision.
+The endpoint coefficients remain fixed; the FP64 operator uses their original
+values to verify every returned solution against the requested residual
+tolerance. This avoids promoting correction directions through an FP64
+covariance accumulator or preconditioner. It changes numerical execution,
+not the SE formula, random probes or acceptance standard.
+`linear_solve_arithmetic` records `fp32_corrections_verified_fp64`.
+If a finite mixed-precision result misses the requested accuracy, a full-FP64
+solve may use the remaining iterations of that batch's original budget.
+`fp64_rescue_batches` and `fp64_rescue_iterations` record this work. Loose
+requested tolerances also retain a final FP64 check.
 Covariance probes are sampled as
 
 $$
