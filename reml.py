@@ -1927,8 +1927,17 @@ def fit_reml(
                 alpha_try *= 0.5
                 continue
             eval_elapsed += time.time() - eval_t0
-            dll_arr, k_pcg_arr = jax.device_get((ll_try - ll, k_pcg_try))
-            dll = float(dll_arr)
+            if ctx.mean_information is not None:
+                # Sparse objectives leave a local FP64 scope. Subtraction in
+                # the default FP32 scope can round a rejected decrease to zero.
+                # Preserve their precision for the same decision as _eval_once.
+                ll_try_host, ll_base_host, k_pcg_arr = jax.device_get(
+                    (ll_try, ll, k_pcg_try)
+                )
+                dll = float(ll_try_host) - float(ll_base_host)
+            else:
+                dll_arr, k_pcg_arr = jax.device_get((ll_try - ll, k_pcg_try))
+                dll = float(dll_arr)
             evaluated_trials += 1
             k_pcg_trial = int(k_pcg_arr)
             ai_pcg_trial = (
@@ -1939,6 +1948,8 @@ def fit_reml(
             trial_accepted = (dll >= 0.0) or optimizer == "smile_scoring"
             ls_trace.append((alpha_used, dll, trial_accepted, k_pcg_trial, ai_pcg_trial, trial_use_taylor))
             if trial_accepted:
+                if grad_try is None or FI_try is None:
+                    raise RuntimeError("Accepted REML trial has no score or information matrix.")
                 accepted = True
                 ll_new = ll_try
                 grad_new = grad_try
