@@ -216,7 +216,7 @@ Sparse-run output semantics are deliberately explicit:
   reuse response-independent REML probe products and single-GRM Lanczos work.
   These caches do not cross sample sets or GRM partitions. Resuming a pipeline
   also checks a source-code digest; changed code requires a fresh work directory.
-- `--lasso-path-solver residual` selects an alternative numerical solver for
+- `--lasso-path-solver residual` is the default numerical solver for
   validation paths from one packed genotype source. It solves for residual
   gradients instead of all inverse-covariance candidate columns, using the
   existing preconditioner to initialize a quasi-Newton metric. Exact-objective
@@ -231,7 +231,8 @@ Sparse-run output semantics are deliberately explicit:
   and reloads their identical values on demand, without limiting the number
   of candidate SNPs. Live matrix operands remain pinned until completion.
   The lambda grid,
-  validation rule and KKT tolerance are unchanged. The default remains `basil`;
+  validation rule and KKT tolerance are unchanged. Explicit
+  `--lasso-path-solver basil` selects the weighted-Gram path solver;
   fixed-lambda refits retain their existing solver.
 - `var_components_lasso_ml` contains one kernel coefficient per fixed GRM
   followed by the identity-residual variance. The covariance remains

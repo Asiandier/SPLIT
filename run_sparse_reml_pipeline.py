@@ -949,8 +949,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--lasso-lam-min-ratio", type=float, default=0.05)
     p.add_argument("--lasso-n-lambda", type=int, default=60)
-    p.add_argument("--lasso-path-solver", choices=("basil", "residual"), default="basil",
-        help="Validation-path numerical solver; grid, penalty and selection rules are unchanged.")
+    p.add_argument("--lasso-path-solver", choices=("basil", "residual"), default="residual",
+        help="Lasso path solver (default: residual); grid, penalty and selection rules are unchanged.")
     p.add_argument(
         "--lasso-fixed-lam-ratio",
         type=float,

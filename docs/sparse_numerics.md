@@ -14,7 +14,9 @@ $$
 P_C=H^{-1}-H^{-1}C(C^T H^{-1}C)^{-1}C^T H^{-1}.
 $$
 
-Both path solvers minimize the same profiled objective:
+The sparse entry points default to `--lasso-path-solver residual`.
+For validation paths, `--lasso-path-solver basil` remains available as an
+explicit alternative. Both path solvers minimize the same profiled objective:
 
 $$
 f_\lambda(b)=\tfrac12(y-Zb)^T P_C(y-Zb)+\lambda\lVert b\rVert_1.

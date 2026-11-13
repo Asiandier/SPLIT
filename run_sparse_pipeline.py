@@ -392,7 +392,7 @@ def _low_level_command(
         "--lasso-n-lambda",
         str(int(args.n_lambda)),
         "--lasso-path-solver",
-        str(getattr(args, "lasso_path_solver", "basil")),
+        str(getattr(args, "lasso_path_solver", "residual")),
         "--lasso-cd-max-iter",
         str(int(args.lasso_cd_max_iter)),
         "--validation-early-stopping-lag",
@@ -1148,8 +1148,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--lam-min-ratio", type=float, default=1e-3)
     parser.add_argument("--n-lambda", type=int, default=80)
-    parser.add_argument("--lasso-path-solver", choices=("basil", "residual"), default=None,
-        help="Validation-path numerical solver; does not alter statistical settings.")
+    parser.add_argument("--lasso-path-solver", choices=("basil", "residual"), default="residual",
+        help="Lasso path solver (default: residual); grid, penalty and selection rules are unchanged.")
     parser.add_argument("--lasso-cd-max-iter", type=int, default=10000)
     parser.add_argument("--validation-early-stopping-lag", type=int, default=5)
     parser.add_argument("--outer-max", type=int, default=20)
@@ -1206,7 +1206,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error("AIC selection requires the residual Lasso solver.")
     elif not args.validation_pheno_txt or not args.validation_keep_path:
         parser.error("Validation selection requires --validation-pheno-txt and --validation-keep-path.")
-    args.lasso_path_solver = args.lasso_path_solver or ("residual" if args.selection_criterion == "aic" else "basil")
     if args.background_ss_pcg_tol is None:
         args.background_ss_pcg_tol = 1e-7 if args.alpha_vamp else 1e-9
     if bool(args.fit_pheno_txt) != bool(args.fit_keep_path):
