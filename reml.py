@@ -32,6 +32,7 @@ from scipy.optimize import nnls
 
 from .pcg import pcg_solve
 from .slq import logdet_value_and_grad as _slq_value_and_grad
+from .slq import rademacher_signs
 from .precond import (
     ProjectedCorePrecondConf,
     ProjectedCoreRuntime,
@@ -348,7 +349,7 @@ def _build_affine_slq_cache(
     """Run Lanczos once for a matrix used in an affine identity pencil."""
     keys_b = jax.random.split(key, nsamples)
     z = jax.vmap(
-        lambda k: jax.random.rademacher(k, (n_dim,), dtype=jnp.int32)
+        lambda k: rademacher_signs(k, (n_dim,))
     )(keys_b).astype(jnp.float32)
     z_norm_sq = jnp.array(n_dim, dtype=jnp.float32)
     z_norm    = jnp.sqrt(z_norm_sq)
@@ -1505,7 +1506,7 @@ def fit_reml(
     use_trace_probes = optimizer == "smile_scoring"
     n_trace_probes = n_rand_vec if use_trace_probes else 0
     Vrand_fixed = (
-        jax.random.rademacher(key_vrand, (n, n_rand_vec), dtype=jnp.int32)
+        rademacher_signs(key_vrand, (n, n_rand_vec))
         .astype(jnp.float32)
     ) if use_trace_probes else None
 

@@ -13,6 +13,18 @@ import jax.numpy as jnp
 import numpy as np
 
 
+def rademacher_signs(key, shape):
+    """Keep probe draws independent of the surrounding JAX precision scope.
+
+    JAX rademacher delegates to Bernoulli with an untyped probability. Even
+    with an explicit integer output dtype, enabling x64 can change its draws.
+    A float32 probability preserves the original FP32 probe sequence while
+    allowing covariance solves to use FP64 independently.
+    """
+    bits = jax.random.bernoulli(key, p=jnp.asarray(0.5, dtype=jnp.float32), shape=shape)
+    return 2 * bits.astype(jnp.int32) - 1
+
+
 def default_workspace_bytes(gpu_budget_bytes=None):
     """Shared SLQ budget policy for fitting and memory planning."""
     return (
@@ -227,7 +239,7 @@ def logdet_value_and_grad(matvec, matvec_pullback, n, key, *, nsamples, m,
     total_value, total_gradient = jnp.asarray(0., dtype=dtype), None
     for start in range(0, nsamples, width):
         count = min(width, nsamples-start)
-        signs = jax.vmap(lambda k:jax.random.rademacher(k, (n,), dtype=jnp.int32))(
+        signs = jax.vmap(lambda k:rademacher_signs(k, (n,)))(
             keys[start:start+count]).astype(dtype).T
         basis = jnp.zeros((depth+1, n, count), dtype=dtype)
         basis = _set_row(basis, 0, signs/jnp.sqrt(jnp.asarray(n, dtype=dtype)))

@@ -100,19 +100,20 @@ update, the covariance, covariate, and selected-span determinants are evaluated
 jointly in an orthogonal contrast space. This equivalent objective avoids
 solving for every selected column at each line-search point; the residual
 quadratic still profiles only the covariates, leaving the LASSO mean fixed.
-The sparse entry points default to 50 fixed SLQ probes (`--slq-samples 50`),
+The sparse entry points default to 100 fixed SLQ probes (`--slq-samples 100`),
 with the existing Lanczos quadrature tolerance and maximum depth. The probe
 count controls Monte Carlo precision; different counts or determinant
 representations need not produce identical numerical trajectories. Projection
 buffers are released before endpoint GLS profiling. If the additional basis
 does not fit the sparse memory plan, the direct selected-information
 determinant is used instead.
-The endpoint sparse variance is `Q_s = (g'g + 2g'r)/n`, where `g = Zb` and
-`r = y - C gamma - g` uses the GLS-profiled covariate coefficients. It omits
-the earlier selected-mean trace subtraction at convergence checks, final h²
-output and construction of the prediction-stage variance budget. The REML
-determinant correction above remains in place; the Lasso residual quadratic
-itself retains `P_C`.
+The endpoint sparse variance is `Q_s = (g'g + 2g'r - T)/n`, where `g = Zb`,
+`r = y - C gamma - g` uses the GLS-profiled covariate coefficients, and
+`T = tr((B' P_C B)^-1)`. This trace correction is included at convergence
+checks, final h² output and construction of the prediction-stage variance
+budget. Its lightweight computation is described in
+[sparse numerical contracts](docs/sparse_numerics.md). The REML determinant
+correction above remains in place; the Lasso residual quadratic retains `P_C`.
 For long sparse fits, `--checkpoint` saves completed outer iterations and
 resumes the same command after interruption. See [checkpoint scope and
 compatibility](docs/sparse_checkpoints.md).

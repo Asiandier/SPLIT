@@ -39,7 +39,13 @@ correction; the entire path's candidate union is not needed for that step.
 These changes retain the lambda grid, validation stopping rule and full-marker
 KKT conditions. Finite-tolerance iterates can differ with warm starts.
 
-The sparse entry points default to 50 fixed SLQ probes. The maximum Lanczos
+The sparse entry points default to 100 fixed SLQ probes. Rademacher draws use
+an explicit FP32 Bernoulli probability, preserving the original FP32 probe
+sequence across JAX precision scopes. Explicit integer output alone is not
+sufficient: JAX's default Bernoulli probability changes precision when x64 is
+enabled. FP64 covariance solves must not implicitly change the random probes.
+Changing the probe count still changes the split-key sequence; estimates from
+different counts are not expected to be bitwise identical. The maximum Lanczos
 depth remains 50, with its existing
 quadrature tolerance. Probe count controls Monte Carlo trace precision;
 reducing it from 100 does not imply an identical numerical likelihood.

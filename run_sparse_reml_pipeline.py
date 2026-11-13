@@ -900,7 +900,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ring-depth", type=int, default=int(env("RING_DEPTH", "0")),
                    help="Pinned ring buffer depth (0 = auto, default 32)")
     p.add_argument("--n-rand-vec", type=int, default=100)
-    p.add_argument("--slq-samples", type=int, default=50)
+    p.add_argument("--slq-samples", type=int, default=100)
     p.add_argument("--slq-m", type=int, default=int(env("SLQ_M", "50")))
     p.add_argument("--slq-quadrature-tol", type=float, default=float(env("SLQ_QUADRATURE_TOL", "1e-6")),
                    help="Log quadrature error bound per sample; 0 uses fixed SLQ depth.")

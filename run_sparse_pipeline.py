@@ -1180,7 +1180,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--call-width", type=int, default=0)
     parser.add_argument("--ring-depth", type=int, default=0)
     parser.add_argument("--n-rand-vec", type=int, default=100)
-    parser.add_argument("--slq-samples", type=int, default=50)
+    parser.add_argument("--slq-samples", type=int, default=100)
     parser.add_argument("--slq-m", type=int, default=50)
     parser.add_argument("--slq-quadrature-tol", type=float, default=1e-6,
                         help="Log quadrature error bound per sample; 0 uses fixed SLQ depth.")
