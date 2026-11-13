@@ -94,27 +94,73 @@ quadrature. The exact determinant identities agree, but their finite-probe
 approximations need not be identical. Numerical trajectories and boundary
 coefficients can therefore differ without a change of statistical objective.
 
-The endpoint sparse variance uses the fitted sparse mean $g=Zb$ and the
-GLS-profiled residual $r=y-C\hat\gamma-g$:
+## Endpoint sparse-variance correction
+
+For the fitted mean $g=Zb$ and GLS-profiled residual $r=y-C\hat\gamma-g$,
 
 $$
-Q_s=\frac{g^Tg+2g^Tr}{n}.
+Q_s=\frac{g^Tg+2g^Tr-T}{n},\qquad T=\operatorname{tr}\{(B^TP_CB)^{-1}\}.
 $$
 
-The earlier selected-mean subtraction
-$\operatorname{tr}\{(B^TP_CB)^{-1}\}/n$ is omitted at convergence checks,
-final h² output and construction of the prediction-stage variance budget.
-Only a covariate-contrast response solve is needed for GLS profiling at these
-endpoints. This changes the sparse-variance estimator; it is not an algebraic
-identity or a claim of unbiasedness. Holding $g,r,H$ fixed, Q increases by the
-omitted positive trace divided by n. Full refits can also change stopping
-decisions and prediction through the new variance budget.
+This restores the selected-mean covariance subtraction at outer h² checks,
+final h² and the prediction-stage variance budget. Under a fixed selected
+space, known covariance and unpenalized GLS, T is the fitted-mean noise
+variance. This interpretation does not establish unbiasedness for adaptive
+Lasso selection and shrinkage. The REML determinant/score above are unchanged.
 
-The REML determinant and score above remain information-corrected. The direct
-information routine is still used for their low-memory fallback and may supply
-warm starts to optional SE calculations. SE retains the selected-space solves
-needed for local coefficient/variance uncertainty, and differentiates the same
-Q reported by the point estimator.
+The trace uses a covariance Schur identity. Let $Q_C$ span C, $W=B^TQ_C$,
+$F=Q_C-BW$, $E=F^TF$ and
+
+$$
+U=B-FE^{-1}W^T,\quad \Pi=I-BB^T-FE^{-1}F^T,\quad
+A=\Pi H\Pi+(I-\Pi).
+$$
+
+Then $U^TB=I$, $U^TC=0$ and
+
+$$
+(B^TP_CB)^{-1}=U^T(H-H\Pi A^{-1}\Pi H)U.
+$$
+
+For a Rademacher vector z in the selected space, set $u=Uz$, $b=\Pi Hu$,
+solve $Ax=b$ and average $u^THu-b^Tx$. The expectation is T. No sample-sized
+square covariance or selected-column inverse is needed. An approximate solve
+is evaluated with FP64 operator products:
+
+$$
+q_U=u^THu-2b^Tx+x^TAx,\quad
+0\le q_U-z^T(B^TP_CB)^{-1}z
+\le\frac{\lVert b-Ax\rVert^2}{\min(\theta_e,1)}.
+$$
+
+The bound concerns linear solves in exact arithmetic, not Monte Carlo error
+or floating-point interval certification. Sixteen fixed, reproducible probes
+are initially used. Probes increase to 32, 64 or 128 until two empirical MC
+SEs plus the solve bound are at most 0.5% of T; otherwise the exact calculation
+is used. These are numerical accuracy controls, not phenotype-dependent model
+parameters. The empirical SE check is not a finite-sample confidence guarantee.
+PCG starts at tolerance 0.01 and tightens if its quadratic error exceeds a tenth
+of this target. Packed GPU products use four-column batches; blocking does not
+change the probe sequence. Supports of rank at most 16 use the direct method.
+
+An already valid exact likelihood cache is reused before estimating T. Endpoint
+trace caches are separate from likelihood caches and are invalidated by changes
+of covariance, selected span or sample/standardization scope. Covariate profiles
+are recomputed for each new response. An empirical uncertainty band touching
+zero Q, a nonpositive denominator or the outer h² stopping boundary requests
+exact evaluation. Deferred pre-update diagnostics do not require a trace.
+
+SE uses the same fixed probes and basis. With $M=B^TP_CB$ and
+$w=P_CB M^{-1}z$, the derivative is
+
+$$
+\frac{\partial T}{\partial\theta_j}=E[w^TK_jw],\qquad K_e=I.
+$$
+
+SE subtracts this derivative divided by n from dQ/dtheta. Its selected-space
+solves already supply $P_CB$ and M; no new contrast solves are needed. This
+conditions on the numerical probe realization. MC trace uncertainty is reported
+separately from the local statistical SE.
 
 ## Precision, reuse and device execution
 

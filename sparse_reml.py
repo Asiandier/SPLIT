@@ -3,7 +3,8 @@
 For D=[C,B]=QR, Pi=I-QQ', the determinant identity is
   log|H| + log|C'H^-1 C| + log|B'P_C B| = log|Pi H Pi+QQ'| + log|D'D|.
 Only the determinant uses D. The quadratic and AI retain P_C. Endpoint
-heritability profiles ordinary covariates without a selected-mean trace.
+heritability profiles ordinary covariates and separately estimates the
+selected-mean covariance trace; that trace is not part of this determinant.
 """
 from __future__ import annotations
 

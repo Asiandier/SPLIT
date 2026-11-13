@@ -101,7 +101,8 @@ class KernelBank:
 def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
               q_saved=None, atoms=None, trace_probes=64, moment_probes=256,
               seed=581104, return_details=False, penalty_signs=None,
-              anchor_candidates=None, progress=None, cached_solutions=None):
+              anchor_candidates=None, progress=None, cached_solutions=None,
+              mean_trace_probes=None):
     """Compute free-all and fixed-boundary SEs without changing the endpoint.
 
     Inputs must use exactly the saved sample order and SNP standardization.
@@ -200,7 +201,25 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
     u = project_hinv(bank.solve(factor, y-g, initial=hy-hz @ alpha))
     residual = y-g-c @ (ci @ (hc.T @ (y-g)))
     a = project(anchor)
-    q_reconstructed = float(b.host(g@g+2*g@residual)/n)
+    # Differentiate the SAME selected-mean trace as the point estimate. For
+    # stochastic endpoints z is the native orthonormal basis and these are
+    # its fixed Rademacher probes. Standalone endpoints use the exact trace,
+    # including Z'Z when their selected coordinates are not orthonormal.
+    if mean_trace_probes is None:
+        gram = b.host(z.T @ z)
+        directions = b.array(sla.cholesky((gram+gram.T)*.5, lower=True))
+        normalization = 1.
+    else:
+        directions = b.array(mean_trace_probes)
+        if (directions.ndim != 2 or directions.shape[0] != p or directions.shape[1] == 0
+                or not np.isfinite(b.host(directions)).all()
+                or not np.allclose(b.host(z.T @ z), np.eye(p), atol=1e-8, rtol=1e-8)):
+            raise ValueError('Endpoint trace probes require the matching orthonormal selected basis')
+        normalization = float(directions.shape[1])
+    inverse_directions = mi @ directions
+    mean_trace = float(b.host(xp.sum(directions*inverse_directions)))/normalization
+    trace_weights = pz @ inverse_directions
+    q_reconstructed = float(b.host(g@g+2*g@residual)/n)-mean_trace/n
     q = q_reconstructed if q_saved is None else float(q_saved)
     lam = ratio*float(b.host(anchor @ py))*anchor_sign
     kkt = b.host(z.T @ u)-lam*b.host(signs)
@@ -235,10 +254,11 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
     for j in range(nc):
         dg = z @ dalpha[j]
         dr = -dg+c @ (ci @ (hc.T @ ku[j]+c.T @ hz @ dalpha[j]))
-        dq.append(float(b.host(2*dg @ (g+residual)+2*g @ dr))/n)
+        derivative_trace = float(b.host(xp.sum(trace_weights*bank.mv(j, trace_weights))))/normalization
+        dq.append((float(b.host(2*dg @ (g+residual)+2*g @ dr))-derivative_trace)/n)
     dq = np.asarray(dq)
     if progress is not None:progress('observed_derivative',time.perf_counter()-started)
-    del ku, pku, kpy, dalpha, du
+    del ku, pku, kpy, dalpha, du, trace_weights, inverse_directions, directions
 
     # Antithetic quadratic/linear decomposition of Gaussian moments.
     # This is trace estimation at fixed theta, not a parametric refitting bootstrap.
@@ -268,8 +288,8 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
                kkt_max_error=float(np.max(abs(kkt), initial=0)),
                lambda_reconstructed=float(lam),
                alpha_branch_max_difference=float(np.max(abs(branch_alpha-b.host(alpha)), initial=0)),
-               information_rank=int(p), mean_uncertainty=0.,
-               endpoint_trace_correction='omitted',
+               information_rank=int(p), mean_uncertainty=mean_trace/n,
+               endpoint_trace_correction=('exact' if mean_trace_probes is None else 'projected_hutchinson'),
                anchor_index_within_support=anchor_index,
                mean_information_condition=float(mean_condition),
                trace_probes=trace_probes,moment_probes=moment_probes,
@@ -387,9 +407,18 @@ def endpoint_h2_se(bank, *, theta, y, z, covar, alpha, ratio, lam, q, atoms,
         if not np.allclose(represented_mean, original_mean, rtol=solve_tol, atol=solve_tol):
             raise ValueError('Cached selected span does not preserve the fitted sparse mean')
     c = np.empty((len(y), 0)) if covar is None else np.asarray(covar)
+    mean_probes = None
+    if mean_information is not None:
+        state = info._endpoint_state
+        if state is None or not np.array_equal(np.asarray(theta), info._endpoint_theta):
+            raise ValueError('Missing trace calculation at the supplied SE covariance')
+        if state['endpoint_trace_correction'] == 'projected_hutchinson':
+            from .sparse_trace import trace_probes as make_trace_probes
+            mean_probes = make_trace_probes(info.rank, state['trace_probes'], state['trace_seed'])
     estimate = calculate(bank, theta, np.asarray(y), basis, c, coef, ratio, None, 1.,
         q_saved=q, atoms=atoms, trace_probes=trace_probes, moment_probes=moment_probes,
-        seed=seed, penalty_signs=signs, anchor_candidates=z, cached_solutions=cache)
+        seed=seed, penalty_signs=signs, anchor_candidates=z, cached_solutions=cache,
+        mean_trace_probes=mean_probes)
     if not np.isclose(estimate['h2'], h2, rtol=0, atol=1e-7):
         raise ValueError('SE endpoint h2 does not match the reported native h2')
     if abs(estimate['q_reconstruction_error']) > max(1e-5, 20*solve_tol*max(1., abs(q))):

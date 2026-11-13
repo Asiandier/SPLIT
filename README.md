@@ -201,14 +201,15 @@ Sparse-run output semantics are deliberately explicit:
   estimator fields and downstream phenotype-scale conversions no longer exist.
 - In each `outer_update` history record, `theta` and validation predictive R²
   describe the selected LASSO state. `information_calibration_before_update`
-  is `omitted`; the projected route leaves pre-update `coherit_h2`, `q_sparse`
-  and trace fields null when endpoint GLS profiling is deferred. The subsequent
+  is `deferred` on projected updates; pre-update `coherit_h2`, `q_sparse`
+  and trace fields are then null because that unused calibration is deferred.
+  The subsequent
   covariance update is recorded as `theta_after_variance_update`, with
   `coherit_h2_after_variance_update` and `q_sparse_after_variance_update`
   recomputed using covariates profiled at that covariance. Its h² convergence
   fields use the `variance_update_` prefix. Final covariance-alignment records
-  report h² for the returned LASSO state. Endpoint trace fields are zero when
-  evaluated; no selected-mean trace is subtracted from Q.
+  report h² for the returned LASSO state. Evaluated endpoints subtract the
+  selected-mean covariance trace from Q and record its numerical diagnostics.
 - BASIL validation reuses its training dual and marker scores after a true
   residual check; only inaccurate columns are refined. Fixed-K variance blocks
   reuse response-independent REML probe products and single-GRM Lanczos work.
@@ -253,13 +254,14 @@ Sparse-run output semantics are deliberately explicit:
   It uses native matrix-free operators without refitting models; the production
   runner computes it only after the final combined-sample fit. `--no-h2-se`
   disables it. See [SE derivation and controls](docs/sparse_h2_se.md).
-- Sparse variance uses `(g.T @ g + 2*g.T @ residual)/n`, with covariates
-  profiled at the final covariance. `q_chive_components` records both terms;
-  `term3_mean_uncertainty_subtracted` is retained as zero and
-  `endpoint_trace_correction` is `omitted`. The REML information determinant
-  is retained. This is a different point estimator from the earlier version
-  that subtracted selected-mean uncertainty, rather than a numerically
-  equivalent speed optimization.
+- Sparse variance uses `(g.T @ g + 2*g.T @ residual - trace)/n`, with
+  `trace = tr((B.T @ P_C @ B)^-1)` for the orthonormal selected mean basis B.
+  `q_chive_components` records the three terms. `endpoint_trace_correction`
+  is `projected_hutchinson` or `exact`; `endpoint_trace_diagnostics` records
+  probe count, Monte Carlo SE and linear-solve error bound. Small supports,
+  an existing exact cache or insufficient probe precision use exact evaluation.
+  This restores the earlier trace-subtracted estimator. The prediction stage
+  uses the same corrected sparse variance. See [numerical details](docs/sparse_numerics.md).
 - Sparse prediction emits only the `lasso_*` branch: the Lasso
   fixed-SNP score plus its matched background BLUP.
 - `--compute-effects` emits nuisance effects and one source-order SNP table

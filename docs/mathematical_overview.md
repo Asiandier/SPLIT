@@ -251,7 +251,10 @@ Sparse COHERIT retains its explicit kernel-coefficient initialization and uses
 these same trace atoms for background variance throughout its outer loop and
 adaptive covariance refits. With calibrated sparse variance `Q`, it reports
 `h2 = (Q + V_G) / (Q + V_G + V_E)`. `Q` is computed directly from the sparse
-fitted mean and residual on the analysis scale and receives no trace factor.
+fitted mean and residual, subtracting selected-mean covariance uncertainty
+on the analysis scale. Q receives no multiplicative kernel trace atom; the
+subtracted uncertainty trace is a different quantity described in
+[sparse numerics](sparse_numerics.md).
 Mean-imputed genotypes can make `tr(K_g) / n` smaller than one even when all
 observed genotype columns were standardized. Reporting their actual trace
 atoms does not change `H`, its REML derivatives, or BLUP effects.

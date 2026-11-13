@@ -2,8 +2,8 @@
 
 The Lasso mean is an offset, NOT an additional profiled fixed effect. For a
 fixed selected span Z, add log|Z' P_C Z| to the negative REML determinant.
-Endpoint sparse variance uses (g'g + 2g'r)/n, without a selected-mean trace
-subtraction. Covariates are still profiled at the current covariance.
+Endpoint sparse variance subtracts tr((B' P_C B)^-1)/n. A projected
+covariance trace estimator avoids one inverse solve per selected column.
 """
 from __future__ import annotations
 
@@ -182,6 +182,9 @@ class SparseMeanInformation:
         self._theta = None
         self._tol = None
         self._state = None
+        self._endpoint_theta = None
+        self._endpoint_state = None
+        self._endpoint_tol = None
         logger.info("[information basis] selected=%s rank=%s time=%.2fs",
                     x.shape[1], self.rank, time.perf_counter()-started)
 
@@ -236,20 +239,70 @@ class SparseMeanInformation:
         self._theta, self._state, self._tol = theta.copy(), state, tol
         return state
 
-    def statistics(self, theta, hv, precond, residual, *, tol, maxiter):
-        """Profile C for endpoint Q without selected-column covariance solves.
+    def trace_statistics(self, theta, hv, precond, *, tol, maxiter, exact=False):
+        """Endpoint trace cache, separate from the REML likelihood cache."""
+        from .sparse_trace import MIN_PROBES, estimate_trace
+        theta = np.asarray(theta, dtype=float)
+        if (theta.ndim != 1 or not np.isfinite(theta).all()
+                or np.any(theta[:-1] < 0) or theta[-1] <= 0):
+            raise ValueError('Selected-mean trace requires a PSD genetic covariance and positive noise')
+        if self._cached(theta, tol):
+            state = dict(trace=self._state['trace'], rank=self.rank,
+                         endpoint_trace_correction='exact', trace_probes=0,
+                         trace_mc_se=0., trace_solve_error_bound=None, trace_pcg_tolerance=tol)
+        elif (not exact and self._endpoint_state is not None
+              and np.array_equal(theta, self._endpoint_theta) and self._endpoint_tol <= tol):
+            return self._endpoint_state
+        else:
+            state = None
+            if self.rank > MIN_PROBES and not exact:
+                state = estimate_trace(self.basis, self.covar, theta, hv, precond,
+                    tol=tol, maxiter=maxiter, batch_size=self.batch_size)
+            if state is None:
+                hc = solve_columns(hv, self.covar, precond, tol=tol, maxiter=maxiter,
+                                   batch_size=self.batch_size)
+                direct = self.evaluate(theta, hv, precond, hc, tol=tol, maxiter=maxiter)
+                state = dict(trace=direct['trace'], rank=self.rank,
+                             endpoint_trace_correction='exact', trace_probes=0,
+                             trace_mc_se=0., trace_solve_error_bound=None, trace_pcg_tolerance=tol)
+        self._endpoint_theta, self._endpoint_state = theta.copy(), state
+        self._endpoint_tol = tol
+        return state
 
-        The zero trace describes the endpoint estimator only. It must not be
-        stored in the likelihood cache: evaluate() still supplies the REML
-        determinant and its score factors at the requested covariance.
+    def statistics(self, theta, hv, precond, residual, *, tol, maxiter, exact=False,
+                   sparse_mean=None, background_variance=None, previous_h2=None,
+                   h2_tolerance=None):
+        """GLS profile and selected-mean correction at the same covariance.
+
+        The stochastic endpoint trace never replaces the information
+        determinant or score in evaluate(). The response profile is always
+        recomputed: it changes after a Lasso update even if theta is unchanged.
         """
         started = time.perf_counter()
         profiled, gamma = self.profile_response(
             hv, precond, residual, tol=tol, maxiter=maxiter)
-        state = {"trace": 0.0, "rank": self.rank,
-                 "endpoint_trace_correction": "omitted"}
-        logger.info("[sparse endpoint] rank=%s trace_correction=omitted profile_time=%.2fs",
-                    self.rank, time.perf_counter()-started)
+        state = self.trace_statistics(theta, hv, precond, tol=tol, maxiter=maxiter, exact=exact)
+        if sparse_mean is not None and state['endpoint_trace_correction'] != 'exact':
+            g = np.asarray(sparse_mean, dtype=float)
+            q0 = float(g @ g+2*g @ profiled)/self.n
+            uncertainty = (2*state['trace_mc_se']+state['trace_solve_error_bound'])/self.n
+            q = q0-state['trace']/self.n
+            total = q+float(background_variance)+float(theta[-1])
+            sensitive = abs(q) <= uncertainty or total <= uncertainty
+            if total > uncertainty:
+                h2 = 1-float(theta[-1])/total
+                h2_error = float(theta[-1])*uncertainty/(total*(total-uncertainty))
+                if previous_h2 is not None and h2_tolerance is not None:
+                    # Include uncertainty in both compared endpoints. This is
+                    # an empirical MC guard, not a probabilistic guarantee.
+                    sensitive |= abs(abs(h2-previous_h2)-h2_tolerance) <= 2*h2_error
+            if sensitive:
+                state = self.trace_statistics(theta, hv, precond, tol=tol, maxiter=maxiter, exact=True)
+                state['exact_reason'] = 'near_variance_or_convergence_boundary'
+        logger.info("[sparse endpoint] rank=%s trace=%g method=%s probes=%s mc_se=%.3g "
+                    "solve_bound=%s time=%.2fs", self.rank, state['trace'],
+                    state['endpoint_trace_correction'], state['trace_probes'],
+                    state['trace_mc_se'], state['trace_solve_error_bound'], time.perf_counter()-started)
         return state, profiled, gamma
 
     def profile_response(self, hv, precond, residual, *, tol, maxiter):

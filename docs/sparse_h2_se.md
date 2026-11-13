@@ -77,13 +77,15 @@ $$
 where the residual kernel is `I`. The sparse variance is
 
 $$
-Q=y^TA_Qy,\qquad
+Q=y^TA_Qy-\operatorname{tr}\{(B^TPB)^{-1}\}/n,\qquad
 A_Q=(T^TT+T^TR+R^TT)/n.
 $$
 
-This is the endpoint estimator without selected-mean trace subtraction.
-Consequently `b=dQ/dtheta` also omits that subtraction's derivative. The REML
-score F and its selected-space information correction remain as given above.
+The endpoint subtracts selected-mean covariance uncertainty. Its derivative
+is subtracted in `b=dQ/dtheta` as well, using the same fixed trace probes as
+the point estimator (or the exact trace when available). This constant at
+fixed theta does not change the conditional Gaussian moment covariance below.
+The REML score F is unchanged. See [trace identity](sparse_numerics.md).
 
 At the fitted endpoint, compute the observed Jacobian `A=-dF/dtheta` and
 `b=dQ/dtheta`, retaining changes in alpha and the absolute lambda. With
@@ -197,11 +199,10 @@ on 900 simulation fits and
 approximation and 93.7% for GREML-LDMS. SPLIT was somewhat more conservative by
 SE/empirical-SD comparison; low-h2 High-LD settings retained point-estimator bias.
 The boundary recommendation was exploratory after comparing both variants.
-Those coverage results do not establish coverage for the current estimator
-without trace subtraction. The current SE uses the same local Gaussian working
-moments with the updated Q and its derivative; its interval coverage requires
-separate validation. Random-probe realizations also differ from the original
-dense backend.
+The current endpoint restores that trace subtraction using a lightweight
+numerical approximation. These earlier coverage results are supporting
+evidence, not a new coverage study of the current full implementation.
+Random-probe realizations also differ from the original dense backend.
 
 Use `h2 +/- h2_se` for a one-SE display, and identify SPLIT's SE as approximate.
 It is not an exact confidence interval or a guarantee of coverage in every setting.

@@ -1395,6 +1395,7 @@ def _outer_coherit_h2_from_fitted_sparse_mean(
     *,
     background_genetic_variance: float,
     residual_variance: float,
+    mean_uncertainty_trace: float = 0.,
 ) -> tuple[float, float]:
     """Return current COHERIT h2 and calibrated sparse variance.
 
@@ -1402,7 +1403,7 @@ def _outer_coherit_h2_from_fitted_sparse_mean(
     primary estimator, expressed through the already available fitted sparse
     mean ``g`` and residual ``r``:
 
-        q_sparse = (g'g + 2 g'r) / n.
+        q_sparse = (g'g + 2 g'r - tr((B' P_C B)^-1)) / n.
 
     Using these vectors avoids another genotype matrix product inside the
     outer convergence check.
@@ -1418,6 +1419,7 @@ def _outer_coherit_h2_from_fitted_sparse_mean(
         (
             sparse_arr @ sparse_arr
             + 2.0 * (sparse_arr @ residual_arr)
+            - float(mean_uncertainty_trace)
         )
         / n_samples
     )
@@ -5126,7 +5128,7 @@ def main() -> None:
                 precond_rank=plan.precond_rank,
             )
             information_markers = active_markers.copy()
-        # Both branches profile ordinary covariates without an endpoint trace.
+        # Both branches profile ordinary covariates at the current covariance.
         # Defer the pre-update Q value when the projected optimizer only needs
         # the residual; post-update and alignment checks use the same Q as h2.
         deferred_information = bool(
@@ -5143,6 +5145,8 @@ def main() -> None:
             mean_state, residual, beta_cov_current = mean_information.statistics(
                 theta, hv, precond, np.asarray(y_np, dtype=np.float64)-sparse_mean_current,
                 tol=min(float(args.pcg_tol), 1e-5), maxiter=int(args.max_pcg_iters),
+                sparse_mean=sparse_mean_current, background_variance=_background_genetic_variance(theta),
+                previous_h2=previous_outer_h2, h2_tolerance=float(args.h2_abs_tol),
             )
         lasso["beta_cov"] = beta_cov_current
         fixed_mean_current = sparse_mean_current + (
@@ -5159,6 +5163,7 @@ def main() -> None:
                 residual,
                 background_genetic_variance=_background_genetic_variance(theta),
                 residual_variance=float(theta[-1]),
+                mean_uncertainty_trace=mean_state['trace'],
             )
         selected_validation_r2 = (
             float(lasso["validation_selection"]["selected"]["predictive_r2"])
@@ -5168,7 +5173,8 @@ def main() -> None:
         if iterative_validation_selection:
             iterative_validation_trace[-1].update(
                 coherit_h2=selected_h2, q_sparse=outer_q_sparse,
-                information_calibration="omitted"
+                information_calibration=("deferred" if mean_state is None else
+                                         mean_state['endpoint_trace_correction'])
             )
 
         # Alignment can change alpha and h2. Only the returned state may be
@@ -5203,7 +5209,7 @@ def main() -> None:
                     "coherit_h2": selected_h2,
                     "q_sparse": outer_q_sparse,
                     "mean_uncertainty_trace_per_n": mean_state["trace"]/n_samples,
-                    "information_calibration_before_update": "omitted",
+                    "information_calibration_before_update": mean_state['endpoint_trace_correction'],
                     "mean_information_rank": mean_information.rank,
                     "h2_abs_change": float(alignment_h2_change),
                     "h2_stable": bool(alignment_h2_stable),
@@ -5356,6 +5362,8 @@ def main() -> None:
             theta_new, hv_after, precond_after,
             np.asarray(y_np, dtype=np.float64)-sparse_mean_current,
             tol=min(float(args.pcg_tol), 1e-5), maxiter=int(args.max_pcg_iters),
+            sparse_mean=sparse_mean_current, background_variance=_background_genetic_variance(theta_new),
+            previous_h2=previous_outer_h2, h2_tolerance=float(args.h2_abs_tol),
         )
         outer_h2, outer_q_after = (
             _outer_coherit_h2_from_fitted_sparse_mean(
@@ -5365,6 +5373,7 @@ def main() -> None:
                     _background_genetic_variance(theta_new)
                 ),
                 residual_variance=float(theta_new[-1]),
+                mean_uncertainty_trace=mean_after['trace'],
             )
         )
         h2_stable, h2_abs_change = _heritability_converged(
@@ -5390,7 +5399,9 @@ def main() -> None:
             "q_sparse": outer_q_sparse,
             "q_sparse_after_variance_update": float(outer_q_after),
             "mean_uncertainty_trace_per_n": (None if mean_state is None else mean_state["trace"]/n_samples),
-            "information_calibration_before_update": "omitted",
+            "information_calibration_before_update": ("deferred" if mean_state is None else
+                                                       mean_state['endpoint_trace_correction']),
+            "mean_trace_diagnostics_after_variance_update": mean_after,
             "mean_uncertainty_trace_per_n_after_variance_update": mean_after["trace"]/n_samples,
             "mean_information_rank": mean_information.rank,
             "variance_update_h2_abs_change": float(h2_abs_change),
@@ -5600,6 +5611,7 @@ def main() -> None:
                 theta_lasso_ml, final_hv, final_precond,
                 np.asarray(y_np, dtype=np.float64)-final_g,
                 tol=min(float(args.pcg_tol), 1e-5), maxiter=int(args.max_pcg_iters),
+                sparse_mean=final_g, background_variance=background_genetic_variance,
             )
             q_mean_uncertainty = final_mean_state["trace"]/n_samples
             y_chive = np.asarray(y_np, dtype=np.float64)
@@ -5651,7 +5663,7 @@ def main() -> None:
     h2_chive_guarded = float(h2_chive) if lasso_branch_valid else unavailable
     h2 = h2_chive_guarded
     primary_h2_method = (
-        "information_corrected_reml_without_endpoint_trace" if lasso_branch_valid else "unavailable"
+        "information_corrected_reml" if lasso_branch_valid else "unavailable"
     )
 
     # Capture uncertainty before prediction refinement, using the native Lasso
@@ -6076,7 +6088,9 @@ def main() -> None:
             ),
         },
         "primary_h2_method": primary_h2_method,
-        "endpoint_trace_correction": "omitted",
+        "endpoint_trace_correction": (final_mean_state['endpoint_trace_correction']
+                                      if lasso_quadratics_available else 'unavailable'),
+        "endpoint_trace_diagnostics": (final_mean_state if lasso_quadratics_available else None),
         "lasso_branch_valid": lasso_branch_valid,
         "lasso_branch_invalid_reasons": list(
             branch_guards["lasso_branch_invalid_reasons"]
