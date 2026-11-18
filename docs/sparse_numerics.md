@@ -70,6 +70,28 @@ Fixed-lambda final refits continue to use the weighted Gram solver.
 
 ## Sparse covariance update
 
+Selected-span setup uses FP64 QR on the fitting GPU when its current free
+memory and sparse fit budget permit it. A row-blocked TSQR tree bounds the
+workspace when the complete tall factor does not fit. CPU fitting and devices
+without enough scratch retain CPU Householder QR; ordinary REML is unchanged.
+
+For the triangular factor R, an approximate inverse W with residual bound
+e >= ||I-RW||_2 < 1 supplies sigma_min(R) >= (1-e)/||W||_F. The residual bound
+includes FP64 matrix-product rounding. When this lower bound exceeds
+10*max(shape)*eps*||R||_F, every singular value is safely above all three
+existing rank thresholds. The positive-diagonal QR basis is then sufficient;
+no singular vectors or tall Q-U multiplication are needed. Otherwise the
+existing QR/SVD rank decision and ambiguous-rank rejection are retained.
+
+The projected likelihood reuses the orthonormal selected basis B. It only
+orthogonalizes F=(I-BB')C, so Q=[B,orth(F)] and |[C,B]'[C,B]|=|F'F|.
+This removes a second wide QR without changing the projector or determinant.
+The sparse mean, variance budgets, exact covariance correction and stopping
+rules are unchanged. Exact traces are invariant to orthogonal changes of B;
+finite endpoint probes can differ under a new basis. Their existing adaptive
+precision checks remain active, and bitwise-identical estimates are not
+promised. No probe count, seed or covariance-solve tolerance changes here.
+
 Let $B$ be an orthonormal basis for the selected SNP span and keep the fitted
 Lasso mean fixed, with $r=y-Zb$. The corrected objective is
 

@@ -17,6 +17,7 @@ import numpy as np
 import scipy.linalg as sla
 
 from .pcg import pcg_solve
+from .sparse_basis import selected_basis
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +143,8 @@ class SparseMeanInformation:
     or trace does. Rank reduction removes numerical null directions only.
     """
 
-    def __init__(self, active_x, covar, *, hinv_active=None, batch_size=128):
+    def __init__(self, active_x, covar, *, hinv_active=None, batch_size=128,
+                 device=None, gpu_budget_bytes=None):
         started = time.perf_counter()
         x = np.asarray(active_x, dtype=np.float64)
         self.covar = (np.empty((x.shape[0], 0), dtype=np.float64) if covar is None
@@ -157,18 +159,10 @@ class SparseMeanInformation:
         self.batch_size = int(batch_size)
         self.hinv_warm = None
         if x.shape[1]:
-            # QR first reduces the SVD to a support-sized matrix for n >> |S|.
-            q, r = sla.qr(x, mode="economic", check_finite=False)
-            u, singular, vt = sla.svd(r, full_matrices=False, check_finite=False)
-            cutoff = max(x.shape) * np.finfo(np.float64).eps * singular[0]
-            ranks = [int(np.sum(singular > a * cutoff)) for a in (0.1, 1., 10.)]
-            if len(set(ranks)) != 1:
-                raise ValueError("Numerically ambiguous sparse mean-space rank.")
-            self.rank = ranks[1]
-            self.basis = q @ u[:, :self.rank]
-            if hinv_active is not None:
-                transform = vt[:self.rank].T / singular[:self.rank]
-                self.hinv_warm = np.asarray(hinv_active @ transform, dtype=np.float32)
+            self.basis, self.rank, self.hinv_warm = selected_basis(
+                x, hinv=hinv_active, device=device,
+                gpu_budget_bytes=gpu_budget_bytes,
+            )
         else:
             self.rank = 0
             self.basis = np.empty((self.n, 0), dtype=np.float64)

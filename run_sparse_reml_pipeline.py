@@ -5121,6 +5121,8 @@ def main() -> None:
                 active_design, covar_np,
                 hinv_active=None if sol_z_np is None else sol_z_np[:, active_local],
                 batch_size=int(args.candidate_pcg_rhs_batch_size),
+                device=fitter.streamers[0].dev if fitter.streamers else None,
+                gpu_budget_bytes=gpu_budget_bytes,
             )
             mean_information = _sparse_reml_mod.with_projected_likelihood(
                 mean_information,
@@ -5597,7 +5599,11 @@ def main() -> None:
 
         if lasso_quadratics_available:
             if final_information is None:
-                final_information = SparseMeanInformation(Z_support, covar_np)
+                final_information = SparseMeanInformation(
+                    Z_support, covar_np,
+                    device=fitter.streamers[0].dev if fitter.streamers else None,
+                    gpu_budget_bytes=gpu_budget_bytes,
+                )
             final_hv = fitter._make_hv(
                 ops, jnp.asarray(theta_lasso_ml[:-1], dtype=jnp.float32),
                 jnp.asarray(theta_lasso_ml[-1], dtype=jnp.float32),

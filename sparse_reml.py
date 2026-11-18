@@ -54,9 +54,15 @@ class SparseProjectedInformation:
         if self.q64 is not None:
             return
         started = time.perf_counter()
-        design = np.column_stack([self.exact.covar, self.exact.basis])
-        q, r = sla.qr(design, mode="economic", check_finite=False)
-        qc, _ = sla.qr(self.exact.covar, mode="economic", check_finite=False)
+        # B is already orthonormal. Only C's component outside span(B)
+        # needs QR: [B,Q_perp] spans [C,B] and |D'D|=|C'(I-BB')C|.
+        basis, covar = self.exact.basis, self.exact.covar
+        remaining = covar-basis @ (basis.T @ covar)
+        # Reorthogonalize the small covariate block, not the tall SNP basis.
+        remaining -= basis @ (basis.T @ remaining)
+        extra, r = sla.qr(remaining, mode="economic", check_finite=False)
+        q = np.column_stack([basis, extra])
+        qc, _ = sla.qr(covar, mode="economic", check_finite=False)
         diagonal = np.abs(np.diag(r))
         if np.any(diagonal <= 0) or not np.all(np.isfinite(diagonal)):
             raise ValueError("Sparse projected likelihood requires full-rank nuisance and selected spans")
