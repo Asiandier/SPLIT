@@ -38,16 +38,31 @@ def initialize() -> bool:
                 nvcc = str(candidates[-1]) if candidates else None
             if nvcc is None:
                 raise RuntimeError("CUDA compiler is not available")
+            # Use the oldest supported PTX target within the kernel's device
+            # range. Newer toolkits may drop older targets such as compute_70.
+            architectures = subprocess.check_output(
+                [nvcc, "--list-gpu-arch"], text=True
+            ).split()
+            supported = [
+                (int(arch[8:]), arch) for arch in architectures
+                if arch.startswith("compute_") and arch[8:].isdigit()
+                and int(arch[8:]) >= 70
+            ]
+            if not supported:
+                raise RuntimeError("No supported PTX target at or above compute_70")
+            _, architecture = min(supported)
+            compiler_version = subprocess.check_output([nvcc, "--version"], text=True)
             source = Path(__file__).with_suffix(".cu")
             digest = hashlib.sha256(source.read_bytes() + jax.__version__.encode()
-                                    + str(nvcc).encode()).hexdigest()[:20]
+                                    + str(nvcc).encode() + architecture.encode()
+                                    + compiler_version.encode()).hexdigest()[:20]
             cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home()/".cache"))/"gpu_reml/ffi"
             cache.mkdir(parents=True, exist_ok=True)
             target = cache/f"sparse_packed_{digest}.so"
             if not target.exists():
                 temporary = target.with_suffix(f".{os.getpid()}.so")
                 command = [nvcc, "-std=c++17", "-O3", "--shared", "-Xcompiler", "-fPIC",
-                           "-arch=compute_70", "-code=compute_70", "-I"+ffi.include_dir(),
+                           "-arch="+architecture, "-code="+architecture, "-I"+ffi.include_dir(),
                            str(source), "-o", str(temporary)]
                 try:
                     subprocess.run(command, check=True, capture_output=True, text=True)

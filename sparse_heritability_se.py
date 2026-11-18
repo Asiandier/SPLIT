@@ -5,9 +5,12 @@ They never trigger phenotype refitting, support selection, or REML updates.
 """
 from __future__ import annotations
 
+import logging
 import time
 import numpy as np
 import scipy.linalg as sla
+
+logger = logging.getLogger(__name__)
 
 
 class Backend:
@@ -102,7 +105,7 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
               q_saved=None, atoms=None, trace_probes=64, moment_probes=256,
               seed=581104, return_details=False, penalty_signs=None,
               anchor_candidates=None, progress=None, cached_solutions=None,
-              mean_trace_probes=None):
+              mean_trace_probes=None, allow_projected=True, _verified_basis=False):
     """Compute free-all and fixed-boundary SEs without changing the endpoint.
 
     Inputs must use exactly the saved sample order and SNP standardization.
@@ -123,6 +126,12 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
         raise ValueError('SE covariates must have full column rank')
     if p >= n-c.shape[1]:
         raise ValueError('Selected model has no residual degrees of freedom')
+    contrasts = None
+    use_projected = allow_projected and mean_trace_probes is not None and hasattr(bank, 'selected_contrasts')
+    if hasattr(bank, 'verify_selected_workspace'):
+        bank.verify_selected_workspace(p, projected=use_projected)
+    if use_projected:
+        contrasts = bank.selected_contrasts(z, c)
     # A change of nuisance basis leaves the projection invariant.
     cache = {} if cached_solutions is None else cached_solutions
     hc_initial = cache.get('hinv_covar')
@@ -132,7 +141,8 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
             hc_initial = sla.solve_triangular(rc.T, np.asarray(hc_initial).T, lower=True,
                                               check_finite=False).T
     auto_anchor = anchor is None
-    y, z, c, alpha = [b.array(a) for a in (y, z, c, alpha)]
+    y, c, alpha = [b.array(a) for a in (y, c, alpha)]
+    z = b.array(z) if contrasts is None else contrasts.b64
     anchor = b.array(np.zeros(n) if auto_anchor else anchor)
     signs = xp.sign(alpha) if penalty_signs is None else b.array(penalty_signs)
     factor = bank.factor(theta)
@@ -142,22 +152,6 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
     hc = (bank.solve(factor, c) if hc_initial is None else
           bank.solve(factor, c, initial=hc_initial))
     ci = b.array(np.linalg.inv(b.host(c.T @ hc)))
-    hz_initial = cache.get('hinv_selected')
-    hz = (bank.solve(factor, z) if hz_initial is None else
-          bank.solve(factor, z, initial=hz_initial))
-    pz = hz-hc @ (ci @ (c.T @ hz))
-    m = b.host(z.T @ pz)
-    if p:
-        mf = sla.cho_factor((m+m.T)/2, lower=True)
-        mi_host = sla.cho_solve(mf, np.eye(p))
-        rcond, info = sla.lapack.dpocon(mf[0], np.linalg.norm(m, 1), uplo='L')
-        if info or rcond <= 1e-12:
-            raise ValueError('Selected mean information is numerically singular')
-        mean_condition = 1/rcond
-    else:
-        mi_host, mean_condition = np.empty((0, 0)), 1.
-    mi = b.array(mi_host)
-    if progress is not None:progress('selected_information',time.perf_counter()-started)
 
     def project_hinv(v):
         return v-hc @ (ci @ (c.T @ v))
@@ -165,22 +159,56 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
     def project(v):
         return project_hinv(bank.solve(factor, v))
 
-    def selected_project(v):
-        pv = project(v)
-        return pv-pz @ (mi @ (z.T @ pv))
+    if contrasts is None:
+        hz_initial = cache.get('hinv_selected')
+        hz = (bank.solve(factor, z) if hz_initial is None else
+              bank.solve(factor, z, initial=hz_initial))
+        c_hz = c.T @ hz
+        pz = hz-hc @ (ci @ c_hz)
+        m = b.host(z.T @ pz)
+        if p:
+            mf = sla.cho_factor((m+m.T)/2, lower=True)
+            mi_host = sla.cho_solve(mf, np.eye(p))
+            rcond, info = sla.lapack.dpocon(mf[0], np.linalg.norm(m, 1), uplo='L')
+            if info or rcond <= 1e-12:
+                raise ValueError('Selected mean information is numerically singular')
+            mean_condition = 1/rcond
+        else:
+            mi_host, mean_condition = np.empty((0, 0)), 1.
+        mi = b.array(mi_host)
 
-    def branches(v, initial=None):
-        hv = (bank.solve(factor, v) if initial is None else
-              bank.solve(factor, v, initial=initial))
-        pv = project_hinv(hv)
-        score_a = anchor @ pv
-        av = mi @ (z.T @ pv-float(ratio*anchor_sign)*signs[:, None]*score_a[None, :])
-        gv = z @ av
-        dv = pv-pz @ av
-        gamma = ci @ (c.T @ hv-(c.T @ hz) @ av)
-        rv = v-gv-c @ gamma
-        return gv, rv, dv
+        def selected_project(v):
+            pv = project(v)
+            return pv-pz @ (mi @ (z.T @ pv))
 
+        def selected_inverse(directions):
+            inverse = mi @ directions
+            return pz @ inverse, inverse
+
+        def direct_branches(v, initial=None):
+            hv = (bank.solve(factor, v) if initial is None else
+                  bank.solve(factor, v, initial=initial))
+            pv = project_hinv(hv)
+            score_a = anchor @ pv
+            av = mi @ (z.T @ pv-float(ratio*anchor_sign)*signs[:, None]*score_a[None, :])
+            gv = z @ av
+            dv = pv-pz @ av
+            gamma = ci @ (c.T @ hv-c_hz @ av)
+            rv = v-gv-c @ gamma
+            return gv, rv, dv
+    else:
+        selected_project = contrasts.solve
+        selected_inverse = contrasts.inverse_information
+        # The overlapping covariate subspace is smaller than the selected SNP
+        # subspace. A sufficient condition bound uses only its small Gram.
+        if atoms is None:
+            raise ValueError('Projected SE requires fitted kernel traces')
+        norm_bound = float(theta[-1]+n*(theta[:-1] @ np.asarray(atoms)))
+        mean_condition = contrasts.condition_bound(norm_bound, theta[-1])
+        if mean_condition >= 1e12:
+            raise ValueError('Projected selected-mean information condition cannot be verified')
+
+    if progress is not None:progress('selected_information',time.perf_counter()-started)
     hy_initial = cache.get('hinv_response')
     hy = (bank.solve(factor, y) if hy_initial is None else
           bank.solve(factor, y, initial=hy_initial))
@@ -198,7 +226,8 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
     g = z @ alpha
     # Linearity supplies a cheap initial solution, but PCG still verifies it
     # against the original residual RHS; cancellation never weakens accuracy.
-    u = project_hinv(bank.solve(factor, y-g, initial=hy-hz @ alpha))
+    hinv_g = None if contrasts is not None else hz @ alpha
+    u = project_hinv(bank.solve(factor, y-g, initial=None if hinv_g is None else hy-hinv_g))
     residual = y-g-c @ (ci @ (hc.T @ (y-g)))
     a = project(anchor)
     # Differentiate the SAME selected-mean trace as the point estimate. For
@@ -206,65 +235,101 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
     # its fixed Rademacher probes. Standalone endpoints use the exact trace,
     # including Z'Z when their selected coordinates are not orthonormal.
     if mean_trace_probes is None:
-        gram = b.host(z.T @ z)
-        directions = b.array(sla.cholesky((gram+gram.T)*.5, lower=True))
+        if _verified_basis:
+            directions = xp.eye(p, dtype=b.dtype)
+        else:
+            gram = b.host(z.T @ z)
+            directions = b.array(sla.cholesky((gram+gram.T)*.5, lower=True))
         normalization = 1.
     else:
-        directions = b.array(mean_trace_probes)
+        directions = np.asarray(mean_trace_probes)
         if (directions.ndim != 2 or directions.shape[0] != p or directions.shape[1] == 0
-                or not np.isfinite(b.host(directions)).all()
-                or not np.allclose(b.host(z.T @ z), np.eye(p), atol=1e-8, rtol=1e-8)):
+                or not np.isfinite(directions).all()
+                or (not _verified_basis and not np.allclose(
+                    b.host(z.T @ z), np.eye(p), atol=1e-8, rtol=1e-8))):
             raise ValueError('Endpoint trace probes require the matching orthonormal selected basis')
         normalization = float(directions.shape[1])
-    inverse_directions = mi @ directions
+        directions = b.array(directions)
+    if contrasts is None:
+        trace_weights, inverse_directions = selected_inverse(directions)
+    else:
+        # Share the small solve for the penalty direction with the trace
+        # directions. Only these M^-1 actions are needed for the sandwich.
+        columns = directions.shape[1]
+        weights, inverse = selected_inverse(xp.column_stack([directions, signs]))
+        trace_weights, inverse_directions = weights[:, :columns], inverse[:, :columns]
+        penalty_dual, penalty_coef = weights[:, columns:], inverse[:, columns:]
+        penalty_residual = bank.hv(penalty_dual)
+
+        def projected_branches(v, initial=None, penalty=None):
+            av, rv, dv = contrasts.unpenalized(v)
+            if penalty is None:
+                penalty = float(ratio*anchor_sign)*(a @ v)
+            return (z @ (av-penalty_coef*penalty),
+                    rv+penalty_residual*penalty, dv+penalty_dual*penalty)
+
     mean_trace = float(b.host(xp.sum(directions*inverse_directions)))/normalization
-    trace_weights = pz @ inverse_directions
+    if progress is not None:progress('mean_trace_actions',time.perf_counter()-started)
     q_reconstructed = float(b.host(g@g+2*g@residual)/n)-mean_trace/n
     q = q_reconstructed if q_saved is None else float(q_saved)
     lam = ratio*float(b.host(anchor @ py))*anchor_sign
     kkt = b.host(z.T @ u)-lam*b.host(signs)
-    branch_alpha = b.host(mi @ (z.T @ py-lam*signs))
+    if contrasts is None:
+        branch_alpha = b.host(mi @ (z.T @ py-lam*signs))
+    else:
+        _, adjustment = selected_inverse(b.array(kkt)[:, None])
+        branch_alpha = b.host(alpha+adjustment[:, 0])
 
     rng = np.random.default_rng(seed)
     # A PSD trace estimator: Cov(psi)=P_S, then E[(K_i psi)'P_S(K_j psi)].
     if trace_probes:
-        inv_draw = bank.inverse_draw(factor, rng, trace_probes)
-        psi = project_hinv(inv_draw)
-        psi = psi-pz @ (mi @ (z.T @ psi))
+        if contrasts is None:
+            inv_draw = bank.inverse_draw(factor, rng, trace_probes)
+            psi = project_hinv(inv_draw)
+            psi = psi-pz @ (mi @ (z.T @ psi))
+            del inv_draw
+        else:
+            psi = selected_project(bank.draw(factor, rng, trace_probes))
         ki_psi = [bank.mv(i, psi) for i in range(nc)]
         ps_ki = selected_project(xp.concatenate(ki_psi, axis=1))
         ps_ki = [ps_ki[:, i*trace_probes:(i+1)*trace_probes] for i in range(nc)]
         tr = np.array([[float(b.host(b.inner(x, v)).mean()) for v in ps_ki] for x in ki_psi])
         tr = (tr+tr.T)/2
-        del inv_draw, psi, ki_psi, ps_ki
+        del psi, ki_psi, ps_ki
     else:
         # Small-n independent algebra checks only; production uses matrix probes.
         ps = selected_project(xp.eye(n, dtype=b.dtype))
         pski = [bank.mv(i, ps) for i in range(nc)]
         tr = np.array([[float(b.host(xp.sum(x*v.T))) for v in pski] for x in pski])
         del ps, pski
+    if progress is not None:progress('information_traces',time.perf_counter()-started)
 
     ku = [bank.mv(i, u) for i in range(nc)]
-    pku = project(xp.column_stack(ku))
     kpy = [bank.mv(i, py) for i in range(nc)]
-    dalpha = [mi @ (-pz.T @ ku[j]+float(ratio*anchor_sign)*signs*(a @ kpy[j])) for j in range(nc)]
-    du = [-pku[:, j]-pz @ dalpha[j] for j in range(nc)]
-    jac = np.array([[float(b.host(ku[i] @ du[j])) for j in range(nc)] for i in range(nc)])+.5*tr
-    dq = []
-    for j in range(nc):
-        dg = z @ dalpha[j]
-        dr = -dg+c @ (ci @ (hc.T @ ku[j]+c.T @ hz @ dalpha[j]))
-        derivative_trace = float(b.host(xp.sum(trace_weights*bank.mv(j, trace_weights))))/normalization
-        dq.append((float(b.host(2*dg @ (g+residual)+2*g @ dr))-derivative_trace)/n)
-    dq = np.asarray(dq)
+    if contrasts is None:
+        pku = project(xp.column_stack(ku))
+        dalpha = [mi @ (-pz.T @ ku[j]+float(ratio*anchor_sign)*signs*(a @ kpy[j])) for j in range(nc)]
+        du = xp.column_stack([-pku[:, j]-pz @ dalpha[j] for j in range(nc)])
+        dg = z @ xp.column_stack(dalpha)
+        dr = -dg+c @ (ci @ (hc.T @ xp.column_stack(ku)+c_hz @ xp.column_stack(dalpha)))
+    else:
+        kuv = xp.column_stack(ku)
+        levels = float(ratio*anchor_sign)*(a @ xp.column_stack(kpy))
+        mean, remainder, dual = projected_branches(kuv, penalty=levels)
+        dg, dr, du = -mean, kuv-remainder, -dual
+    jac = b.host(xp.column_stack(ku).T @ du)+.5*tr
+    derivative_trace = np.array([float(b.host(xp.sum(trace_weights*bank.mv(j, trace_weights))))
+                                 for j in range(nc)])/normalization
+    dq = (b.host(2*(g+residual) @ dg+2*g @ dr)-derivative_trace)/n
     if progress is not None:progress('observed_derivative',time.perf_counter()-started)
-    del ku, pku, kpy, dalpha, du, trace_weights, inverse_directions, directions
+    del ku, kpy, du, dg, dr, trace_weights, inverse_directions, directions
 
     # Antithetic quadratic/linear decomposition of Gaussian moments.
     # This is trace estimation at fixed theta, not a parametric refitting bootstrap.
     xi = bank.draw(factor, rng, moment_probes)
+    branches = direct_branches if contrasts is None else projected_branches
     gx, rx, dx = branches(xi)
-    gm, rm, dm = branches(g[:, None], initial=(hz @ alpha)[:, None])
+    gm, rm, dm = branches(g[:, None], initial=None if hinv_g is None else hinv_g[:, None])
     quad, linear = [], []
     for i in range(nc):
         kd = bank.mv(i, dx)
@@ -292,6 +357,8 @@ def calculate(bank, theta, y, z, c, alpha, ratio, anchor, anchor_sign,
                endpoint_trace_correction=('exact' if mean_trace_probes is None else 'projected_hutchinson'),
                anchor_index_within_support=anchor_index,
                mean_information_condition=float(mean_condition),
+               mean_information_condition_kind=('estimate_1norm' if contrasts is None else 'upper_bound_1norm'),
+               selected_information_backend=('inverse_columns' if contrasts is None else 'projected_actions'),
                trace_probes=trace_probes,moment_probes=moment_probes,
                fitting_information_reused=bool(cache),
                boundary_count=int(np.sum(theta[:-1]<=1e-8)))
@@ -381,7 +448,7 @@ def selected_coordinates(z, alpha, *, basis=None):
 
 def endpoint_h2_se(bank, *, theta, y, z, covar, alpha, ratio, lam, q, atoms,
                    h2, trace_probes=64, moment_probes=256, seed=581104,
-                   solve_tol=1e-5, mean_information=None):
+                   solve_tol=1e-5, mean_information=None, progress=None):
     """Public fixed-endpoint API. Caller supplies the analysis-scale inputs.
 
     JAX callers must enable x64 in a scoped context, as the pipeline does.
@@ -389,18 +456,26 @@ def endpoint_h2_se(bank, *, theta, y, z, covar, alpha, ratio, lam, q, atoms,
     """
     cache = None
     cached_basis = None
+    verified_basis = False
     if mean_information is not None:
+        from .sparse_information import SparseMeanInformation
+        from .sparse_reml import SparseProjectedInformation
+
         info = mean_information
         c_input = np.empty((len(y), 0)) if covar is None else np.asarray(covar)
         if info.n != len(y) or not np.array_equal(info.covar, c_input):
             raise ValueError('Cached fitting information does not match the SE endpoint')
         cached_basis = info.basis
+        # Both native information paths already constructed an orthonormal
+        # basis by QR/SVD. Rechecking its full Gram would cost O(n rank^2).
+        verified_basis = isinstance(info, (SparseMeanInformation, SparseProjectedInformation))
         # Projected fits no longer build the wide endpoint information state.
         # Its immutable selected basis is still useful; covariance solutions
         # are reused only when evaluate() has an exact matching cache.
         if info._state is not None and np.array_equal(np.asarray(theta), info._theta):
             cache = dict(hinv_covar=info._state['hinv_covar'], hinv_selected=info.hinv_warm)
     basis, coef, signs = selected_coordinates(z, alpha, basis=cached_basis)
+    verified_basis = verified_basis and basis is cached_basis
     if cached_basis is not None:
         original_mean = np.asarray(z, float) @ np.asarray(alpha, float)
         represented_mean = basis @ coef
@@ -415,17 +490,35 @@ def endpoint_h2_se(bank, *, theta, y, z, covar, alpha, ratio, lam, q, atoms,
         if state['endpoint_trace_correction'] == 'projected_hutchinson':
             from .sparse_trace import trace_probes as make_trace_probes
             mean_probes = make_trace_probes(info.rank, state['trace_probes'], state['trace_seed'])
-    estimate = calculate(bank, theta, np.asarray(y), basis, c, coef, ratio, None, 1.,
-        q_saved=q, atoms=atoms, trace_probes=trace_probes, moment_probes=moment_probes,
-        seed=seed, penalty_signs=signs, anchor_candidates=z, cached_solutions=cache,
-        mean_trace_probes=mean_probes)
-    if not np.isclose(estimate['h2'], h2, rtol=0, atol=1e-7):
-        raise ValueError('SE endpoint h2 does not match the reported native h2')
-    if abs(estimate['q_reconstruction_error']) > max(1e-5, 20*solve_tol*max(1., abs(q))):
-        raise ValueError('SE endpoint does not reconstruct the native sparse variance Q')
-    anchor_error = abs(estimate['lambda_reconstructed']-lam)/max(abs(lam), 1e-20)
-    if len(alpha) and anchor_error > .03:
-        raise ValueError(f'SE lambda-max branch mismatch: relative error {anchor_error:g}')
+    def evaluate(allow_projected):
+        estimate = calculate(bank, theta, np.asarray(y), basis, c, coef, ratio, None, 1.,
+            q_saved=q, atoms=atoms, trace_probes=trace_probes, moment_probes=moment_probes,
+            seed=seed, penalty_signs=signs, anchor_candidates=z, cached_solutions=cache,
+            mean_trace_probes=mean_probes, progress=progress, allow_projected=allow_projected,
+            _verified_basis=verified_basis)
+        if not np.isclose(estimate['h2'], h2, rtol=0, atol=1e-7):
+            raise ValueError('SE endpoint h2 does not match the reported native h2')
+        if abs(estimate['q_reconstruction_error']) > max(1e-5, 20*solve_tol*max(1., abs(q))):
+            raise ValueError('SE endpoint does not reconstruct the native sparse variance Q')
+        anchor_error = abs(estimate['lambda_reconstructed']-lam)/max(abs(lam), 1e-20)
+        if len(alpha) and anchor_error > .03:
+            raise ValueError(f'SE lambda-max branch mismatch: relative error {anchor_error:g}')
+        return estimate, anchor_error
+
+    projected = mean_probes is not None and hasattr(bank, 'selected_contrasts')
+    if projected:
+        try:
+            estimate, anchor_error = evaluate(True)
+        except (ValueError, FloatingPointError, RuntimeError, MemoryError, np.linalg.LinAlgError) as error:
+            fallback_reason = str(error)
+            logger.warning('[h2 SE fallback] projected actions failed, trying inverse columns: %s', error)
+        else:
+            fallback_reason = None
+        if fallback_reason is not None:
+            estimate, anchor_error = evaluate(False)
+            estimate['projected_fallback_reason'] = fallback_reason
+    else:
+        estimate, anchor_error = evaluate(False)
     return dict(estimate, status='available', method='local_observed_sandwich', approximate=True,
         se_recommended=estimate['se_active'], boundary_policy='fixed_current_zero_variance_components',
         boundary_threshold=1e-8, seed=int(seed), anchor_lambda_relative_error=float(anchor_error),
@@ -472,12 +565,17 @@ def pipeline_h2_se(*, args, fitter, grm_index, valid, theta, y, z, covar,
                 alpha=alpha, ratio=ratio, lam=lam, q=q, atoms=atoms, h2=h2,
                 trace_probes=args.h2_se_trace_probes, moment_probes=args.h2_se_moment_probes,
                 seed=args.h2_se_seed, solve_tol=args.h2_se_pcg_tol,
-                mean_information=mean_information)
+                mean_information=mean_information,
+                progress=lambda phase, elapsed: logger.info(
+                    '[h2 SE phase] %s completed, elapsed=%.2fs', phase, elapsed))
             estimate.update(backend='matrix_free_native_kernels', batch_size=batch_size,
                 linear_solve_arithmetic='fp32_corrections_verified_fp64',
                 batch_size_requested=args.h2_se_batch_size,
                 pcg_tolerance=args.h2_se_pcg_tol, max_solve_residual=bank.max_solve_residual,
                 solve_batches=bank.solve_batches,
+                final_solve_batch_size=bank.solve_batch_size,
+                allocation_retries=bank.allocation_retries,
+                rhs_columns=bank.rhs_columns, projected_rhs_columns=bank.projected_rhs_columns,
                 pcg_iterations=getattr(bank, 'pcg_iterations', None),
                 fp64_rescue_batches=bank.fp64_rescue_batches,
                 fp64_rescue_iterations=bank.fp64_rescue_iterations,

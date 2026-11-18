@@ -264,6 +264,11 @@ class OuterCheckpoint:
 
 def capture_state(namespace, *, stage):
     state = {name: namespace[name] for name in STATE_NAMES}
+    if stage == 'fit_complete':
+        # The resumed pipeline enters final inference directly at this stage.
+        # Only final_information is used there; candidate inverse columns and
+        # the fallback pair serve the outer loop.
+        state.update(warm_z_dict={}, last_aligned_pair=None, mean_information=None)
     state.update(checkpoint_stage=stage,
                  preconditioner=namespace['fitter'].precond_conf,
                  execution=dict(call_width=namespace['call_width'],

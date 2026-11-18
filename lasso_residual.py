@@ -17,12 +17,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import scipy.linalg as sla
+from numba import njit, prange
 
 from . import sparse_fp64
+from .geno_stream import _numba_thread_mask
 from .lasso_recycle import RecycledInverse
 from .lasso_cd import solve_lasso_cd_gram, make_lambda_sequence
 from .pcg import pcg_solve
 from .precond import scalar_diag_from_precond_conf, build_projected_core_runtime
+from .runtime_env import resolve_cpu_threads
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +113,17 @@ def quadratic_l1_step(beta, direction, score, curvature, lam):
     return float(min(candidates, key=change))
 
 
+@njit(cache=True, nogil=True, parallel=True)
+def _rank_two_update(metric, first_weight, first, second_weight, second):
+    # A column is contiguous in the Fortran-ordered working-set matrix.
+    for j in prange(metric.shape[1]):
+        left = first_weight*first[j]
+        right = second_weight*second[j]
+        for i in range(metric.shape[0]):
+            value = metric[i, j]+left*first[i]
+            metric[i, j] = value+right*second[i]
+
+
 def bfgs_update(metric, step, change):
     """Maintain positive curvature; skip pairs dominated by roundoff."""
     product = metric@step
@@ -120,9 +134,13 @@ def bfgs_update(metric, step, change):
         return None
     if target <= eps*np.linalg.norm(step)*np.linalg.norm(change):
         return None
-    # BLAS rank-one updates avoid an extra k-by-k temporary.
-    sla.blas.dger(-1./denom, product, product, a=metric, overwrite_a=1)
-    sla.blas.dger(1./target, change, change, a=metric, overwrite_a=1)
+    # On large working sets, one pass over the metric saves memory traffic.
+    # Keep the lightweight BLAS call for small matrices before compilation.
+    if metric.shape[0] >= 1024:
+        _rank_two_update(metric, -1./denom, product, 1./target, change)
+    else:
+        sla.blas.dger(-1./denom, product, product, a=metric, overwrite_a=1)
+        sla.blas.dger(1./target, change, change, a=metric, overwrite_a=1)
     return product, denom, target
 
 
@@ -342,7 +360,9 @@ def fit_weighted_residual_path(*, fitter, grm_index, hv, precond, theta, y,
     The returned inverse-design cache is empty by design; selected-span
     information is computed separately after validation has selected a model.
     """
-    with jax.experimental.enable_x64():
+    cfg = getattr(fitter, 'cfg', None)
+    cpu_threads, _ = resolve_cpu_threads(getattr(cfg, 'cpu_threads', None))
+    with jax.experimental.enable_x64(), _numba_thread_mask(cpu_threads):
         return _fit_path(fitter=fitter, grm_index=grm_index, hv=hv,
             precond=precond, theta=theta, y=y, covar=covar, lam_max=lam_max,
             path_cfg=path_cfg, pcg_tol=pcg_tol, max_pcg_iters=max_pcg_iters,
@@ -513,7 +533,8 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
 
     def evaluate(coef, warm, error_budget=None, reason="proposal"):
         tick = time.perf_counter()
-        residual = yj-fitted(coef)
+        fixed_score = fitted(coef)
+        residual = yj-fixed_score
         rhs = transform(residual)
         initial = projected_pre(rhs) if warm is None else warm
         rhs.block_until_ready()
@@ -559,6 +580,7 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         counters['max_pcg_residual'] = max(counters['max_pcg_residual'], float(error))
         counters['max_pcg_iterations'] = max(counters['max_pcg_iterations'], int(count))
         return score, solved if ridged else dual, dict(seconds=seconds, residual=float(error),
+            fixed_score=fixed_score,
             iterations=int(count), gradient_error_bound=bound_scale*float(error))
 
     gradient, warm, diagnostic = evaluate(beta, None, reason="initial")
@@ -588,7 +610,7 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
                     1.+guess['ratio'], -guess['ratio'], column_norm_bound**2/sigma)
                 beta, gradient = guess['beta'], guess['score']
                 warm = warm+guess['ratio']*(warm-previous_state['warm'])
-                diagnostic = dict(diagnostic, gradient_error_bound=guess['error_bound'])
+                diagnostic = dict(diagnostic, gradient_error_bound=guess['error_bound'], fixed_score=None)
         for iteration in range(max_iterations+1):
             check = check_certificate(gradient, indices, beta, lam, tolerance,
                 diagnostic['gradient_error_bound'])
@@ -716,7 +738,8 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
                 pairs.append(dict(step=step.copy(), change=step_size*change.copy(),
                     product=update[0], denominator=update[1], target=update[2]))
             diagnostic = dict(proposed_diag, gradient_error_bound=(1-step_size)*diagnostic['gradient_error_bound']
-                +step_size*proposed_diag['gradient_error_bound']+rounding_bound)
+                +step_size*proposed_diag['gradient_error_bound']+rounding_bound,
+                fixed_score=proposed_diag['fixed_score'] if step_size == 1. else None)
         else:
             # Refining an uncertain score also consumes the iteration budget.
             # In particular, the last refinement must not fall through and
@@ -724,7 +747,9 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
             raise RuntimeError(f'Residual Lasso failed KKT at path index {path_index}')
         active = np.flatnonzero(beta != 0.)
         selected = indices[active]
-        fixed_train = fitted(beta)
+        fixed_train = diagnostic['fixed_score']
+        if fixed_train is None:
+            fixed_train = fitted(beta)
         dual = adjoint(warm) if ridged else warm
         gamma = sla.solve_triangular(rc, np.asarray(qc.T@(yj-fixed_train)-hqc.T@dual),
             check_finite=False).reshape(-1) if c.shape[1] else np.empty(0)

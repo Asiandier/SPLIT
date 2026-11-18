@@ -41,10 +41,8 @@ def configure_runtime_env() -> None:
     # serializes allocation/free work and is substantially slower for the
     # repeated streamed kernels used here. Users can still opt into it through
     # XLA_PYTHON_CLIENT_ALLOCATOR for allocation diagnostics.
-    # Limit backend discovery to CUDA/CPU by default. On non-TPU machines JAX
-    # otherwise tries to initialize the TPU backend and emits a noisy libtpu
-    # warning during every CLI run.
-    os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+    # Let JAX discover available backends. A nonempty JAX_PLATFORMS list
+    # requires every listed backend to initialize, including on CPU-only hosts.
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 

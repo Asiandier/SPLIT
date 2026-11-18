@@ -1344,32 +1344,6 @@ def _solve_hinv_columns_batched(
     }
 
 
-def _chive_q_hat_given_active(
-    z_active: np.ndarray,
-    y: np.ndarray,
-    beta_active: np.ndarray,
-) -> tuple[float, float, float]:
-    """
-    CHIVE single-sample estimator on the active SNP set:
-        Q = (1/n)||Z_S b_S||^2 + (2/n) b_S^T Z_S^T (y - Z_S b_S)
-    """
-    y = np.asarray(y, dtype=np.float64).reshape(-1)
-    beta = np.asarray(beta_active, dtype=np.float64).reshape(-1)
-    if z_active.size == 0 or beta.size == 0:
-        return 0.0, 0.0, 0.0
-
-    Zs = np.asarray(z_active, dtype=np.float64)
-    if Zs.ndim != 2 or Zs.shape[0] != y.size or Zs.shape[1] != beta.size:
-        raise ValueError("CHIVE input shape mismatch.")
-
-    n = float(y.size)
-    g = Zs @ beta
-    r = y - g
-    term1 = float(g @ g / n)
-    term2 = float(2.0 * (beta @ (Zs.T @ r)) / n)
-    return term1 + term2, term1, term2
-
-
 def _standardize_phenotype_at_input(
     y: np.ndarray,
 ) -> tuple[np.ndarray, float, float]:
@@ -5529,6 +5503,12 @@ def main() -> None:
             checkpoint.save(_checkpoint_mod.capture_state(locals(), stage='outer_complete'))
     if checkpoint is not None and not fit_finished and final_pair_available and penalized_failure_reason is None:
         checkpoint.save(_checkpoint_mod.capture_state(locals(), stage='fit_complete'))
+    # Final inference uses final_information and the frozen sparse pair.
+    # Release the outer-loop designs and warm solves before extracting the
+    # final support again for SE and prediction.
+    Z_cand = sol_z_np = active_design = residual_design = None
+    extract_candidate_design = fixed_ratio_gram_cache = fixed_ratio_design_cache = None
+    warm_z_dict = outer_hinv_z_dict = last_aligned_pair = mean_information = None
     # Freeze the primary COHERIT branch.  The final Lasso and theta now come
     # from the same covariance, with convergence checked on this returned pair.
     theta_lasso_ml = np.asarray(theta, dtype=np.float64).copy()
@@ -5661,31 +5641,18 @@ def main() -> None:
                 jnp.asarray(theta_lasso_ml[-1], dtype=jnp.float32),
             )
             final_g = np.asarray(Z_support, dtype=np.float64) @ beta_lasso_active
-            final_mean_state, _final_residual, beta_cov_lasso = final_information.statistics(
+            final_mean_state, final_residual, beta_cov_lasso = final_information.statistics(
                 theta_lasso_ml, final_hv, final_precond,
                 np.asarray(y_np, dtype=np.float64)-final_g,
                 tol=min(float(args.pcg_tol), 1e-5), maxiter=int(args.max_pcg_iters),
                 sparse_mean=final_g, background_variance=background_genetic_variance,
             )
             q_mean_uncertainty = final_mean_state["trace"]/n_samples
-            y_chive = np.asarray(y_np, dtype=np.float64)
-            if (
-                covar_np is not None
-                and covar_np.size > 0
-                and beta_cov_lasso.size > 0
-            ):
-                y_chive -= (
-                    np.asarray(covar_np, dtype=np.float64)
-                    @ beta_cov_lasso
-                )
-            q_chive, q_chive_term1, q_chive_term2 = (
-                _chive_q_hat_given_active(
-                    Z_support,
-                    y_chive,
-                    beta_lasso_active,
-                )
-            )
-            q_chive -= q_mean_uncertainty
+            # g' r equals alpha' Z' r. Both g and the GLS residual are
+            # already available at this endpoint.
+            q_chive_term1 = float(final_g @ final_g / n_samples)
+            q_chive_term2 = float(2.0 * (final_g @ final_residual) / n_samples)
+            q_chive = q_chive_term1 + q_chive_term2 - q_mean_uncertainty
 
     # The sole COHERIT estimate uses the calibrated Lasso quadratic and the
     # covariate-contrast REML covariance from the same penalized branch.

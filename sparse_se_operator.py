@@ -1,12 +1,56 @@
 """Matrix-free covariance solves and Gaussian draws for sparse h2 uncertainty."""
 from __future__ import annotations
 
+import logging
+
 import jax.numpy as jnp
 import numpy as np
 
 from .sparse_information import solve_sparse_pcg
 from .sparse_heritability_se import Backend
 from .pcg import pcg_solve
+from .sparse_basis import gpu_workspace_bytes
+from .sparse_trace import ProjectedTrace
+
+logger = logging.getLogger(__name__)
+
+
+class SelectedContrasts(ProjectedTrace):
+    """Actions of the GLS projector and selected-mean inverse information."""
+
+    def __init__(self, basis, covar, bank):
+        super().__init__(basis, covar)
+        self.bank = bank
+        self.device_lift_weights = jnp.asarray(self.lift_weights, dtype=jnp.float64)
+
+    def lift(self, value):
+        return self.b64 @ value-self.f64 @ (self.device_lift_weights @ value)
+
+    def coordinates(self, value):
+        return self.b64.T @ value-self.device_lift_weights.T @ (self.f64.T @ value)
+
+    def solve(self, value):
+        return self.project(self.bank.solve(None, self.project(value), contrast=self.project))
+
+    def condition_bound(self, covariance_norm, noise_variance):
+        # B' P_C B is bounded below by B'(I-Q_C Q_C')B / ||H||.
+        # Its smallest compression eigenvalue equals the smaller of one
+        # and lambda_min(Q_C'(I-BB')Q_C), up to projector roundoff.
+        gram = np.asarray(self.f64.T @ self.f64)
+        gap = min(1., float(np.linalg.eigvalsh(gram)[0])) if gram.size else 1.
+        return (max(1, self.b64.shape[1])*covariance_norm/(noise_variance*gap)
+                if gap > 0 else float('inf'))
+
+    def inverse_information(self, directions):
+        """Return P_C B M^-1 directions and M^-1 directions."""
+        u = self.lift(directions)
+        w = u-self.solve(self.bank.hv(u))
+        return w, self.coordinates(self.bank.hv(w))
+
+    def unpenalized(self, value):
+        dual = self.solve(value)
+        residual = self.bank.hv(dual)
+        return self.coordinates(value-residual), residual, dual
 
 
 class OperatorKernelBank:
@@ -27,8 +71,12 @@ class OperatorKernelBank:
         self.ops = fitter._assemble_reml_operators()
         self.k = self.ops.K_mvs
         self.tol, self.maxiter, self.batch_size = tol, maxiter, batch_size
+        self.solve_batch_size = batch_size
+        self.allocation_retries = 0
         self.max_solve_residual = 0.
         self.solve_batches = 0
+        self.rhs_columns = 0
+        self.projected_rhs_columns = 0
         self.pcg_iterations = 0
         self.warm_solve_batches = 0
         self.fp64_rescue_batches = 0
@@ -73,7 +121,61 @@ class OperatorKernelBank:
         self.marker_scale = np.repeat(scales, self.index.m_per_grm)
         return None  # The covariance is represented by hv, not a dense factor.
 
-    def solve(self, factor, rhs, *, initial=None):
+    def selected_contrasts(self, basis, covar):
+        return SelectedContrasts(basis, covar, self)
+
+    def verify_selected_workspace(self, rank, *, projected):
+        device = getattr(self.streamer, 'dev', None)
+        budget = getattr(self.fitter.cfg, 'gpu_budget_bytes', None)
+        if device is None or device.platform != 'gpu' or budget is None:
+            return
+        available = gpu_workspace_bytes(device, budget)
+        # These arrays coexist even before including operator scratch.
+        required = (12*self.n*rank if projected
+                    else 24*self.n*rank+8*rank*rank)
+        if available and required > available:
+            method = 'Projected' if projected else 'Inverse-column'
+            raise MemoryError(f'{method} SE needs at least {required/1024**3:.2f} GiB '
+                              f'for selected arrays, with {available/1024**3:.2f} GiB available')
+
+    def _verified_solve(self, hv, precond, block, initial):
+        value, residual, iterations = solve_sparse_pcg(
+            hv, block, M=precond, tol=self.tol, maxiter=self.maxiter,
+            log_diagnostics=False, X0=initial)
+        if self.tol >= np.sqrt(np.finfo(np.float32).eps):
+            # Loose tolerances still verify against the FP64 covariance.
+            value = jnp.asarray(value, dtype=jnp.float64)
+            precise_block = jnp.asarray(block, dtype=jnp.float64)
+            norm = jnp.linalg.norm(precise_block, axis=0)
+            residual = float(jnp.max(jnp.linalg.norm(precise_block-hv(value), axis=0)
+                                     / jnp.where(norm > 0, norm, 1.)))
+        remaining = self.maxiter-int(iterations)
+        if (np.isfinite(residual) and residual > self.tol*1.05 and remaining > 0):
+            value, residual, extra = pcg_solve(
+                hv, jnp.asarray(block, dtype=jnp.float64), M=precond,
+                tol=self.tol, maxiter=remaining, X0=jnp.asarray(value, dtype=jnp.float64))
+            iterations += int(extra)
+            self.fp64_rescue_batches += 1
+            self.fp64_rescue_iterations += int(extra)
+        if not np.isfinite(residual) or residual > self.tol * 1.05:
+            raise FloatingPointError(f"SE covariance solve failed: residual={residual:g}, tol={self.tol:g}")
+        return jnp.asarray(value, dtype=self.b.dtype), residual, iterations
+
+    def solve(self, factor, rhs, *, initial=None, contrast=None):
+        if contrast is None:
+            hv, precond = self.hv, self.precond
+        else:
+            def hv(value):
+                projected = contrast(value)
+                return contrast(self.hv(projected))+(value-projected)
+
+            if self.precond is not None:
+                def precond(value):
+                    projected = contrast(value)
+                    return contrast(self.precond(projected))+(value-projected)
+            else:
+                precond = None
+
         vector = rhs.ndim == 1
         target = rhs[:, None] if vector else rhs
         if initial is not None:
@@ -81,37 +183,32 @@ class OperatorKernelBank:
             if initial.shape != target.shape:
                 raise ValueError("Cached SE solve has incompatible dimensions")
         parts = []
-        for start in range(0, target.shape[1], self.batch_size):
-            block = target[:, start:start+self.batch_size]
-            value, residual, iterations = solve_sparse_pcg(
-                self.hv, block, M=self.precond,
-                tol=self.tol, maxiter=self.maxiter, log_diagnostics=False,
-                X0=None if initial is None else initial[:, start:start+self.batch_size])
-            if self.tol >= np.sqrt(np.finfo(np.float32).eps):
-                # The shared helper permits FP32-only solves at loose tolerances.
-                # SE still checks the original FP64 covariance in this case.
-                value = jnp.asarray(value, dtype=jnp.float64)
-                precise_block = jnp.asarray(block, dtype=jnp.float64)
-                norm = jnp.linalg.norm(precise_block, axis=0)
-                residual = float(jnp.max(jnp.linalg.norm(precise_block-self.hv(value), axis=0)
-                                         / jnp.where(norm > 0, norm, 1.)))
-            remaining = self.maxiter-int(iterations)
-            if (np.isfinite(residual) and residual > self.tol*1.05 and remaining > 0):
-                # A poorly conditioned FP32 correction can stagnate. Spend only
-                # the remaining iteration budget on the same FP64 system.
-                value, residual, extra = pcg_solve(
-                    self.hv, jnp.asarray(block, dtype=jnp.float64), M=self.precond,
-                    tol=self.tol, maxiter=remaining, X0=jnp.asarray(value, dtype=jnp.float64))
-                iterations += int(extra)
-                self.fp64_rescue_batches += 1
-                self.fp64_rescue_iterations += int(extra)
-            if not np.isfinite(residual) or residual > self.tol * 1.05:
-                raise FloatingPointError(f"SE covariance solve failed: residual={residual:g}, tol={self.tol:g}")
+        start = 0
+        while start < target.shape[1]:
+            width = min(self.solve_batch_size, target.shape[1]-start)
+            stop = start+width
+            try:
+                value, residual, iterations = self._verified_solve(
+                    hv, precond, target[:, start:stop],
+                    None if initial is None else initial[:, start:stop])
+            except (RuntimeError, MemoryError) as error:
+                if width == 1 or not (isinstance(error, MemoryError) or
+                    any(term in str(error) for term in ('RESOURCE_EXHAUSTED', 'OUT_OF_MEMORY'))):
+                    raise
+                self.solve_batch_size = max(1, width//2)
+                self.allocation_retries += 1
+                logger.warning('[h2 SE solve] reduce solve width %s -> %s after allocation failure',
+                               width, self.solve_batch_size)
+                continue
             self.max_solve_residual = max(self.max_solve_residual, float(residual))
             self.solve_batches += 1
+            self.rhs_columns += width
+            if contrast is not None:
+                self.projected_rhs_columns += width
             self.pcg_iterations += int(iterations)
             self.warm_solve_batches += int(initial is not None)
-            parts.append(jnp.asarray(value, dtype=self.b.dtype))
+            parts.append(value)
+            start = stop
         result = jnp.concatenate(parts, axis=1) if parts else jnp.empty(target.shape, dtype=self.b.dtype)
         return result[:, 0] if vector else result
 

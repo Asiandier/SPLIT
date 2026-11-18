@@ -15,6 +15,8 @@ checkpoint; individual lambda values and refinement iterations are not saved.
 
 The checkpoint preserves coefficients, variance components, candidate sets,
 warm starts, information factors, preconditioner and convergence history.
+The final aligned checkpoint stores the final information, while candidate
+inverse columns and the preceding fallback pair belong to outer updates.
 JSON plus non-object NPY arrays preserve array precision and shared numerical
 objects without pickle. A file lock prevents concurrent writers; streamed,
 uncompressed writes use a temporary file, `fsync` and atomic replacement.

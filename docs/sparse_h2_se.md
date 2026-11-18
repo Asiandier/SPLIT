@@ -161,9 +161,23 @@ updated. Explicit numerical/endpoint failures produce an unavailable SE status.
 
 The final fitting stage supplies its immutable selected-space basis. SE reuses
 that basis after checking the sample/covariate scope and fitted-mean mapping.
-Projected fits need not have computed selected-column covariance solutions;
-SE computes the solutions required for its own local derivative. If the direct
-REML likelihood already has a cache at the exact covariance coefficients, SE
+It relies on the native fit's QR/SVD for orthogonality, avoiding a second
+wide basis Gram product. Standalone calculations still check any supplied
+trace basis.
+For an endpoint using the sampled selected-mean trace, SE forms actions of
+the same inverse information using contrast solves. Write `B` for the
+orthonormal selected basis, `D=[B,C]` for the joint design, and `U` for
+the Euclidean dual of `B` in `D`, so that `U'B=I` and `U'C=0`.
+Let `P_D` be the GLS residual projector for `D` and `M=B'P_C B`.
+Then `W=(I-P_D H)U=P_C B M^-1`, and `M^-1=U'HW`.
+The unpenalized selected GLS coefficients for a vector `v` are
+`U'(v-H P_D v)`. Adding the signed penalty requires one direction of
+`W`. The selected trace and its derivatives use their original probe
+directions. The same trace, moment draws, and endpoint checks apply in both
+branches. The projected route verifies a conservative condition bound and
+can fall back to the inverse-column route if its numerical checks fail.
+
+If the direct REML likelihood already has a cache at the exact covariance coefficients, SE
 uses its solutions as checked warm starts. Every column is checked against the
 current FP64 covariance operator and refined if necessary. Tighter requested SE
 solve tolerances still trigger refinement. `fitting_information_reused`,
@@ -178,6 +192,11 @@ An explicit positive value overrides this numerical blocking choice. Probe
 counts stay fixed; as with the earlier implementation, changing batch width can
 change the random-draw realization, so the effective width is saved alongside
 the seed and counts.
+If a linear-solve batch cannot allocate device memory, it is retried at a lower
+width. This does not change the draw batch size or RNG sequence. The output
+records the final solve width and the number of allocation retries. A minimum
+memory check for simultaneously live selected-space arrays runs before the
+projected or inverse-column branch.
 
 A finite point estimate from a nonconverged outer loop does not establish the
 estimating-equation endpoint required by this local approximation. Such fits

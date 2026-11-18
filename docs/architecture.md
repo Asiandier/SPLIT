@@ -15,6 +15,8 @@ GPU_REML is organized around one contract: a covariance component must expose
 | Public model API | `reml_model.py` | Build compatible operator bundles, manage preconditioner lifecycle, fit replicates, estimate effects, and predict. |
 | Downstream models | `lasso_cd.py`, `lasso_residual.py`, `lasso_recycle.py`, `gwas.py` | Weighted Gram and residual-gradient Lasso solvers, covariance-local inverse recycling, and marginal GWAS. |
 | Sparse mean information | `sparse_information.py`, `sparse_reml.py`, `sparse_trace.py` | Selected-span determinant correction, endpoint GLS profiling and selected-mean covariance trace subtraction using a projected covariance identity. |
+| Sparse heritability uncertainty | `sparse_heritability_se.py`, `sparse_se_operator.py` | Sandwich propagation at the saved sparse endpoint, using matrix-free covariance draws and checked selected-space solves. |
+| Sparse restart state | `sparse_checkpoint.py` | Atomically serialize fit state at outer-iteration boundaries and restore it against the same source and inputs. |
 | Optional sparse GPU backends | `sparse_fp64.py` / `.cc`, `sparse_packed.py` / `.cu` | Private cuBLAS GEMMs and deterministic packed-genotype products; native JAX remains available. |
 | Adaptive partition | `run_sparse_pipeline.py`, `adaptive_ld.py`, `score_process.py` | Orchestrate the path, stream shared boundary contractions, and calibrate trace-defined quadratic scores. |
 | Sparse prediction refinement | `joint_vamp.py`, `joint_refinement.py`, `background_ss.py`, `grouped_ss_vamp.py`, `ss_linear.py`, `sparse_prediction.py` | Jointly update alpha and background after the final refit, with fixed variance budgets and streamed products; restore the original pair on numerical failure. |
