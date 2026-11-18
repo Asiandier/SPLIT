@@ -66,7 +66,22 @@ bound to the observed maximum violation before accepting. Refining an
 uncertain score consumes the same iteration budget as other iterations;
 exhausting that budget raises an error rather than returning an uncertified
 path. The lambda grid and validation stopping/selection rules are shared.
-Fixed-lambda final refits continue to use the weighted Gram solver.
+Fixed-lambda final refits use the same residual solver at the selected
+ratio of the profiled all-marker lambda maximum. Following the zero model,
+the target uses the mapped previous coefficients as an optional warm start.
+The weighted Gram implementation is available through `--lasso-path-solver
+basil`, and also provides a fallback if the residual solve cannot certify
+the target or the user sets a candidate cap.
+
+The fixed-lambda solver preserves the original covariate ridge. For
+`C=QR` and ridge `rho>0`, its profiled inverse is
+`(H+CC'/rho)^-1`. Let `P=I-QQ'` and
+`A=P+Q sqrt(rho) R^-1 Q'`. The solver applies
+`A H A'+QQ'` without constructing a sample covariance matrix.
+This operator is bounded below by `min(sigma_e^2,1) I`.
+After solving with right-hand side `A(y-Zb)`, applying `A'` gives the
+profiled dual. The bound for the full-marker score includes `||A'||_2`,
+so the linear-solve tolerance remains tied to the KKT certificate.
 
 ## Sparse covariance update
 
@@ -86,6 +101,12 @@ existing QR/SVD rank decision and ambiguous-rank rejection are retained.
 The projected likelihood reuses the orthonormal selected basis B. It only
 orthogonalizes F=(I-BB')C, so Q=[B,orth(F)] and |[C,B]'[C,B]|=|F'F|.
 This removes a second wide QR without changing the projector or determinant.
+If the projection state exceeds the spare SLQ budget, the sparse planner
+first checks whether evaluating gradients batch by batch fits at the
+existing probe width. It can then decrease the batch width, using all the
+original probes and holding the same quadrature tolerance. It retains the
+direct information solver if even one projected batch exceeds the plan.
+The projected workspace is recorded in the outer checkpoint.
 The sparse mean, variance budgets, exact covariance correction and stopping
 rules are unchanged. Exact traces are invariant to orthogonal changes of B;
 finite endpoint probes can differ under a new basis. Their existing adaptive

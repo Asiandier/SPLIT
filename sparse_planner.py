@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from .pipeline_common import run_planner
+from .slq import workspace_layout
 from .suggest_params_v3 import _DEFAULT_GPU_FREE, _GPU_HEADROOM
 
 
@@ -23,6 +24,29 @@ def sparse_slq_workspace_bytes(gpu_budget_bytes) -> int:
     specific to sparse fitting; ordinary REML retains its existing policy.
     """
     return max(1, int(gpu_budget_bytes)//4)
+
+
+def projected_slq_workspace(n, nsamples, depth, *, workspace_bytes,
+                            available_bytes, basis_bytes):
+    """Fit the extra projection state by releasing the SLQ tape per batch.
+
+    available_bytes is the headroom above the ordinary SLQ peak. The
+    non-SLQ part of that estimate stays reserved even at smaller batch widths.
+    """
+    original = workspace_layout(n, nsamples, depth, workspace_bytes)
+    if basis_bytes <= available_bytes:
+        return workspace_bytes
+    per_probe = original["bytes_per_probe"]
+    # The smallest budget that preserves the original power-of-two capacity
+    # drops deferred gradients whenever the full tape does not fit.
+    capacity = 1 << (original["batch_width"] - 1).bit_length()
+    while capacity:
+        candidate = min(workspace_bytes, capacity * per_probe)
+        peak = workspace_layout(n, nsamples, depth, candidate)["peak_bytes"]
+        if basis_bytes <= available_bytes + original["peak_bytes"] - peak:
+            return candidate
+        capacity //= 2
+    return None
 
 
 def sparse_fp64_workspace_bytes(gpu_budget_bytes, *, plan=None, n_samples=None,

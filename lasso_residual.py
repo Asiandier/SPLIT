@@ -330,12 +330,12 @@ class _DeviceColumnCache:
 
 def fit_weighted_residual_path(*, fitter, grm_index, hv, precond, theta, y,
         covar, lam_max, path_cfg, pcg_tol, max_pcg_iters, pcg_ridge,
-        marker_batch, max_iterations, workspace_bytes, validation_evaluator,
-        stopping_rule, use_preconditioned_metric=True,
+        marker_batch, max_iterations, workspace_bytes, validation_evaluator=None,
+        stopping_rule=None, covariate_ridge=0., use_preconditioned_metric=True,
         validation_requires_training_design=True,
         previous_candidate=None, previous_beta_path=None,
         materialize_result_design=True, hv_with_score=None):
-    """Fit a validation path without inverse-covariance candidate columns.
+    """Fit a validation path or a frozen lambda ratio without inverse columns.
 
     ``stopping_rule`` and ``validation_evaluator`` are supplied by the supported
     sparse pipeline. They retain the original metric, grid and selection rule.
@@ -349,6 +349,7 @@ def fit_weighted_residual_path(*, fitter, grm_index, hv, precond, theta, y,
             pcg_ridge=pcg_ridge, marker_batch=marker_batch,
             max_iterations=max_iterations, workspace_bytes=workspace_bytes,
             validation_evaluator=validation_evaluator, stopping_rule=stopping_rule,
+            covariate_ridge=covariate_ridge,
             use_preconditioned_metric=use_preconditioned_metric,
             validation_requires_training_design=validation_requires_training_design,
             previous_candidate=previous_candidate, previous_beta_path=previous_beta_path,
@@ -359,13 +360,20 @@ def fit_weighted_residual_path(*, fitter, grm_index, hv, precond, theta, y,
 def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         path_cfg, pcg_tol, max_pcg_iters, pcg_ridge, marker_batch,
         max_iterations, workspace_bytes, validation_evaluator, stopping_rule,
-        use_preconditioned_metric, validation_requires_training_design,
+        covariate_ridge, use_preconditioned_metric, validation_requires_training_design,
         previous_candidate, previous_beta_path, materialize_result_design,
         hv_with_score):
     started = time.perf_counter()
     n = np.asarray(y).size
-    if len(fitter.streamers) != 1 or path_cfg.fixed_lam_ratio is not None:
-        raise ValueError('Residual validation path requires one packed source and a full grid')
+    fixed = path_cfg.fixed_lam_ratio is not None
+    if len(fitter.streamers) != 1:
+        raise ValueError('Residual Lasso requires one genotype source')
+    if not fixed and (validation_evaluator is None or stopping_rule is None):
+        raise ValueError('Residual validation path requires an evaluator and stopping rule')
+    if fixed and not 0 < path_cfg.fixed_lam_ratio <= 1:
+        raise ValueError('Fixed Lasso ratio must lie in (0, 1]')
+    if not np.isfinite(covariate_ridge) or covariate_ridge < 0:
+        raise ValueError('Residual Lasso requires a finite nonnegative covariate ridge')
     if not np.isfinite(lam_max) or lam_max <= 0:
         raise ValueError('Residual validation path requires a positive lambda maximum')
     theta = jnp.asarray(theta, dtype=jnp.float32)
@@ -389,9 +397,30 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         q = qc32 if value.dtype == jnp.float32 else qc
         return value-q@(q.T@value)
 
+    transform = adjoint = project
+    transform_norm = 1.
+    ridged = covariate_ridge > 0 and c.shape[1] > 0
+    if ridged:
+        # With C=Q R and ridge rho, the profiled inverse is
+        # (H + C C'/rho)^-1. Congruence by A=P+Q(sqrt(rho) R^-1)Q'
+        # gives A H A' + QQ', avoiding the large 1/rho eigenvalues.
+        small = math.sqrt(covariate_ridge)*sla.solve_triangular(
+            rc, np.eye(rc.shape[0]), check_finite=False)
+        transform_norm = max(1., float(np.linalg.norm(small, ord='fro')))
+        small64 = jnp.asarray(small)
+        small32 = small64.astype(jnp.float32)
+
+        def apply_transform(value, *, transpose=False):
+            q, d = (qc32, small32) if value.dtype == jnp.float32 else (qc, small64)
+            coordinates = q.T@value
+            return value+q@(((d.T if transpose else d)@coordinates)-coordinates)
+
+        transform = apply_transform
+        adjoint = lambda value: apply_transform(value, transpose=True)
+
     def projected_hv(value):
-        w = project(value)
-        return project(hv(w))+(value-w)
+        w = adjoint(value)
+        return transform(hv(w))+(value-(project(value) if ridged else w))
 
     def projected_pre(value):
         w = project(value)
@@ -442,6 +471,7 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
     rows, solutions, gammas, metrics, trace = [], [], [], [], []
     counters = dict(gradient_calls=0, residual_solve_seconds=0., metric_seconds=0.,
         subproblem_seconds=0., validation_seconds=0., max_pcg_residual=0.,
+        bfgs_update_seconds=0.,
         fitted_seconds=0., covariance_solve_seconds=0., score_seconds=0.,
         gradient_events=[], certificate_reuses=0,
         max_pcg_iterations=0, validation_pcg_residual=0., validation_pcg_iterations=0)
@@ -462,8 +492,7 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
             raise ValueError('Previous Lasso coefficient path has an invalid marker layout')
         old_column[prior_indices] = np.arange(len(prior_indices))
     warm_rows_used = set()
-    lambdas = make_lambda_sequence(lam_max, path_cfg.lam_min_ratio, path_cfg.n_lambda)
-    lam = float(lambdas[0])
+    lam = float(lam_max)
 
     def tolerance_at(value):
         return max(path_cfg.kkt_abs_tol, path_cfg.kkt_rel_tol*max(1., value))
@@ -485,12 +514,12 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
     def evaluate(coef, warm, error_budget=None, reason="proposal"):
         tick = time.perf_counter()
         residual = yj-fitted(coef)
-        rhs = project(residual)
+        rhs = transform(residual)
         initial = projected_pre(rhs) if warm is None else warm
         rhs.block_until_ready()
         fitted_seconds = time.perf_counter()-tick
         solve_started = time.perf_counter()
-        bound_scale = column_norm_bound*float(jnp.linalg.norm(rhs))/min(sigma, 1.)
+        bound_scale = column_norm_bound*transform_norm*float(jnp.linalg.norm(rhs))/min(sigma, 1.)
         budget = .1*tolerance_at(lam) if error_budget is None else float(error_budget)
         if not np.isfinite(budget) or budget <= 0:
             raise ValueError('Score-error budget must be positive and finite')
@@ -498,17 +527,17 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         retained = None
         def verified_product(value):
             nonlocal retained
-            w = project(value)
+            w = adjoint(value)
             product, score = hv_with_score(w)
             retained = (value, w, score)
-            return project(product)+(value-w)
+            return transform(product)+(value-(project(value) if ridged else w))
         solved, error, count = solve_adaptive_pcg(projected_hv, rhs,
             M=projected_pre, tol=requested, maxiter=max_pcg_iters, X0=initial, recycle=recycling,
             verified_hv=verified_product if hv_with_score is not None else None)
         if error > requested:
             raise RuntimeError('Lasso residual solve failed its requested accuracy')
         reused = retained is not None and retained[0] is solved
-        dual = retained[1] if reused else project(solved)
+        dual = retained[1] if reused else adjoint(solved)
         dual.block_until_ready()
         solve_seconds = time.perf_counter()-solve_started
         score_started = time.perf_counter()
@@ -529,12 +558,20 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         counters['residual_solve_seconds'] += seconds
         counters['max_pcg_residual'] = max(counters['max_pcg_residual'], float(error))
         counters['max_pcg_iterations'] = max(counters['max_pcg_iterations'], int(count))
-        return score, dual, dict(seconds=seconds, residual=float(error),
+        return score, solved if ridged else dual, dict(seconds=seconds, residual=float(error),
             iterations=int(count), gradient_error_bound=bound_scale*float(error))
 
     gradient, warm, diagnostic = evaluate(beta, None, reason="initial")
+    if fixed:
+        # Freeze the requested ratio against the full, profiled zero-model
+        # score, with the same covariance and nuisance ridge as the target.
+        lam_max = float(np.max(np.abs(gradient)))
+        lambdas = np.unique([lam_max, lam_max*path_cfg.fixed_lam_ratio])[::-1]
+    else:
+        lambdas = make_lambda_sequence(lam_max, path_cfg.lam_min_ratio, path_cfg.n_lambda)
     previous_lam = lam
     previous_state = None
+    stopping = {}
     for path_index, lam_value in enumerate(lambdas):
         lam = float(lam_value)
         tolerance = tolerance_at(lam)
@@ -575,7 +612,15 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
             outside[indices] = -np.inf
             eligible = np.flatnonzero(outside > lam+max(0., tolerance-diagnostic['gradient_error_bound']))
             batch = (2 if not len(indices) else 1)*max(1, int(marker_batch))
-            fresh = eligible[np.argsort(-outside[eligible], kind='stable')[:batch]]
+            # Partition the top scores, then sort that prefix with the same
+            # marker-index tie break as the former full stable sort.
+            if len(eligible) > batch:
+                weights = outside[eligible]
+                cutoff = np.partition(weights, len(weights)-batch)[len(weights)-batch]
+                above = eligible[weights > cutoff]
+                ties = eligible[weights == cutoff][:batch-len(above)]
+                eligible = np.concatenate((above, ties))
+            fresh = eligible[np.lexsort((eligible, -outside[eligible]))]
             if len(fresh):
                 tick = time.perf_counter()
                 host_new = grm_index.extract_standardized_columns(fresh)
@@ -664,7 +709,9 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
                 beta = (1.-step_size)*beta+step_size*proposal
                 gradient = (1.-step_size)*gradient+step_size*proposed_gradient
                 warm = (1.-step_size)*warm+step_size*proposed_warm
+            update_started = time.perf_counter()
             update = bfgs_update(metric, step, step_size*change[indices])
+            counters['bfgs_update_seconds'] += time.perf_counter()-update_started
             if update is not None:
                 pairs.append(dict(step=step.copy(), change=step_size*change.copy(),
                     product=update[0], denominator=update[1], target=update[2]))
@@ -678,28 +725,41 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         active = np.flatnonzero(beta != 0.)
         selected = indices[active]
         fixed_train = fitted(beta)
-        gamma = sla.solve_triangular(rc, np.asarray(qc.T@(yj-fixed_train)-hqc.T@warm),
+        dual = adjoint(warm) if ridged else warm
+        gamma = sla.solve_triangular(rc, np.asarray(qc.T@(yj-fixed_train)-hqc.T@dual),
             check_finite=False).reshape(-1) if c.shape[1] else np.empty(0)
-        row = dict(path_index=path_index, k=len(active), lam=lam, lam_ratio=lam/lam_max,
+        row = dict(path_index=path_index, k=len(active), lam=lam,
+            lam_ratio=(lam/lam_max if lam_max > 0 else path_cfg.fixed_lam_ratio),
             converged=True, kkt_passed=True, global_kkt_passed=True,
             kkt_tolerance=tolerance, max_active_kkt_error=check['active_error'],
             max_inactive_kkt_excess=check['inactive_error'],
             global_kkt_max_outside_score=lam+check['inactive_error'],
             score_error_bound=diagnostic['gradient_error_bound'], iterations=iteration)
+        rows.append(row)
+        solutions.append((selected.copy(), beta[active].copy()))
+        gammas.append(gamma)
+        logger.info('[residual Lasso timing] point=%s/%s workset=%s metric=%.2fs '
+                    'subproblem=%.2fs bfgs=%.2fs covariance=%.2fs fitted=%.2fs',
+                    path_index+1, len(lambdas), len(indices), counters['metric_seconds'],
+                    counters['subproblem_seconds'], counters['bfgs_update_seconds'],
+                    counters['covariance_solve_seconds'],
+                    counters['fitted_seconds'])
+        if fixed:
+            logger.info('[residual Lasso] point=%s/%s support=%s KKT=%.3g/%.3g time=%.1fs',
+                        path_index+1, len(lambdas), len(active), check['upper_bound'],
+                        tolerance, time.perf_counter()-started)
+            continue
         tick = time.perf_counter()
         prediction_reuse = ({} if validation_requires_training_design else
                             dict(training_fixed_score_path=np.asarray(fixed_train)))
         evaluated = validation_evaluator(candidate=selected,
             train_candidate=(cached_design(selected) if validation_requires_training_design else None),
             beta_cov_path=gamma[None, :], beta_snp_path=beta[active][None, :],
-            hinv_residual_path=np.asarray(warm), training_score_path=gradient[:, None],
+            hinv_residual_path=np.asarray(dual), training_score_path=gradient[:, None],
             **prediction_reuse)
         counters['validation_seconds'] += time.perf_counter()-tick
         counters['validation_pcg_residual'] = max(counters['validation_pcg_residual'], evaluated['pcg_rel_res'])
         counters['validation_pcg_iterations'] = max(counters['validation_pcg_iterations'], evaluated['pcg_iters'])
-        rows.append(row)
-        solutions.append((selected.copy(), beta[active].copy()))
-        gammas.append(gamma)
         metrics.append(dict(evaluated['metrics'][0], path_index=path_index))
         stopping = stopping_rule(metrics)
         label='AIC' if 'aic' in metrics[-1] else 'validation'
@@ -731,7 +791,8 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
     return dict(lasso_path=dict(path=rows, beta_snp_path=beta_path,
         beta_cov_path=np.asarray(gammas), lam_max=lam_max, selected_index=None,
         selection_method=None, selected_lam_ratio=None,
-        path_role=('kkt_certified_training_aic_prefix_residual_lasso'
+        path_role=('frozen_ratio_target_only' if fixed else
+                   'kkt_certified_training_aic_prefix_residual_lasso'
                    if metrics and 'aic' in metrics[-1]
                    else 'kkt_certified_validation_prefix_residual_lasso'),
         requested_n_lambda=len(lambdas), evaluated_n_lambda=len(rows),

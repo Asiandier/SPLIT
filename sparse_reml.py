@@ -23,6 +23,7 @@ from .precond import (
     scalar_diag_from_precond_conf,
 )
 from .slq import logdet_value_and_grad
+from .sparse_planner import projected_slq_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +31,9 @@ logger = logging.getLogger(__name__)
 class SparseProjectedInformation:
     """One selected span; fit-only device caches are explicitly releasable."""
 
-    def __init__(self, information):
+    def __init__(self, information, *, slq_workspace_bytes=None):
         self.exact = information
+        self.slq_workspace_bytes = slq_workspace_bytes
         self.n = information.n
         self.rank = information.rank
         self.release_likelihood_cache()
@@ -163,11 +165,13 @@ class SparseProjectedInformation:
         diagnostics = {}
         value, gradient = logdet_value_and_grad(
             apply, pullback, self.n, key, nsamples=nsamples, m=m,
-            workspace_bytes=ctx.slq_workspace_bytes, dtype=parameters.dtype,
+            workspace_bytes=(self.slq_workspace_bytes or ctx.slq_workspace_bytes),
+            dtype=parameters.dtype,
             accept_value=(None if accept_logdet is None else
                           lambda value: accept_logdet(value+constant)),
             lower_bound=lower if lower > 0 else None,
             quadrature_tolerance=ctx.slq_quadrature_tolerance, diagnostics=diagnostics,
+            synchronize_batches=self.slq_workspace_bytes is not None,
         )
         logger.info("[projected information] joint determinant=%.6f time=%.2fs depths=%s",
                     float(value+constant), time.perf_counter()-started,
@@ -175,14 +179,25 @@ class SparseProjectedInformation:
         return value+constant, gradient
 
 
-def with_projected_likelihood(information, *, available_bytes=None, precond_rank=0):
+def with_projected_likelihood(information, *, available_bytes=None, precond_rank=0,
+                              slq_workspace_bytes=None, slq_samples=None, slq_depth=None):
     """Use the identity only when its additional basis fits the sparse plan."""
     required = information.n * (
         12 * (information.rank + 2 * information.covar.shape[1]) + 16 * precond_rank
     )
-    if available_bytes is not None and required > max(0, available_bytes):
-        logger.info("[projected information] retain direct information solves: "
-                    "additional basis needs %.2f GiB; planned headroom %.2f GiB",
-                    required/1024**3, max(0, available_bytes)/1024**3)
-        return information
-    return SparseProjectedInformation(information)
+    if available_bytes is None or required <= available_bytes:
+        return SparseProjectedInformation(information)
+    if slq_workspace_bytes is not None:
+        workspace = projected_slq_workspace(
+            information.n, slq_samples, slq_depth, workspace_bytes=slq_workspace_bytes,
+            available_bytes=available_bytes, basis_bytes=required,
+        )
+        if workspace is not None:
+            logger.info("[projected information] resize SLQ workspace %.2f -> %.2f GiB "
+                        "to retain the projection basis (%.2f GiB)",
+                        slq_workspace_bytes/1024**3, workspace/1024**3, required/1024**3)
+            return SparseProjectedInformation(information, slq_workspace_bytes=workspace)
+    logger.info("[projected information] retain direct information solves: "
+                "additional basis needs %.2f GiB; planned headroom %.2f GiB",
+                required/1024**3, max(0, available_bytes)/1024**3)
+    return information

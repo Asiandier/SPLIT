@@ -4258,6 +4258,25 @@ def main() -> None:
                 sol_screen[:, 1:n_screen], dtype=np.float64
             )
 
+        def solve_residual_path(**selection):
+            streamer = fitter.streamers[0]
+            paired_hv = None
+            if getattr(fitter, "_partitioned_streamer", None) is streamer:
+                paired_hv = lambda value: streamer.weighted_component_hv(
+                    theta_g, theta_e, value, return_transpose=True)
+            return _residual_lasso_mod.fit_weighted_residual_path(
+                fitter=fitter, grm_index=grm_index, hv=hv, precond=precond,
+                theta=theta, y=y_np, covar=covar_np, lam_max=float(np.max(score)),
+                path_cfg=path_cfg, pcg_tol=float(args.pcg_tol),
+                max_pcg_iters=int(args.max_pcg_iters), pcg_ridge=float(args.pcg_ridge),
+                marker_batch=int(args.basil_marker_batch_size),
+                max_iterations=int(args.basil_max_iterations),
+                workspace_bytes=int(getattr(streamer, "_sparse_fp64_workspace_bytes", 0)),
+                previous_candidate=warm_lasso_candidate,
+                previous_beta_path=warm_lasso_beta_path, materialize_result_design=False,
+                hv_with_score=paired_hv, **selection,
+            )
+
         # Validation selection must compare exact solutions of the *global*
         # weighted-Lasso problem at every lambda.  Use a BASIL rollout rather
         # than growing one shared candidate until it happens to solve the whole
@@ -4305,25 +4324,9 @@ def main() -> None:
                     )
 
                 if args.lasso_path_solver == "residual":
-                    paired_hv = None
-                    if getattr(fitter, '_partitioned_streamer', None) is fitter.streamers[0]:
-                        paired_hv = lambda value: fitter.streamers[0].weighted_component_hv(
-                            theta_g, theta_e, value, return_transpose=True)
-                    basil_result = _residual_lasso_mod.fit_weighted_residual_path(
-                        fitter=fitter, grm_index=grm_index, hv=hv, precond=precond,
-                        theta=theta, y=y_np, covar=covar_np,
-                        lam_max=float(np.max(score)), path_cfg=path_cfg,
-                        pcg_tol=float(args.pcg_tol), max_pcg_iters=int(args.max_pcg_iters),
-                        pcg_ridge=float(args.pcg_ridge),
-                        marker_batch=int(args.basil_marker_batch_size),
-                        max_iterations=int(args.basil_max_iterations),
-                        workspace_bytes=int(getattr(fitter.streamers[0], "_sparse_fp64_workspace_bytes", 0)),
+                    basil_result = solve_residual_path(
                         validation_evaluator=evaluate_basil_validation_block,
                         validation_requires_training_design=bool(aic_selection),
-                        previous_candidate=warm_lasso_candidate,
-                        previous_beta_path=warm_lasso_beta_path,
-                        materialize_result_design=False,
-                        hv_with_score=paired_hv,
                         stopping_rule=lambda values: (_aic_selection_mod.stopping_decision if aic_selection else _validation_path_early_stopping_decision)(
                             values, stopping_lag=int(args.validation_early_stopping_lag)),
                     )
@@ -4513,6 +4516,48 @@ def main() -> None:
             max_kkt_rounds = 0
         else:
             max_kkt_rounds = int(args.kkt_max_rounds)
+            if args.lasso_path_solver == "residual" and max_candidate == 0:
+                try:
+                    result = solve_residual_path(covariate_ridge=float(args.lasso_ridge))
+                except (FloatingPointError, MemoryError, RuntimeError, ValueError, np.linalg.LinAlgError) as error:
+                    logger.warning("Fixed-ratio residual Lasso unavailable; use candidate Gram: %s", error)
+                else:
+                    lasso = result["lasso_path"]
+                    candidate = result["candidate"]
+                    extract_candidate_design = result["extract_geno"]
+                    Z_cand = sol_z_np = None
+                    selected = len(lasso["path"])-1
+                    beta = lasso["beta_snp_path"][selected].copy()
+                    active_local = np.flatnonzero(beta)
+                    row = lasso["path"][selected]
+                    lasso.update(beta_snp=beta, beta_cov=lasso["beta_cov_path"][selected].copy(),
+                                 active_idx=active_local, lam=row["lam"], selected_index=selected,
+                                 selected_lam_ratio=float(args.lasso_fixed_lam_ratio),
+                                 selection_method="fixed_lam_ratio")
+                    support_new = candidate[active_local]
+                    warm_lasso_candidate = candidate.copy()
+                    warm_lasso_beta_path = lasso["beta_snp_path"].copy()
+                    warm_z_dict.clear()
+                    kkt_trace = result["kkt_trace"]
+                    accepted_kkt_record = {
+                        "passed": True, "tolerance": row["kkt_tolerance"],
+                        "max_active_error": row["max_active_kkt_error"],
+                        "max_inactive_excess": row["max_inactive_kkt_excess"],
+                        "score_error_bound": row["score_error_bound"],
+                        "n_outside_violators": 0, "candidate_path_kkt_passed": True,
+                        "decision_precision": "verified_residual_pcg",
+                        "method": lasso["basil"]["algorithm"],
+                    }
+                    performance = lasso["basil"]["performance"]
+                    sparse_path_performance["residual_lasso"] = performance
+                    sparse_path_performance["lasso_path_solves"] += 1
+                    sparse_path_performance["lasso_path_solve_seconds"] += performance["total_seconds"]
+                    res_all = performance["max_pcg_residual"]
+                    it_all = performance["max_pcg_iterations"]
+                    certified_kkt = True
+                    theta_lasso = theta.copy()
+                    max_kkt_rounds = 0
+                    del result
 
         fixed_ratio_gram_cache = WeightedGramCache()
         fixed_ratio_design_cache = CandidateDesignCache(
@@ -5128,6 +5173,9 @@ def main() -> None:
                 mean_information,
                 available_bytes=gpu_budget_bytes-plan.gpu_slq_peak_gib*1024**3,
                 precond_rank=plan.precond_rank,
+                slq_workspace_bytes=fit_cfg.slq_workspace_bytes if args.device != "cpu" else None,
+                slq_samples=args.slq_samples,
+                slq_depth=args.slq_m,
             )
             information_markers = active_markers.copy()
         # Both branches profile ordinary covariates at the current covariance.

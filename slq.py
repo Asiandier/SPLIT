@@ -50,7 +50,8 @@ def workspace_layout(n, nsamples, m, workspace_bytes, *, itemsize=4):
     peak = max(eager, retained) if retained <= workspace_bytes else eager
     # Small dense quadrature matrices are live alongside the Lanczos state.
     peak += 8*itemsize*width*depth*depth
-    return dict(batch_width=width, retained_bytes=retained, peak_bytes=peak)
+    return dict(batch_width=width, retained_bytes=retained, peak_bytes=peak,
+                bytes_per_probe=per_probe)
 
 
 @partial(jax.jit, donate_argnums=(0,))
@@ -193,7 +194,8 @@ def _log_quadrature_gap(alpha, beta, lower_bound):
 def logdet_value_and_grad(matvec, matvec_pullback, n, key, *, nsamples, m,
                          workspace_bytes=256*1024**2, dtype=jnp.float32,
                          accept_value=None, lower_bound=None,
-                         quadrature_tolerance=1e-6, diagnostics=None):
+                         quadrature_tolerance=1e-6, diagnostics=None,
+                         synchronize_batches=False):
     """Return a fixed-probe SLQ value and its own parameter gradient.
 
     ``matvec_pullback(left, right)`` returns ``(matvec(left), gradient)``,
@@ -279,6 +281,8 @@ def logdet_value_and_grad(matvec, matvec_pullback, n, key, *, nsamples, m,
         else:
             gradient = _batch_pullback(matvec_pullback, basis, products, beta, a_bar, b_bar)
             total_gradient = gradient if total_gradient is None else total_gradient+gradient
+            if synchronize_batches:
+                total_gradient.block_until_ready()
         del basis, products
     if not bool(jnp.isfinite(total_value)):
         raise FloatingPointError("Nonfinite SLQ value.")

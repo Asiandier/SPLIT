@@ -58,7 +58,9 @@ def _product(a, b, device, available):
     with jax.default_device(device), jax.experimental.enable_x64():
         right = jax.device_put(np.asarray(b, order='C'), device)
         for start in range(0, a.shape[0], rows):
-            left = jax.device_put(np.asarray(a[start:start+rows], order='C'), device)
+            # The inverse-column warm start is stored in FP32. Convert only
+            # the current tile to the FP64 basis coordinates used by cuBLAS.
+            left = jax.device_put(np.asarray(a[start:start+rows], dtype=np.float64, order='C'), device)
             value = (sparse_fp64.matmul(left, right, workspace_limit=scratch)
                      if accelerated else left @ right)
             result[start:start+rows] = np.asarray(value)

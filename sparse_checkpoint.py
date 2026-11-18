@@ -126,7 +126,8 @@ class _Encoder:
         elif isinstance(value, SparseProjectedInformation):
             if value.q64 is not None:
                 raise ValueError('Checkpoint boundary retains a live projected-likelihood cache')
-            node = dict(type='projected_information', exact=self.encode(value.exact))
+            node = dict(type='projected_information', exact=self.encode(value.exact),
+                        slq_workspace_bytes=value.slq_workspace_bytes)
         elif isinstance(value, SparseMeanInformation):
             attributes = dict(vars(value))
             if attributes['_state'] is not None:
@@ -182,7 +183,8 @@ def _decode(metadata, archive):
                     or result.covar.shape[0] != result.n):
                 raise ValueError('Invalid checkpoint information dimensions')
         elif kind == 'projected_information':
-            result = SparseProjectedInformation(decode(node['exact']))
+            result = SparseProjectedInformation(
+                decode(node['exact']), slq_workspace_bytes=node.get('slq_workspace_bytes'))
         elif kind == 'preconditioner':
             result = ProjectedCorePrecondConf(**decode(node['attributes']))
         else:
