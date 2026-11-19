@@ -1254,10 +1254,12 @@ class GenoBlockStreamer:
         sample_mask: np.ndarray | None = None,
         ring_depth: int | None = None,
         source_build_chunk_width: int | None = None,
+        sparse_packed_streaming: bool = False,
     ):
         if _AUTO_NUMBA_WARMUP:
             _ensure_numba_warmup()
         self._ring_depth_cfg = ring_depth
+        self._sparse_packed_streaming = sparse_packed_streaming
         # ---- Resolve source --------------------------------------------------
         source_was_supplied = source is not None
         if source is not None and bed_prefix is not None:
@@ -1457,6 +1459,7 @@ class GenoBlockStreamer:
         self._packed_buf = None
         self._tmpfile_fd = None
         self._device_packed_blocks = None
+        self._sparse_packed_stream = None
 
         from .geno_source import BedGenoSource
         if isinstance(self._source, BedGenoSource):
@@ -2472,7 +2475,8 @@ class GenoBlockStreamer:
 
         # Create evict ring for bounded RSS
         self._ring = None
-        if self._packed_mmap is not None and self._n_calls > 0:
+        if (self._packed_mmap is not None and self._n_calls > 0
+                and not (self._sparse_packed_streaming and self.dev.platform == "gpu")):
             self._ring = _EvictRing(
                 self._packed_mmap, self._packed_buf, packed_offsets,
                 self._n_calls, self.n, self._max_packed_width,
@@ -2600,9 +2604,13 @@ class GenoBlockStreamer:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
+        if getattr(self, "_sparse_packed_stream", None) is not None:
+            self._sparse_packed_stream.close()
+            self._sparse_packed_stream = None
         self._device_packed_blocks = None
         for attr in (
             "_eff_m_const", "_means_by_call", "_inv_by_call",
+            "_sparse_call_parameters",
             "_snp_starts_dev", "_true_widths_dev",
             "_means_host", "_inv_sds_host", "_count_host",
             "_component_eff_m_const", "_exact_diag_dev",
@@ -2730,10 +2738,37 @@ class GenoBlockStreamer:
 
     def release_packed_device_cache(self) -> None:
         """Free a phase-specific cache; the host mmap remains a valid source."""
+        if self._sparse_packed_stream is not None:
+            self._sparse_packed_stream.trim(0)
         self._device_packed_blocks = None
+
+    def configure_sparse_packed_cache(self, limit_bytes, *, budget_bytes):
+        """Enable the sparse prefetch policy on this GPU streamer."""
+        if self.dev.platform != "gpu" or self._packed_buf is None:
+            return 0
+        from .sparse_packed_stream import SparsePackedStream
+        if self._sparse_packed_stream is None:
+            if self._ring is not None:
+                self._ring.close()
+                self._ring = None
+            self._device_packed_blocks = None
+            self._sparse_packed_stream = SparsePackedStream(
+                self.dev, self._packed_block_host, np.diff(self._packed_offsets),
+                budget_bytes=budget_bytes,
+            )
+            self._sparse_call_parameters = tuple(zip(
+                self._true_widths_dev, self._means_by_call, self._inv_by_call, self._snp_starts_dev,
+            ))
+        resident = self._sparse_packed_stream.set_cache_limit(limit_bytes)
+        logger.info("[sparse genotype] %.2f GiB resident (%d/%d blocks), %.2f GiB device prefetch window",
+                    resident/2**30, self._sparse_packed_stream.resident_calls, self._n_calls,
+                    self._sparse_packed_stream.prefetch_bytes/2**30)
+        return resident
 
     def _pop_cached(self, call_idx) -> np.ndarray | jax.Array:
         c = int(call_idx)
+        if self._sparse_packed_stream is not None:
+            return self._sparse_packed_stream.block(c)
         if self._device_packed_blocks is not None:
             return self._device_packed_blocks[c]
         pw = int(self._packed_call_widths[c])
@@ -2807,6 +2842,8 @@ class GenoBlockStreamer:
             self._means_by_call, self._inv_by_call, self._eff_m_const,
             n=self.n, n_calls=self._n_calls,
             pop_block=self._pop_cached,
+            packed_stream=self._sparse_packed_stream,
+            call_parameters=getattr(self, "_sparse_call_parameters", None),
             missing_val=int(self._missing_val), normalize=normalize,
             fp64_workspace_bytes=getattr(self, "_sparse_fp64_workspace_bytes", 0),
         )
@@ -2885,6 +2922,8 @@ class GenoBlockStreamer:
             true_widths=self._true_widths_dev,
             means_by_call=self._means_by_call, inv_by_call=self._inv_by_call,
             n_calls=self._n_calls, pop_block=self._pop_cached,
+            packed_stream=self._sparse_packed_stream,
+            call_parameters=getattr(self, "_sparse_call_parameters", None),
             missing_val=int(self._missing_val),
             normalize=normalize, eff_m=self._eff_m_const,
             sparse_packed_enabled=getattr(self, "_sparse_fp64_workspace_bytes", 0) > 0,
@@ -2898,6 +2937,8 @@ class GenoBlockStreamer:
         return xv_impl_streamed(effects, self._snp_starts_dev, self._true_widths_dev,
             self._means_by_call, self._inv_by_call, n=self.n, m=self.m,
             n_calls=self._n_calls, pop_block=self._pop_cached,
+            packed_stream=self._sparse_packed_stream,
+            call_parameters=getattr(self, "_sparse_call_parameters", None),
             missing_val=int(self._missing_val))
 
     def extract_standardized_columns(self, snp_indices: np.ndarray) -> np.ndarray:
@@ -3035,6 +3076,7 @@ class BedBlockStreamer(GenoBlockStreamer):
         sample_mask: np.ndarray | None = None,
         ring_depth: int | None = None,
         source_build_chunk_width: int | None = None,
+        sparse_packed_streaming: bool = False,
     ):
         super().__init__(
             bed_prefix=bed_prefix,
@@ -3048,4 +3090,5 @@ class BedBlockStreamer(GenoBlockStreamer):
             sample_mask=sample_mask,
             ring_depth=ring_depth,
             source_build_chunk_width=source_build_chunk_width,
+            sparse_packed_streaming=sparse_packed_streaming,
         )

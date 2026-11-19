@@ -215,6 +215,18 @@ separately from the local statistical SE.
 
 ## Precision, reuse and device execution
 
+- Sparse GPU scans keep genotype blocks compressed on the host and on the
+  device. The planner reserves compute state and up to four input blocks
+  before allocating a persistent cache. Two reusable pinned host buffers
+  supply asynchronous copies. The consumer drains its bounded window before
+  allocating more inputs. Cache capacity counts exact compressed bytes and
+  transfer capacity counts the largest actual call block. A stable prefix
+  survives repeated scans of panels larger than the device cache.
+- Residual Lasso can borrow cache memory after reserving the two live
+  candidate operands and its narrow solve workspace. It returns this memory
+  before the next wide REML or information solve. Refinement sizes a new cache
+  after releasing the fitting cache and reserving its trace and decode
+  workspace. All products traverse the same logical SNP order.
 - Mixed-precision PCG solves the same operator throughout. An FP32 correction
   $H\delta\approx b-Hx$ is added in FP64. Acceptance requires an independently
   evaluated residual at the requested precision and within the original total
@@ -224,6 +236,15 @@ separately from the local statistical SE.
   $UU^T+(I-U(HU)^T)M(I-(HU)U^T)$, which is positive definite for positive
   definite $M$ and full-rank coarse directions. It changes convergence speed,
   not the linear system or its acceptance test.
+- Lasso candidate columns and recycling bases share the live device budget.
+  CUDA reports physical headroom even with the `platform` allocator; a pooled
+  allocator can also reuse its reserved free blocks. The reserve scales with
+  the resident genotype format, block width and preconditioner rank. Unpinned
+  candidate columns can be reloaded from their original host values. PCG can
+  skip or release recycling when memory is tight. If an allocation still
+  fails, the operation is retried after reclaiming optional buffers. The
+  original weighted objective, full-marker KKT checks and validation grid
+  still determine the accepted path.
 - The residual Lasso's final FP64 covariance product can also return the
   unweighted standardized transpose $Z^T w$ used in its global score. This is
   retained only for the identical verified solution and its covariate-projected

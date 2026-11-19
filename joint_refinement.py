@@ -13,7 +13,6 @@ import jax.numpy as jnp
 
 from .background_ss import StreamedGenotypeProducts
 from .ss_linear import MatrixFreeSampleSolver
-from .sparse_planner import sparse_packed_device_cache_budget
 
 from .grouped_ss_vamp import VAMPConfig, validate_vamp_config
 from .joint_vamp import fit_joint
@@ -276,7 +275,7 @@ def training_trace(products, active=None):
     mask = np.ones(products.p, bool) if active is None else np.asarray(active)
     if mask.shape != (products.p,) or mask.dtype != np.dtype(bool):
         raise ValueError("Trace mask must be a Boolean vector over fitting SNPs")
-    if products._device_packed is not None:
+    if products.packed_calls is not None and products.streamer.dev.platform == 'gpu':
         diagonal = np.asarray(products.gram_diagonal(mask), dtype=np.float64)
     elif products.packed_calls is not None:
         from .geno_stream import _accumulate_packed_standardized_diag_numba
@@ -404,8 +403,7 @@ def refine_native_fit(
     cache_bytes = getattr(
         getattr(fitter, "cfg", None), "packed_device_cache_bytes", None
     )
-    if cache_bytes is None:
-        cache_bytes = sparse_packed_device_cache_budget(budget)
+    cache_bytes = int(budget) if budget is not None else (cache_bytes or 0)
     with jax.experimental.enable_x64():
         for streamer in getattr(fitter, "streamers", ()):
             release = getattr(streamer, "release_packed_device_cache", None)
@@ -418,6 +416,8 @@ def refine_native_fit(
             block_bytes=block_bytes,
             device_cache_bytes=cache_bytes,
             accelerate_packed=True,
+            gpu_budget_bytes=budget,
+            trace_workspace_bytes=workspace,
         )
         logger.info('[joint VAMP setup] n=%s, SNPs=%s, packed cache=%.3f GiB, '
                     'product block=%s SNPs, trace workspace=%.1f MiB',
@@ -490,6 +490,7 @@ def refine_native_fit(
         alpha[support] = fitted.alpha
         sparse_score = np.asarray(products.forward(jnp.asarray(alpha[:, None])))[:, 0]
         prediction = nuisance + sparse_score + np.asarray(updated.random_effect)
+        products.close()
     metadata = dict(
         status=fitted.status,
         model="joint_global_budget_p",

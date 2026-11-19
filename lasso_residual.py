@@ -11,7 +11,7 @@ import json
 import math
 import time
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import jax
 import jax.numpy as jnp
@@ -19,13 +19,14 @@ import numpy as np
 import scipy.linalg as sla
 from numba import njit, prange
 
-from . import sparse_fp64
+from . import sparse_fp64, sparse_packed
 from .geno_stream import _numba_thread_mask
 from .lasso_recycle import RecycledInverse
 from .lasso_cd import solve_lasso_cd_gram, make_lambda_sequence
 from .pcg import pcg_solve
 from .precond import scalar_diag_from_precond_conf, build_projected_core_runtime
 from .runtime_env import resolve_cpu_threads
+from .sparse_memory import available_device_bytes, device_allocation_failed
 
 logger = logging.getLogger(__name__)
 
@@ -283,35 +284,96 @@ class _DeviceColumnCache:
     operation remain the same. Pinned operands survive until their operation
     completes; scratch and operator workspaces are reserved independently.
     """
-    def __init__(self, host_blocks, device, *, memory_limit=None, reserve_bytes=0):
+    def __init__(self, host_blocks, device, *, memory_limit=None, reserve_bytes=0,
+                 release_recycle=None, packed_stream=None):
         self.host_blocks = host_blocks
         self.device = device
         self.memory_limit = memory_limit
         self.reserve_bytes = int(reserve_bytes)
+        self.release_recycle = release_recycle
+        self.packed_stream = packed_stream
         self.arrays = OrderedDict()
         self.pins = {}
         self.evictions = self.uploads = self.uploaded_bytes = 0
+        self.allocation_retries = 0
+        self.packed_evicted_bytes = 0
         self.peak_resident_bytes = 0
 
+    def available(self):
+        return available_device_bytes(self.device, self.memory_limit)
+
+    def _evict_one(self):
+        victim = next((i for i in self.arrays if not self.pins.get(i, 0)), None)
+        if victim is None:
+            return False
+        value = self.arrays.pop(victim)
+        value.block_until_ready()
+        value.delete()
+        self.evictions += 1
+        return True
+
+    def _release_packed(self, needed_bytes=None):
+        """Reclaim optional genotype blocks while keeping the host source."""
+        stream = self.packed_stream
+        if stream is None or stream.resident_bytes == 0:
+            return False
+        before = stream.resident_bytes
+        limit = 0 if needed_bytes is None else max(0, before-needed_bytes)
+        stream.trim(limit)
+        released = before-stream.resident_bytes
+        self.packed_evicted_bytes += released
+        return released > 0
+
     def _make_room(self, additional_bytes=0):
-        stats = self.device.memory_stats()
-        if stats is None:
+        available = self.available()
+        if available is None:
+            # If both driver and allocator accounting are unavailable, keep
+            # only the live operands. Host blocks can always be loaded again.
+            if getattr(self.device, 'platform', None) == 'gpu':
+                while self._evict_one():
+                    pass
+                self._release_packed()
             return
-        capacity = int(stats['bytes_limit'])
-        if self.memory_limit is not None and self.memory_limit > 0:
-            capacity = min(capacity, int(self.memory_limit))
-        required = int(additional_bytes)+self.reserve_bytes
-        while int(stats['bytes_in_use'])+required > capacity:
-            victim = next((i for i in self.arrays if not self.pins.get(i, 0)), None)
-            if victim is None:
+        required = int(additional_bytes) + self.reserve_bytes
+        while available is not None and available < required:
+            if not (self._evict_one()
+                    or (self.release_recycle and self.release_recycle())
+                    or self._release_packed(required-available)):
                 raise MemoryError(
-                    'Residual Lasso needs more device memory for two column blocks '
-                    'and its operator workspace, even after evicting cached columns')
-            value = self.arrays.pop(victim)
-            value.block_until_ready()
-            value.delete()
-            self.evictions += 1
-            stats = self.device.memory_stats()
+                    f'Residual Lasso requires {required/2**30:.2f} GiB for the '
+                    f'next operation, with {available/2**30:.2f} GiB available '
+                    'after reclaiming optional device caches')
+            available = self.available()
+
+    def gemm_workspace(self, requested):
+        if requested <= 0:
+            return 0
+        available = self.available()
+        if available is None or available <= self.reserve_bytes:
+            return 0
+        room = available-self.reserve_bytes
+        # A handful of workspace sizes avoid recompilation at every small
+        # allocator fluctuation. The cuBLAS bridge can tile within this limit.
+        return requested if room >= requested else 1 << (room.bit_length()-1)
+
+    def run(self, operation):
+        """Retry just the failed operation after releasing optional storage."""
+        try:
+            return operation()
+        except (RuntimeError, MemoryError) as error:
+            if not device_allocation_failed(error):
+                raise
+            reclaimed = self._evict_one()
+            while self._evict_one():
+                reclaimed = True
+            if self.release_recycle is not None:
+                reclaimed = self.release_recycle() or reclaimed
+            reclaimed = self._release_packed() or reclaimed
+            if not reclaimed:
+                raise
+        self.allocation_retries += 1
+        logger.info('[residual Lasso memory] retry operation after reclaiming optional buffers')
+        return operation()
 
     @contextmanager
     def hold(self, index):
@@ -319,8 +381,10 @@ class _DeviceColumnCache:
             host = self.host_blocks[index]
             size = int(host.size)*np.dtype(np.float64).itemsize
             self._make_room(size)
-            with jax.default_device(self.device):
-                self.arrays[index] = jnp.asarray(host, dtype=jnp.float64)
+            def upload():
+                with jax.default_device(self.device):
+                    return jnp.asarray(host, dtype=jnp.float64).block_until_ready()
+            self.arrays[index] = self.run(upload)
             self.uploads += 1
             self.uploaded_bytes += size
             self.peak_resident_bytes = max(self.peak_resident_bytes,
@@ -343,7 +407,21 @@ class _DeviceColumnCache:
     def metrics(self):
         return dict(evictions=self.evictions, uploads=self.uploads,
             uploaded_bytes=self.uploaded_bytes, peak_resident_bytes=self.peak_resident_bytes,
-            reserve_bytes=self.reserve_bytes)
+            reserve_bytes=self.reserve_bytes, allocation_retries=self.allocation_retries,
+            packed_evicted_bytes=self.packed_evicted_bytes)
+
+
+def _lasso_workspace(n, marker_batch, call_width, rank, *, packed, prefetch_bytes):
+    """Budget the live phase with the widest mandatory temporaries."""
+    max_block = 2*max(1, int(marker_batch))
+    # Two cached column operands may need row-major FFI copies.
+    metric = 16*n*max_block + 8*max_block**2
+    precondition = 8*n*(rank+max_block) + 8*rank*(rank+max_block)
+    if packed:
+        partials = 16*((n+511)//512*call_width + (call_width+2047)//2048*n)
+    else:
+        partials = 16*n*call_width
+    return max(metric, precondition, partials+prefetch_bytes) + 128*n
 
 
 def fit_weighted_residual_path(*, fitter, grm_index, hv, precond, theta, y,
@@ -362,7 +440,25 @@ def fit_weighted_residual_path(*, fitter, grm_index, hv, precond, theta, y,
     """
     cfg = getattr(fitter, 'cfg', None)
     cpu_threads, _ = resolve_cpu_threads(getattr(cfg, 'cpu_threads', None))
-    with jax.experimental.enable_x64(), _numba_thread_mask(cpu_threads):
+    stream = fitter.streamers[0] if fitter.streamers else None
+    packed_stream = getattr(stream, '_sparse_packed_stream', None)
+    n = np.asarray(y).size
+    width = int(getattr(stream, 'call_width', 0))
+    rank = int(getattr(getattr(fitter, 'precond_conf', None), 'total_rank', 0))
+    packed = workspace_bytes > 0 and sparse_packed.supports(
+        jax.ShapeDtypeStruct((n, 1), jnp.float64))
+    prefetch = (packed_stream.prefetch_bytes if packed_stream is not None else
+                0 if getattr(stream, '_device_packed_blocks', None) is not None else n*width//2)
+    reserve = _lasso_workspace(n, marker_batch, width, rank, packed=packed, prefetch_bytes=prefetch)
+    # Leave room for two live FP64 candidate-column operands in addition to
+    # the compute scratch. The prefetch window is reserved by the cache.
+    column_bytes = 2*8*n*2*max(1, int(marker_batch))
+    cache_scope = (nullcontext() if packed_stream is None else
+                   packed_stream.borrow_cache(reserve + column_bytes))
+    with jax.experimental.enable_x64(), _numba_thread_mask(cpu_threads), cache_scope:
+        if packed_stream is not None:
+            logger.info('[residual Lasso memory] %.2f GiB packed genotypes resident',
+                        packed_stream.resident_bytes/2**30)
         return _fit_path(fitter=fitter, grm_index=grm_index, hv=hv,
             precond=precond, theta=theta, y=y, covar=covar, lam_max=lam_max,
             path_cfg=path_cfg, pcg_tol=pcg_tol, max_pcg_iters=max_pcg_iters,
@@ -374,7 +470,7 @@ def fit_weighted_residual_path(*, fitter, grm_index, hv, precond, theta, y,
             validation_requires_training_design=validation_requires_training_design,
             previous_candidate=previous_candidate, previous_beta_path=previous_beta_path,
             materialize_result_design=materialize_result_design,
-            hv_with_score=hv_with_score)
+            hv_with_score=hv_with_score, reserve=reserve, packed=packed)
 
 
 def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
@@ -382,7 +478,7 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         max_iterations, workspace_bytes, validation_evaluator, stopping_rule,
         covariate_ridge, use_preconditioned_metric, validation_requires_training_design,
         previous_candidate, previous_beta_path, materialize_result_design,
-        hv_with_score):
+        hv_with_score, reserve, packed):
     started = time.perf_counter()
     n = np.asarray(y).size
     fixed = path_cfg.fixed_lam_ratio is not None
@@ -466,12 +562,19 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
     # Keep its exact host values and reuse available VRAM without constraining
     # the statistical working set. Reserve the existing operator/GEMM scratch
     # plus a conversion block and small products while two operands are live.
-    scratch = (workspace_bytes if workspace_bytes > 0 else
-        16*n*int(getattr(stream, 'call_width', 0)))
-    max_block = 2*max(1, int(marker_batch))
-    cache = _DeviceColumnCache(host_blocks, next(iter(yj.devices())),
-        memory_limit=getattr(getattr(fitter, 'cfg', None), 'gpu_budget_bytes', None),
-        reserve_bytes=scratch+8*n*max_block+8*max_block**2+64*n)
+    device = next(iter(yj.devices()))
+    memory_limit = getattr(getattr(fitter, 'cfg', None), 'gpu_budget_bytes', None)
+    recycling = RecycledInverse(n, workspace_bytes=reserve, memory_limit=memory_limit)
+    cache = _DeviceColumnCache(host_blocks, device, memory_limit=memory_limit,
+                               reserve_bytes=reserve, release_recycle=recycling.clear,
+                               packed_stream=getattr(stream, '_sparse_packed_stream', None))
+    if device.platform == 'gpu':
+        logger.info('[residual Lasso memory] mandatory workspace=%.2f GiB; packed=%s',
+                    reserve/2**30, packed)
+
+    def metric_product(left, right):
+        return cache.run(lambda: np.asarray(_matmul(left, right, transpose_a=True,
+            workspace_limit=cache.gemm_workspace(workspace_bytes))))
     block_of_marker = np.full(int(grm_index.m_total), -1, dtype=np.int32)
     column_of_marker = np.zeros(int(grm_index.m_total), dtype=np.int32)
 
@@ -524,19 +627,17 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
             end = start+host.shape[1]
             if np.any(coef[start:end] != 0.):
                 with cache.hold(index) as block:
-                    value = (value+block@jnp.asarray(coef[start:end, None])).block_until_ready()
+                    value = cache.run(lambda: (value+block@jnp.asarray(
+                        coef[start:end, None])).block_until_ready())
             start = end
         return value
-
-    recycling = RecycledInverse(n, workspace_bytes=workspace_bytes,
-        memory_limit=getattr(getattr(fitter, "cfg", None), "gpu_budget_bytes", None))
 
     def evaluate(coef, warm, error_budget=None, reason="proposal"):
         tick = time.perf_counter()
         fixed_score = fitted(coef)
         residual = yj-fixed_score
         rhs = transform(residual)
-        initial = projected_pre(rhs) if warm is None else warm
+        cache._make_room()
         rhs.block_until_ready()
         fitted_seconds = time.perf_counter()-tick
         solve_started = time.perf_counter()
@@ -552,9 +653,10 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
             product, score = hv_with_score(w)
             retained = (value, w, score)
             return transform(product)+(value-(project(value) if ridged else w))
-        solved, error, count = solve_adaptive_pcg(projected_hv, rhs,
-            M=projected_pre, tol=requested, maxiter=max_pcg_iters, X0=initial, recycle=recycling,
-            verified_hv=verified_product if hv_with_score is not None else None)
+        solved, error, count = cache.run(lambda: solve_adaptive_pcg(
+            projected_hv, rhs, M=projected_pre, tol=requested, maxiter=max_pcg_iters,
+            X0=projected_pre(rhs) if warm is None else warm, recycle=recycling,
+            verified_hv=verified_product if hv_with_score is not None else None))
         if error > requested:
             raise RuntimeError('Lasso residual solve failed its requested accuracy')
         reused = retained is not None and retained[0] is solved
@@ -562,8 +664,8 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         dual.block_until_ready()
         solve_seconds = time.perf_counter()-solve_started
         score_started = time.perf_counter()
-        score = np.array(retained[2] if reused else stream.xtv(dual, normalize=False),
-                         copy=True).reshape(-1)
+        score = cache.run(lambda: np.array(
+            retained[2] if reused else stream.xtv(dual, normalize=False), copy=True)).reshape(-1)
         counters['transpose_products_reused'] = counters.get('transpose_products_reused', 0)+int(reused)
         score_seconds = time.perf_counter()-score_started
         seconds = time.perf_counter()-tick
@@ -652,15 +754,13 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
                     crosses = []
                     for previous in range(block_id):
                         with cache.hold(previous) as old:
-                            crosses.append(np.asarray(_matmul(old, new,
-                                transpose_a=True, workspace_limit=workspace_bytes)))
+                            crosses.append(metric_product(old, new))
                     cross = np.concatenate(crosses, axis=0) if crosses else np.empty((0, len(fresh)))
-                    block = np.asarray(_matmul(new, new, transpose_a=True,
-                        workspace_limit=workspace_bytes))
+                    block = metric_product(new, new)
                     if geometry is not None:
-                        uz = np.asarray(_matmul(u_basis, new,
-                            transpose_a=True, workspace_limit=workspace_bytes))
-                        cz = geometry.covar_features(np.asarray(jnp.asarray(c).T@new), uz)
+                        uz = metric_product(u_basis, new)
+                        covar_z = cache.run(lambda: np.asarray(jnp.asarray(c).T@new))
+                        cz = geometry.covar_features(covar_z, uz)
                 if geometry is not None:
                     cross = geometry.block(cross, u_features, uz, c_features, cz)
                     block = geometry.block(block, uz, uz, cz, cz)
@@ -777,11 +877,13 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         tick = time.perf_counter()
         prediction_reuse = ({} if validation_requires_training_design else
                             dict(training_fixed_score_path=np.asarray(fixed_train)))
-        evaluated = validation_evaluator(candidate=selected,
-            train_candidate=(cached_design(selected) if validation_requires_training_design else None),
+        cache._make_room()
+        validation_design = cached_design(selected) if validation_requires_training_design else None
+        evaluated = cache.run(lambda: validation_evaluator(candidate=selected,
+            train_candidate=validation_design,
             beta_cov_path=gamma[None, :], beta_snp_path=beta[active][None, :],
             hinv_residual_path=np.asarray(dual), training_score_path=gradient[:, None],
-            **prediction_reuse)
+            **prediction_reuse))
         counters['validation_seconds'] += time.perf_counter()-tick
         counters['validation_pcg_residual'] = max(counters['validation_pcg_residual'], evaluated['pcg_rel_res'])
         counters['validation_pcg_iterations'] = max(counters['validation_pcg_iterations'], evaluated['pcg_iters'])
@@ -804,6 +906,7 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
     counters['recycling_rank'] = recycling.rank
     counters['recycling_dependent'] = recycling.dependent
     counters['recycling_memory_skips'] = recycling.memory_skips
+    counters['recycling_allocation_failures'] = recycling.allocation_failures
     counters['device_column_cache'] = cache.metrics()
     cache.clear()
     counters['total_seconds'] = time.perf_counter()-started

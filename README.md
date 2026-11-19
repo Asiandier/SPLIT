@@ -650,14 +650,14 @@ fit lifecycle.
   `XLA_PYTHON_CLIENT_ALLOCATOR=platform` releases allocations eagerly, at a
   potential performance cost.
   Ordinary REML reserves up to one eighth of the budget (capped at 2 GiB)
-  for reusable two-bit genotype blocks. The sparse workflow explicitly uses
-  a separate policy, allowing up to half its budget for these blocks. The
-  planner includes the chosen reservation before sizing compute workspaces;
-  the same allowance is passed to the fitter. A complete source must fit its
-  share to be cached; larger sources continue to stream. Background SS reuses
-  the sparse allowance after releasing the native REML cache, with smaller
-  decode blocks and device-side loops. Neither cache stores a dense
-  standardized genotype matrix or sample Gram matrix.
+  for reusable two-bit genotype blocks. The sparse planner first sizes
+  covariance, Krylov and transfer workspaces. It uses the remaining memory
+  to keep a stable subset of compressed genotype blocks on the GPU.
+  Two pinned host buffers prefetch the other blocks through a bounded device
+  window while the GPU executes earlier products. Residual Lasso can use
+  additional cache space while its narrower solve is active. Background SS
+  and joint VAMP release the fitting cache, plan their own workspace and
+  reuse the same prefetch pipeline for blocks outside their resident subset.
   Within a fixed sample and standardization scope, sparse candidate expansion
   reuses previously read genotype columns and previously computed weighted Gram
   entries. These caches retain only the current candidate set; covariance
@@ -667,13 +667,12 @@ fit lifecycle.
   Gram arithmetic, avoiding serial copies of multi-GiB arrays.
   Sparse planning also accounts for selected-mean FP64 correction solves at
   `--candidate-pcg-rhs-batch-size`, including their live Krylov vectors and
-  optional FP64 GEMM workspace. It reduces the SNP block width when that
-  phase exceeds the budget; the ordinary REML planner is unchanged.
-- `--ring-depth`: number of CPU-side staging buffers used for genotype
-  streaming. This is the main knob for controlling CPU memory peak during data
-  movement. Larger values can give smoother host-to-GPU streaming but allocate
-  more pinned/staging memory on the CPU. The default `0` lets the planner choose
-  a conservative value.
+  optional FP64 GEMM workspace. The planner can reduce the SNP block width
+  and the RHS batch below its requested maximum to fit the budget.
+- `--ring-depth`: CPU-side staging depth for the ordinary REML ring and the
+  CPU sparse path. The sparse GPU path uses its own bounded pinned buffers.
+  Packed inputs are backed by a temporary file and can also occupy reclaimable
+  filesystem cache on the host.
 - `GPU_REML_MATMUL_PRECISION`: JAX matmul precision policy. The robust default
   is `highest`; an alternative should be used only after validating numerical
   agreement on the target GPU.

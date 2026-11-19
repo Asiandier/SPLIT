@@ -15,6 +15,8 @@ from .grouped_ss_vamp import (
     GenotypeProducts, VAMPConfig, VAMPResult, VAMPConvergenceError, fit_grouped_ss_vamp,
 )
 from .ss_linear import MatrixFreeSampleSolver
+from .sparse_memory import available_device_bytes, device_allocation_failed
+from .sparse_packed_stream import SparsePackedStream
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +28,8 @@ class StreamedGenotypeProducts:
     that fallback retains only one memory-bounded genotype block.
     """
     def __init__(self, index, n, normalizers, *, block_bytes=64*1024**2,
-                 device_cache_bytes=0, accelerate_packed=False):
+                 device_cache_bytes=0, accelerate_packed=False,
+                 gpu_budget_bytes=None, trace_workspace_bytes=0):
         self.index, self.n, self.p = index, int(n), int(index.m_total)
         self.streamer = getattr(index, 'streamer', None)
         self.normalizers = np.asarray(normalizers, float)
@@ -34,6 +37,7 @@ class StreamedGenotypeProducts:
         self.chunk_size = min(4096, max(1, block_bytes//max(16*self.n, 1)))
         self.packed_calls = None
         self._device_packed = None
+        self._prefetch = None
         self.device_cache_bytes = 0
         self.sparse_packed_enabled = False
         if (self.streamer is not None and getattr(self.streamer, '_packed_buf', None) is not None
@@ -62,63 +66,112 @@ class StreamedGenotypeProducts:
             self.inverse = jax.device_put(inverse, self.streamer.dev)
             self.starts = jax.device_put(np.array([c[3] for c in calls], np.int32), self.streamer.dev)
             self.widths = jax.device_put(np.array([c[4] for c in calls], np.int32), self.streamer.dev)
-            self._all_calls = jnp.arange(len(calls), dtype=jnp.int32)
+            self._all_calls = np.arange(len(calls), dtype=np.int32)
             self._missing = jnp.asarray(self.streamer._missing_val, jnp.uint8)
             if accelerate_packed and getattr(self.streamer.dev, 'platform', None) == 'gpu':
                 from . import sparse_packed
                 with jax.default_device(self.streamer.dev):
                     self.sparse_packed_enabled = sparse_packed.initialize()
-            needed = len(calls)*self.n*(self.packed_width//4)
-            if (getattr(self.streamer.dev, 'platform', None) == 'gpu'
-                    and 0 < needed <= device_cache_bytes):
-                from .kv_impl import _device_put_block, _store_packed_call
-                with jax.default_device(self.streamer.dev):
-                    cache = jnp.zeros((len(calls), self.n, self.packed_width//4), jnp.uint8)
-                # One upload at a time bounds setup memory at cache + one block.
-                for k in range(len(calls)):
-                    block = self._packed(k)
-                    if block.shape[1] < self.packed_width//4:
-                        block = np.pad(block, ((0, 0), (0, self.packed_width//4-block.shape[1])))
-                    cache = _store_packed_call(cache, _device_put_block(block, self.streamer.dev),
-                                               jnp.asarray(k, jnp.int32))
-                    cache.block_until_ready()
-                self._device_packed = cache
-                self.device_cache_bytes = needed
+            if self.streamer.dev.platform == 'gpu':
+                shape = (self.n, self.packed_width//4)
+                size = int(np.prod(shape))
+                self._prefetch = SparsePackedStream(
+                    self.streamer.dev, self._packed_padded, [size]*len(calls),
+                    budget_bytes=gpu_budget_bytes,
+                )
+                # Reserve two decode tiles, trace storage and outputs before
+                # retaining any packed blocks. Driver/allocator usage also
+                # includes the remaining native fit state.
+                reserve = (block_bytes + trace_workspace_bytes
+                           + 16*(self.n+self.p))
+                self._cache_prefix(shape, size, device_cache_bytes, reserve)
+            self._parameters = tuple(zip(self.widths, self.means, self.inverse, self.starts))
 
-    def _active_calls(self, active):
-        selected, masks = [], np.zeros((len(self.packed_calls), self.packed_width), bool)
+    def _cache_prefix(self, shape, size, limit, reserve):
+        from .kv_impl import _store_packed_call
+        device = self.streamer.dev
+        available = available_device_bytes(device, self._prefetch.budget_bytes)
+        if available is None:
+            return
+        limit = min(limit, available-reserve-self._prefetch.prefetch_bytes)
+        count = min(len(self.packed_calls), max(0, int(limit)//size))
+
+        def fill(count):
+            with jax.default_device(device):
+                initial = jnp.zeros((count, *shape), jnp.uint8)
+                return self._prefetch.reduce(range(count), initial,
+                    lambda cache, k, block: _store_packed_call(cache, block, jnp.asarray(k, jnp.int32)))
+
+        while count:
+            try:
+                self._device_packed = fill(count)
+            except (RuntimeError, MemoryError) as exc:
+                if not device_allocation_failed(exc):
+                    raise
+                count //= 2
+            else:
+                self.device_cache_bytes = count*size
+                break
+
+    def close(self):
+        self._device_packed = None
+        if getattr(self, '_prefetch', None) is not None:
+            self._prefetch.close()
+            self._prefetch = None
+
+    def __del__(self):
+        self.close()
+
+    def _selection(self, active):
+        if np.all(active):
+            return self._all_calls, self.inverse
+        mask = np.zeros((len(self.packed_calls), self.packed_width), bool)
         for k, (_, _, _, start, actual) in enumerate(self.packed_calls):
-            masks[k, :actual] = active[start:start+actual]
-            if np.any(masks[k]):
-                selected.append(k)
-        return jnp.asarray(selected, jnp.int32), self.inverse*jnp.asarray(masks)
+            mask[k, :actual] = active[start:start+actual]
+        return np.flatnonzero(np.any(mask, axis=1)), self.inverse*jax.device_put(mask, self.streamer.dev)
+
+    def _split_calls(self, selected):
+        end = 0 if self._device_packed is None else int(self._device_packed.shape[0])
+        count = int(np.searchsorted(selected, end))
+        return selected[:count], selected[count:]
 
     def restricted(self, active):
-        """Restrict VAMP linear products; general foreground products stay unmasked."""
+        """Restrict the linear products to active markers in logical order."""
         from types import SimpleNamespace
         active = np.asarray(active)
         if active.shape != (self.p,) or active.dtype != np.dtype(bool):
             raise ValueError('Active SNP mask must be Boolean in logical SNP order')
-        if self._device_packed is None:
-            mask = jnp.asarray(active)
-            def masked(value):
-                return jnp.where(mask if value.ndim == 1 else mask[:, None], value, 0.)
+        if np.all(active):
+            return self
+        if self.packed_calls is not None:
+            selected, inverse = self._selection(active)
+            _, streamed = self._split_calls(selected)
+            # The mask and metadata are fixed for this linear operator.
+            # Slice once, outside repeated VAMP forward/transpose scans.
+            streamed_inverse = {int(k): inverse[int(k)] for k in streamed}
             return SimpleNamespace(
-                forward=lambda effects: self.forward(masked(effects)),
-                transpose=lambda value: masked(self.transpose(value)))
-        from .kv_impl import packed_cache_forward, packed_cache_transpose
-        selected, inverse = self._active_calls(active)
+                forward=lambda effects: self._packed_forward(effects, selected, inverse, streamed_inverse),
+                transpose=lambda value: self._packed_transpose(value, selected, inverse, streamed_inverse))
+        mask = jnp.asarray(active)
+        def masked(value):
+            return jnp.where(mask if value.ndim == 1 else mask[:, None], value, 0.)
         return SimpleNamespace(
-            forward=lambda effects: packed_cache_forward(self._device_packed, self.starts,
-                self.widths, self.means, inverse, selected, effects, self._missing,
-                sparse_packed_enabled=self.sparse_packed_enabled),
-            transpose=lambda value: packed_cache_transpose(self._device_packed, self.starts,
-                self.widths, self.means, inverse, selected, value, self._missing, p=self.p,
-                sparse_packed_enabled=self.sparse_packed_enabled))
+            forward=lambda effects: self.forward(masked(effects)),
+            transpose=lambda value: masked(self.transpose(value)))
 
     def _packed(self, k):
         call, first, last, _, _ = self.packed_calls[k]
         return self.streamer._packed_block_host(call)[:, first:last]
+
+    def _packed_padded(self, k):
+        block = self._packed(k)
+        pad = self.packed_width//4-block.shape[1]
+        return np.pad(block, ((0, 0), (0, pad))) if pad else block
+
+    def _reduce(self, calls, state, step):
+        from .kv_impl import reduce_packed_blocks
+        return reduce_packed_blocks(calls, state, step,
+            pop_block=self._packed, dev=self.streamer.dev, packed_stream=self._prefetch)
 
     def _blocks(self, active=None):
         for start in range(0, self.p, self.chunk_size):
@@ -128,19 +181,32 @@ class StreamedGenotypeProducts:
             block = self.index.extract_standardized_columns(np.arange(start, stop))
             yield start, stop, jnp.asarray(block, jnp.float64)
 
+    def _packed_forward(self, effects, selected, inverse, streamed_inverse=None):
+        from .kv_impl import _xv_call_accumulate, packed_cache_forward
+        effects = jnp.asarray(effects)
+        squeeze = effects.ndim == 1
+        if squeeze:
+            effects = effects[:, None]
+        cached, streamed = self._split_calls(selected)
+        if cached.size:
+            total = packed_cache_forward(self._device_packed, self.starts,
+                self.widths, self.means, inverse, jnp.asarray(cached, jnp.int32), effects,
+                self._missing, sparse_packed_enabled=self.sparse_packed_enabled)
+        else:
+            total = jnp.zeros((self.n, effects.shape[1]), effects.dtype)
+        if streamed.size:
+            def step(total, k, block):
+                width, mean, inv, start = self._parameters[k]
+                return _xv_call_accumulate(total, block, width, mean,
+                    inv if streamed_inverse is None else streamed_inverse[k], effects, start,
+                    self._missing, sparse_packed_enabled=self.sparse_packed_enabled)
+            total = self._reduce(streamed, total, step)
+        return total[:, 0] if squeeze else total
+
     def forward(self, effects):
         effects = jnp.asarray(effects)
-        if self._device_packed is not None:
-            from .kv_impl import packed_cache_forward
-            return packed_cache_forward(self._device_packed, self.starts, self.widths,
-                self.means, self.inverse, self._all_calls, effects, self._missing,
-                sparse_packed_enabled=self.sparse_packed_enabled)
         if self.packed_calls is not None:
-            from .kv_impl import xv_impl_streamed
-            return xv_impl_streamed(effects, self.starts, self.widths, self.means, self.inverse,
-                n=self.n, m=self.p, n_calls=len(self.packed_calls), pop_block=self._packed,
-                missing_val=int(self.streamer._missing_val),
-                sparse_packed_enabled=self.sparse_packed_enabled)
+            return self._packed_forward(effects, self._all_calls, self.inverse)
         if self.streamer is not None and hasattr(self.streamer, 'xv'):
             return self.streamer.xv(effects)
         total = jnp.zeros((self.n, effects.shape[1]), effects.dtype)
@@ -148,19 +214,36 @@ class StreamedGenotypeProducts:
             total += jnp.matmul(block, effects[start:stop], precision=jax.lax.Precision.HIGHEST)
         return total
 
+    def _packed_transpose(self, value, selected, inverse, streamed_inverse=None):
+        from .kv_impl import _xtv_one_call_jit, _xtv_scatter_jit, packed_cache_transpose
+        value = jnp.asarray(value)
+        squeeze = value.ndim == 1
+        if squeeze:
+            value = value[:, None]
+        cached, streamed = self._split_calls(selected)
+        if cached.size:
+            total = packed_cache_transpose(self._device_packed, self.starts,
+                self.widths, self.means, inverse, jnp.asarray(cached, jnp.int32), value,
+                self._missing, p=self.p, sparse_packed_enabled=self.sparse_packed_enabled)
+            if streamed.size:
+                total = jnp.pad(total, ((0, self.packed_width), (0, 0)))
+        else:
+            total = jnp.zeros((self.p+self.packed_width, value.shape[1]), value.dtype)
+        if streamed.size:
+            def step(total, k, block):
+                width, mean, inv, start = self._parameters[k]
+                product = _xtv_one_call_jit(block, width, mean,
+                    inv if streamed_inverse is None else streamed_inverse[k], value, self._missing,
+                    sparse_packed_enabled=self.sparse_packed_enabled)
+                return _xtv_scatter_jit(total, product[:int(self.packed_calls[k][-1])], start)
+            total = self._reduce(streamed, total, step)
+        result = total[:self.p]
+        return result[:, 0] if squeeze else result
+
     def transpose(self, residual):
         residual = jnp.asarray(residual)
-        if self._device_packed is not None:
-            from .kv_impl import packed_cache_transpose
-            return packed_cache_transpose(self._device_packed, self.starts, self.widths,
-                self.means, self.inverse, self._all_calls, residual, self._missing, p=self.p,
-                sparse_packed_enabled=self.sparse_packed_enabled)
         if self.packed_calls is not None:
-            from .kv_impl import xtv_impl_streamed
-            return xtv_impl_streamed(residual, self.p, self.starts, self.widths,
-                self.means, self.inverse, n_calls=len(self.packed_calls),
-                pop_block=self._packed, missing_val=int(self.streamer._missing_val),
-                sparse_packed_enabled=self.sparse_packed_enabled)
+            return self._packed_transpose(residual, self._all_calls, self.inverse)
         if self.streamer is not None:
             return self.streamer.xtv(residual, normalize=False)
         total = jnp.zeros((self.p, residual.shape[1]), residual.dtype)
@@ -170,59 +253,59 @@ class StreamedGenotypeProducts:
         return total
 
     def _packed_gram_operator(self, active, *, with_transpose=False):
-        """Packed Gram scan, optionally retaining its standardized inner product."""
-        active = np.asarray(active, bool)
-        if self._device_packed is not None:
-            from .kv_impl import packed_cache_gram, packed_cache_gram_transpose
-            selected, inverse = self._active_calls(active)
+        """Scan a device-resident prefix, then continue on prefetched blocks."""
+        if self.packed_calls is None:
+            return None
+        from .kv_impl import (
+            _kv_one_call_jit, _kv_xtv_one_call_jit, _xtv_scatter_jit,
+            packed_cache_gram, packed_cache_gram_transpose,
+        )
+        selected, inverse = self._selection(np.asarray(active, bool))
+        cached, streamed = self._split_calls(selected)
+        cached = jnp.asarray(cached, jnp.int32)
+        inv_params = None if inverse is self.inverse else {int(k): inverse[int(k)] for k in streamed}
+        accelerated = self.sparse_packed_enabled
+
+        def packed_operator(value):
+            squeeze = value.ndim == 1
+            if squeeze:
+                value = value[:, None]
+            total = jnp.zeros_like(value)
+            projection = None
+            if cached.size:
+                if with_transpose:
+                    total, projection = packed_cache_gram_transpose(
+                        self._device_packed, self.starts, self.widths, self.means, inverse,
+                        cached, value, self._missing, p=self.p, sparse_packed_enabled=accelerated)
+                    if streamed.size:
+                        projection = jnp.pad(projection, ((0, self.packed_width), (0, 0)))
+                else:
+                    total = packed_cache_gram(self._device_packed, self.widths, self.means,
+                        inverse, cached, value, self._missing, sparse_packed_enabled=accelerated)
+            elif with_transpose:
+                projection = jnp.zeros((self.p+self.packed_width, value.shape[1]), value.dtype)
+
+            def step(state, k, packed):
+                total, projection = state
+                width, mean, inv, start = self._parameters[k]
+                if inv_params is not None:
+                    inv = inv_params[k]
+                if with_transpose:
+                    total, block = _kv_xtv_one_call_jit(packed, width, mean, inv, value,
+                        self._missing, total, sparse_packed_enabled=accelerated)
+                    projection = _xtv_scatter_jit(projection,
+                        block[:int(self.packed_calls[k][-1])], start)
+                else:
+                    total = _kv_one_call_jit(packed, width, mean, inv, value,
+                        self._missing, total, sparse_packed_enabled=accelerated)
+                return total, projection
+
+            total, projection = self._reduce(streamed, (total, projection), step)
             if with_transpose:
-                return lambda value: packed_cache_gram_transpose(self._device_packed,
-                    self.starts, self.widths, self.means, inverse, selected, value,
-                    self._missing, p=self.p, sparse_packed_enabled=self.sparse_packed_enabled)
-            return lambda value: packed_cache_gram(self._device_packed, self.widths,
-                self.means, inverse, selected, value, self._missing,
-                sparse_packed_enabled=self.sparse_packed_enabled)
-        if self.packed_calls is not None:
-            from .kv_impl import (
-                _device_put_block, _kv_one_call_jit, _kv_xtv_one_call_jit, _xtv_scatter_jit,
-            )
-            selected, inverse = [], []
-            for k, (_, _, _, start, actual) in enumerate(self.packed_calls):
-                if np.any(active[start:start+actual]):
-                    mask = np.zeros(self.packed_width, bool)
-                    mask[:actual] = active[start:start+actual]
-                    selected.append(k); inverse.append(self.inverse[k]*jnp.asarray(mask))
-            missing = jnp.asarray(self.streamer._missing_val, jnp.uint8)
-            def packed_operator(value):
-                squeeze = value.ndim == 1
-                if squeeze:
-                    value = value[:, None]
-                total = jnp.zeros_like(value)
-                if with_transpose:
-                    projection = jnp.zeros((self.p+self.packed_width, value.shape[1]), value.dtype)
-                if selected:
-                    pending = _device_put_block(self._packed(selected[0]), self.streamer.dev)
-                    for position, k in enumerate(selected):
-                        packed = pending
-                        if position+1 < len(selected):
-                            pending = _device_put_block(self._packed(selected[position+1]), self.streamer.dev)
-                        if with_transpose:
-                            total, block = _kv_xtv_one_call_jit(packed, self.widths[k],
-                                self.means[k], inverse[position], value, missing, total,
-                                sparse_packed_enabled=self.sparse_packed_enabled)
-                            projection = _xtv_scatter_jit(projection, block, self.starts[k])
-                        else:
-                            total = _kv_one_call_jit(packed, self.widths[k], self.means[k],
-                                inverse[position], value, missing, total,
-                                sparse_packed_enabled=self.sparse_packed_enabled)
-                        del packed
-                if with_transpose:
-                    return (total[:, 0], projection[:self.p, 0]) if squeeze else (total, projection[:self.p])
-                if squeeze:
-                    return total[:, 0]
-                return total
-            return packed_operator
-        return None
+                return (total[:, 0], projection[:self.p, 0]) if squeeze else (total, projection[:self.p])
+            return total[:, 0] if squeeze else total
+
+        return packed_operator
 
     def gram_transpose_operator(self, active):
         """Return a shared packed scan, or None for custom non-packed backends.
@@ -255,11 +338,19 @@ class StreamedGenotypeProducts:
         return operator
 
     def gram_diagonal(self, active):
-        if self._device_packed is not None:
-            from .kv_impl import packed_cache_diagonal
-            selected, inverse = self._active_calls(np.asarray(active, bool))
-            return packed_cache_diagonal(self._device_packed, self.widths, self.means,
-                                          inverse, selected, self._missing)
+        if self.packed_calls is not None and self.streamer.dev.platform == 'gpu':
+            from .kv_impl import _packed_diagonal_step, packed_cache_diagonal
+            selected, inverse = self._selection(np.asarray(active, bool))
+            cached, streamed = self._split_calls(selected)
+            initial = (packed_cache_diagonal(self._device_packed, self.widths, self.means,
+                       inverse, jnp.asarray(cached, jnp.int32), self._missing)
+                       if cached.size else jnp.zeros(self.n, jnp.float64))
+            inv_params = None if inverse is self.inverse else {int(k): inverse[int(k)] for k in streamed}
+            def step(total, k, block):
+                width, mean, inv, _ = self._parameters[k]
+                return _packed_diagonal_step(total, block, width, mean,
+                    inv if inv_params is None else inv_params[k], self._missing)
+            return self._reduce(streamed, initial, step)
         if self.streamer is not None and np.all(active) and hasattr(self.streamer, 'exact_diag'):
             return self.streamer.exact_diag().astype(jnp.float64)*self.streamer._eff_m_const
         total = jnp.zeros(self.n, jnp.float64)
@@ -426,10 +517,8 @@ def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
         workspace = min(max(config.trace_workspace_bytes, minimum_workspace),
                         max(1, int(budget)//8))
         config = replace(config, trace_workspace_bytes=workspace)
-    from .sparse_planner import sparse_packed_device_cache_budget
     cache_bytes = getattr(getattr(fitter, 'cfg', None), 'packed_device_cache_bytes', None)
-    if cache_bytes is None:
-        cache_bytes = sparse_packed_device_cache_budget(budget)
+    cache_bytes = int(budget) if budget is not None else (cache_bytes or 0)
     if context is None:
         # REML is complete. Reuse its reservation for SS's smaller FP64 blocks
         # instead of holding two copies of the same compressed genotypes.
@@ -438,7 +527,8 @@ def _refine_sparse_fit_background(*, fitter, grm_index, y, covariates, support,
             if release is not None:
                 release()
         products = StreamedGenotypeProducts(grm_index, n, normalizers, block_bytes=block_bytes,
-                                            device_cache_bytes=cache_bytes)
+            device_cache_bytes=cache_bytes, gpu_budget_bytes=budget,
+            trace_workspace_bytes=config.trace_workspace_bytes)
         logger.info('[background SS] n=%s, SNPs=%s, packed GPU cache=%.3f GiB / %.3f GiB budget; '
                     'preparing linear solver and trace quadrature',
                     n, p, products.device_cache_bytes/2**30, cache_bytes/2**30)

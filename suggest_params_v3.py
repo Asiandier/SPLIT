@@ -66,6 +66,7 @@ class PlanResult:
     source_build_chunk_width: int = 0
     source_build_chunks: int = 0
     source_build_est_gib: float = 0.0
+    sparse_rhs_batch_size: int | None = None
 
 
 @dataclass(frozen=True)

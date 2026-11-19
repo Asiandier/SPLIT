@@ -97,9 +97,11 @@ roles are described in [sparse_numerics.md](sparse_numerics.md).
 - Multi-GRM SLQ stops when its quadrature gap meets the configured tolerance,
   while differentiating the same recurrence used for the objective. SS trace
   quadrature starts at 32 steps and increases depth when its gap is unresolved.
-- A bounded packed GPU cache avoids repeated host transfers when a complete
-  source fits. SS uses compiled block loops over this cache; larger sources
-  retain the streaming path. Both phases share the planner's cache reservation.
+- Sparse GPU fitting and SS retain a prefix of compressed genotype blocks from
+  the memory left after reserving their respective workspaces. They overlap
+  host-to-device transfers of the remaining blocks with computation.
+  SS scans its resident prefix in a compiled loop and continues the same
+  reduction in SNP order on prefetched blocks.
 - Joint VAMP opts into narrow packed CUDA products for both cached and streamed
   genotypes, with native JAX available when the extension is absent. It reuses
   the sparse fitting solver's FP32 corrections and FP64 residual verification,

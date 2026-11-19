@@ -1,20 +1,16 @@
-"""Sparse-workflow cache policy, separate from ordinary REML defaults."""
+"""Budget sparse compute and packed prefetch separately from ordinary REML."""
 from __future__ import annotations
 
 from .pipeline_common import run_planner
 from .slq import workspace_layout
+from .sparse_packed_stream import PREFETCH_WINDOW
 from .suggest_params_v3 import _DEFAULT_GPU_FREE, _GPU_HEADROOM
 
-
-def sparse_packed_device_cache_budget(gpu_budget_bytes=None) -> int:
-    """Allow a full packed source to use up to half the sparse GPU budget.
-
-    The shared planner reserves this allowance before sizing compute blocks.
-    Native REML fitting and subsequent background refinement reuse the same
-    allowance; they do not retain two copies of the packed source.
-    """
-    return (max(0, int(gpu_budget_bytes)//2)
-            if gpu_budget_bytes is not None else 256 * 1024**2)
+_GIB = 2**30
+_WIDTH_ALIGNMENT = 256
+# Bound the latency of fetching one block independently of total panel size.
+# Smaller budgets shrink this tile further using the live-workspace plan.
+_PACKED_TRANSFER_TARGET = 256 * 2**20
 
 
 def sparse_slq_workspace_bytes(gpu_budget_bytes) -> int:
@@ -63,8 +59,12 @@ def sparse_fp64_workspace_bytes(gpu_budget_bytes, *, plan=None, n_samples=None,
     if n_samples is None:
         raise ValueError("Sample count is required for planned FP64 workspace.")
     n, w, r = int(n_samples), int(plan.call_width), int(rhs_batch_size)
-    occupied = plan.gpu_fixed_gib * 1024**3 + 80*n*r + n*w/2 + 8*n*w
+    occupied = plan.gpu_fixed_gib * _GIB + 80*n*r + _prefetch_bytes(n, w) + 8*n*w
     return min(cap, max(0, int(gpu_budget_bytes-occupied)))
+
+
+def _prefetch_bytes(n, width):
+    return PREFETCH_WINDOW * n * ((width+3)//4)
 
 
 def sparse_solve_peak_bytes(plan, n_samples, rhs_batch_size, workspace_bytes):
@@ -73,67 +73,103 @@ def sparse_solve_peak_bytes(plan, n_samples, rhs_batch_size, workspace_bytes):
     Account for live FP32 Krylov vectors plus FP64 residual/correction vectors
     (80 bytes per sample/RHS). Native FP64 can retain two decoded blocks;
     emulated FP64 needs one decoded block and its explicit workspace. Packed
-    prefetch adds two quarter-byte blocks. These are alternative live phases.
+    prefetch has a bounded device window. These are alternative live phases.
     """
     n, w, r = int(n_samples), int(plan.call_width), int(rhs_batch_size)
-    fixed = plan.gpu_fixed_gib * 1024**3
+    fixed = plan.gpu_fixed_gib * _GIB
     vectors = 80*n*r
-    prefetch = n*w/2
+    prefetch = _prefetch_bytes(n, w)
     return fixed+vectors+prefetch+max(16*n*w, 8*n*w+int(workspace_bytes))
 
 
 def run_sparse_planner(*, gpu_free=None, gpu_budget=None, rhs_batch_size=1024,
-                       device="gpu", **kwargs):
-    """Opt the sparse workflow into its cache policy without changing REML."""
-    resolved_budget = (
-        float(gpu_budget)
-        if gpu_budget is not None
-        else float(gpu_free if gpu_free is not None else _DEFAULT_GPU_FREE) * _GPU_HEADROOM
-    )
+                       auto_rhs_batch=False, device="gpu", **kwargs):
+    """Size mandatory work first and assign spare memory to packed blocks."""
+    available = float(gpu_free if gpu_free is not None else _DEFAULT_GPU_FREE) * _GPU_HEADROOM
+    resolved_budget = available
+    if gpu_budget is not None:
+        resolved_budget = float(gpu_budget)
+        if gpu_free is not None and str(device).lower() != "cpu":
+            resolved_budget = min(resolved_budget, available)
     kwargs.setdefault('slq_workspace_bytes', sparse_slq_workspace_bytes(resolved_budget))
-    plan = run_planner(
-        gpu_free=gpu_free,
-        gpu_budget=gpu_budget,
-        packed_device_cache_bytes=sparse_packed_device_cache_budget(resolved_budget),
-        **kwargs,
-    )
-    # CPU fitting has no live GPU solve or FFI workspace. Retain its previous
-    # plan rather than rejecting it against an unrelated device-memory limit.
     if str(device).lower() == "cpu":
+        plan = run_planner(gpu_free=gpu_free, gpu_budget=gpu_budget, **kwargs)
+        plan.sparse_rhs_batch_size = rhs_batch_size
         return plan
-    def peak(p):
-        # Size blocks for the mandatory native FP64 path first. Optional
-        # emulation scratch must fit around these arrays, not displace them.
-        return sparse_solve_peak_bytes(p, kwargs['n_samples'], rhs_batch_size, 0)
-    # Keep ordinary-REML planning intact. Re-plan only the sparse block width
-    # when its selected-mean solve has the larger live-memory requirement.
-    if peak(plan) > resolved_budget and plan.call_width > 256:
-        lo, hi = 1, plan.call_width//256
-        best = None
+
+    n = int(kwargs['n_samples'])
+    if n < 1:
+        raise ValueError("Sparse GPU planner requires at least one sample.")
+    cap = kwargs.pop('requested_call_width', None)
+    if cap is None:
+        cap = max(_WIDTH_ALIGNMENT,
+                  4*_PACKED_TRANSFER_TARGET//n//_WIDTH_ALIGNMENT*_WIDTH_ALIGNMENT)
+
+    def make_plan(width):
+        return run_planner(gpu_free=gpu_free, gpu_budget=resolved_budget,
+                           packed_device_cache_bytes=0, requested_call_width=width, **kwargs)
+
+    def extra_prefetch(plan):
+        # Ordinary REML already includes two device input blocks.
+        return (min(PREFETCH_WINDOW, plan.n_calls)-min(2, plan.n_calls))*plan.block_bytes
+
+    def peak(plan):
+        return max(plan.gpu_peak_gib*_GIB + extra_prefetch(plan),
+                   sparse_solve_peak_bytes(plan, n, rhs_batch_size, 0))
+
+    minimum = make_plan(min(cap, _WIDTH_ALIGNMENT))
+    # When possible keep a useful transfer tile. Sacrificing nearly all
+    # genotype columns for a single wide RHS batch repeats Python/DMA setup
+    # in every covariance scan. On tighter budgets the second loop still
+    # finds the smallest feasible layout.
+    target = make_plan(min(cap, max(_WIDTH_ALIGNMENT, cap//4//_WIDTH_ALIGNMENT*_WIDTH_ALIGNMENT)))
+    trial = rhs_batch_size
+    while auto_rhs_batch and rhs_batch_size > 1 and target.feasible and peak(target) > resolved_budget:
+        rhs_batch_size = max(1, rhs_batch_size//2)
+    if peak(target) > resolved_budget:
+        rhs_batch_size = trial
+    while auto_rhs_batch and rhs_batch_size > 1 and peak(minimum) > resolved_budget:
+        rhs_batch_size = max(1, rhs_batch_size//2)
+    if not minimum.feasible or peak(minimum) > resolved_budget:
+        raise SystemExit("Sparse selected-mean solve exceeds the GPU budget; "
+                         "reduce --candidate-pcg-rhs-batch-size or increase the budget. "
+                         + minimum.note)
+
+    plan = make_plan(cap)
+    if not plan.feasible or peak(plan) > resolved_budget:
+        lo, hi = 1, max(1, plan.call_width//_WIDTH_ALIGNMENT)
+        plan = minimum
         while lo <= hi:
             mid = (lo+hi)//2
-            candidate = run_planner(
-                gpu_free=gpu_free, gpu_budget=gpu_budget,
-                packed_device_cache_bytes=sparse_packed_device_cache_budget(resolved_budget),
-                **dict(kwargs, requested_call_width=mid*256),
-            )
-            if peak(candidate) <= resolved_budget:
-                best = candidate
+            trial = make_plan(mid*_WIDTH_ALIGNMENT)
+            if trial.feasible and peak(trial) <= resolved_budget:
+                plan = trial
                 lo = mid+1
             else:
                 hi = mid-1
-        if best is not None:
-            plan = best
+
+    # Emulated FP64 can use the second decode tile as scratch. A larger
+    # workspace is optional; prioritize persistent compressed blocks over it.
+    mandatory = peak(plan)
+    total_markers = sum(kwargs['p_list'])
+    cache = min(max(0, int(resolved_budget-mandatory)), n*(total_markers+3*plan.n_calls)//4)
+    extra = extra_prefetch(plan) + cache
+    plan.packed_device_cache_bytes = cache
+    plan.gpu_fixed_gib += cache/_GIB
+    plan.gpu_streamer_state_gib += cache/_GIB
+    for field in ('gpu_steady_peak_gib', 'gpu_precond_build_peak_gib',
+                  'gpu_precompute_peak_gib', 'gpu_projection_peak_gib', 'gpu_slq_peak_gib'):
+        setattr(plan, field, getattr(plan, field) + extra/_GIB)
+    plan.host_ring_gib = min(PREFETCH_WINDOW//2, plan.n_calls)*plan.block_bytes/_GIB
+    plan.host_anon_est_gib = 3+plan.host_ring_gib
+    plan.sparse_rhs_batch_size = rhs_batch_size
     workspace = sparse_fp64_workspace_bytes(
-        resolved_budget, plan=plan, n_samples=kwargs['n_samples'],
-        rhs_batch_size=rhs_batch_size,
+        resolved_budget, plan=plan, n_samples=n, rhs_batch_size=rhs_batch_size,
     )
-    estimate = sparse_solve_peak_bytes(plan, kwargs['n_samples'], rhs_batch_size, workspace)
-    plan.feasible = bool(plan.feasible and estimate <= resolved_budget)
-    plan.gpu_peak_gib = max(plan.gpu_peak_gib, estimate/1024**3)
-    plan.note += (f" Sparse selected-mean solve peak={estimate/1024**3:.1f}GiB; "
-                  f"RHS batch={rhs_batch_size}; FP64 workspace<={workspace/1024**3:.1f}GiB.")
-    if not plan.feasible:
-        raise SystemExit("Sparse selected-mean solve exceeds the GPU budget; "
-                         "reduce --candidate-pcg-rhs-batch-size. " + plan.note)
+    estimate = sparse_solve_peak_bytes(plan, n, rhs_batch_size, workspace)
+    plan.gpu_peak_gib = max((mandatory + cache)/_GIB, estimate/_GIB)
+    plan.note += (f" Sparse cache={cache/_GIB:.2f}GiB; "
+                  f"device prefetch={PREFETCH_WINDOW} blocks; "
+                  f"selected-mean peak={estimate/_GIB:.2f}GiB; "
+                  f"RHS batch={rhs_batch_size}; FP64 workspace<={workspace/_GIB:.2f}GiB.")
     return plan

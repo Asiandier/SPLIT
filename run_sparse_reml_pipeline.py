@@ -19,7 +19,7 @@ Performance notes (vs. previous version):
     for the Z portion.
   • Gram matrix inputs kept in float64 throughout to avoid precision loss.
   • Pre-built JAX arrays for y and covar avoid repeated device_put.
-  • Sparse cache policy: reserves packed genotypes before shared GPU-width planning.
+  • Sparse cache policy: budgeted workspaces and asynchronous packed-block prefetch.
 """
 from __future__ import annotations
 
@@ -626,6 +626,8 @@ def _build_prediction_fit_context(
         keep_host_stats=True,
         cpu_threads=cpu_threads,
         gpu_budget_bytes=gpu_budget_bytes,
+        packed_device_cache_bytes=0,
+        sparse_packed_streaming=True,
         ring_depth=ring_depth,
         n_rand_vec=args.n_rand_vec,
         minq_iter=args.minq_iter,
@@ -898,7 +900,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--ring-depth", type=int, default=int(env("RING_DEPTH", "0")),
-                   help="Pinned ring buffer depth (0 = auto, default 32)")
+                   help="Host ring depth for CPU fitting (0 = auto)")
     p.add_argument("--n-rand-vec", type=int, default=100)
     p.add_argument("--slq-samples", type=int, default=100)
     p.add_argument("--slq-m", type=int, default=int(env("SLQ_M", "50")))
@@ -1034,8 +1036,7 @@ def parse_args() -> argparse.Namespace:
         default=1024,
         help=(
             "Maximum genotype RHS columns per candidate Hinv[Z] block-PCG "
-            "solve. Bounds streamed-GRM X.T@V memory during large working-set "
-            "expansion."
+            "solve. The GPU planner may use a smaller batch to fit the budget."
         ),
     )
     p.add_argument(
@@ -3678,14 +3679,12 @@ def main() -> None:
         arbitrary_component_partition=bool(component_variant_indices),
         requested_call_width=(args.call_width if args.call_width > 0 else None),
         rhs_batch_size=int(args.candidate_pcg_rhs_batch_size),
+        auto_rhs_batch=True,
         device=args.device,
     )
     call_width = plan.call_width
-    gpu_budget_bytes = (
-        float(args.gpu_budget_gib) * 1024**3
-        if args.gpu_budget_gib > 0
-        else float(plan.gpu_budget_gib) * 1024**3
-    )
+    gpu_budget_bytes = float(plan.gpu_budget_gib) * 1024**3
+    args.candidate_pcg_rhs_batch_size = plan.sparse_rhs_batch_size
     print_planner_info(
         plan, gpu_name, gpu_free, call_width,
     )
@@ -3694,14 +3693,14 @@ def main() -> None:
         "call_width=%s, "
         "gpu_budget_gib=%s, "
         "n_rand_vec=%s, precond_rank=%s, "
-        "slq_samples=%s, slq_m=%s, "
+        "slq_samples=%s, slq_m=%s, candidate_pcg_rhs_batch_size=%s, "
         "minq_iter=%s, pcg_tol=%s, "
         "max_pcg_iters=%s",
         gpu_name, gpu_free/1024**3 if gpu_free else 'unk',
         call_width,
         args.gpu_budget_gib if args.gpu_budget_gib > 0 else 'auto',
         args.n_rand_vec, plan.precond_rank,
-        args.slq_samples, args.slq_m,
+        args.slq_samples, args.slq_m, args.candidate_pcg_rhs_batch_size,
         args.minq_iter, args.pcg_tol,
         args.max_pcg_iters,
     )
@@ -3723,6 +3722,7 @@ def main() -> None:
             keep_host_stats=True,
             gpu_budget_bytes=gpu_budget_bytes,
             packed_device_cache_bytes=plan.packed_device_cache_bytes,
+            sparse_packed_streaming=True,
             ring_depth=plan.ring_depth,
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter,
             slq_samples=args.slq_samples, slq_m=args.slq_m,
@@ -3748,6 +3748,7 @@ def main() -> None:
             keep_host_stats=True,
             gpu_budget_bytes=gpu_budget_bytes,
             packed_device_cache_bytes=plan.packed_device_cache_bytes,
+            sparse_packed_streaming=True,
             ring_depth=plan.ring_depth,
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter,
             slq_samples=args.slq_samples, slq_m=args.slq_m,
@@ -3834,8 +3835,7 @@ def main() -> None:
     theta_initial = theta.copy()
     restored_outer_state = checkpoint.load() if checkpoint is not None else None
     if restored_outer_state is not None:
-        execution = dict(call_width=call_width, precond_rank=plan.precond_rank,
-                         ring_depth=plan.ring_depth)
+        execution = _checkpoint_mod.execution_layout(plan, call_width)
         if restored_outer_state['execution'] != execution:
             raise RuntimeError('Checkpoint numerical layout differs from the current resource plan')
         fitter.precond_conf = restored_outer_state['preconditioner']
@@ -4482,7 +4482,7 @@ def main() -> None:
                 np.linalg.LinAlgError,
             ) as error:
                 penalized_block_failure = (
-                    "Weighted BASIL Lasso path failed: " f"{error}"
+                    f"Weighted {args.lasso_path_solver} Lasso path failed: {error}"
                 )
             # The fixed-ratio branch below retains its selected-lambda KKT
             # refinement.  The validation branch has already certified every

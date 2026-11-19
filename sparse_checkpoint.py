@@ -262,6 +262,11 @@ class OuterCheckpoint:
         self.lock.close()
 
 
+def execution_layout(plan, call_width):
+    return dict(call_width=call_width, precond_rank=plan.precond_rank,
+                ring_depth=plan.ring_depth, rhs_batch_size=getattr(plan, 'sparse_rhs_batch_size', None))
+
+
 def capture_state(namespace, *, stage):
     state = {name: namespace[name] for name in STATE_NAMES}
     if stage == 'fit_complete':
@@ -271,7 +276,5 @@ def capture_state(namespace, *, stage):
         state.update(warm_z_dict={}, last_aligned_pair=None, mean_information=None)
     state.update(checkpoint_stage=stage,
                  preconditioner=namespace['fitter'].precond_conf,
-                 execution=dict(call_width=namespace['call_width'],
-                     precond_rank=namespace['plan'].precond_rank,
-                     ring_depth=namespace['plan'].ring_depth))
+                 execution=execution_layout(namespace['plan'], namespace['call_width']))
     return state

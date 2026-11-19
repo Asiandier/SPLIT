@@ -1,6 +1,9 @@
 """Bounded-memory subspace reuse for one fixed SPD Lasso covariance."""
 import numpy as np
+import jax
 import jax.numpy as jnp
+
+from .sparse_memory import available_device_bytes, device_allocation_failed
 
 
 class RecycledInverse:
@@ -17,7 +20,13 @@ class RecycledInverse:
         self.rank = 0
         self.capacity = 0
         self.u = self.w = self.u32 = self.w32 = None
-        self.dependent = self.memory_skips = 0
+        self.dependent = self.memory_skips = self.allocation_failures = 0
+
+    def clear(self):
+        had_basis = bool(self.rank)
+        self.u = self.w = self.u32 = self.w32 = None
+        self.rank = self.capacity = 0
+        return had_basis
 
     def coarse(self, residual):
         if not self.rank:
@@ -57,27 +66,41 @@ class RecycledInverse:
             return
         if self.rank == self.n:
             return
-        if self.rank == self.capacity:
-            capacity = min(self.n, max(1, 2*self.capacity))
-            device = next(iter(value.devices()))
-            stats = device.memory_stats()
-            if stats is not None:
-                limit = stats['bytes_limit']
-                if self.memory_limit is not None and self.memory_limit > 0:
-                    limit = min(limit, self.memory_limit)
-                # New FP64/FP32 bases plus allocation/copy intermediates.
-                need = int(stats['bytes_in_use'])+48*self.n*capacity+self.workspace_bytes
-                if need > limit:
-                    self.memory_skips += 1
-                    return
-            u = jnp.zeros((self.n, capacity), dtype=jnp.float64)
-            w = jnp.zeros_like(u)
-            if self.rank:
-                u = u.at[:, :self.capacity].set(self.u)
-                w = w.at[:, :self.capacity].set(self.w)
-            self.u, self.w, self.capacity = u, w, capacity
+        capacity = self.capacity if self.rank < self.capacity else min(self.n, max(1, 2*self.capacity))
+        device = next(iter(value.devices()))
+        room = available_device_bytes(device, self.memory_limit)
+        if room is not None:
+            # Old bases are still live. Budget the replacement FP64/FP32
+            # copies and the update's temporaries around that live state.
+            affordable = max(0, room-self.workspace_bytes)//(48*self.n)
+            if affordable < max(self.capacity, self.rank+1):
+                self.memory_skips += 1
+                return
+            capacity = min(capacity, affordable)
+        elif device.platform == 'gpu':
+            self.memory_skips += 1
+            return
+
+        u, w = self.u, self.w
         factor = np.sqrt(energy)
-        self.u = self.u.at[:, self.rank].set(v[:, 0]/factor)
-        self.w = self.w.at[:, self.rank].set(av[:, 0]/factor)
-        self.u32, self.w32 = self.u.astype(jnp.float32), self.w.astype(jnp.float32)
+        try:
+            if capacity != self.capacity:
+                if self.rank:
+                    padding = ((0, 0), (0, capacity-self.capacity))
+                    u = jnp.pad(u, padding)
+                    w = jnp.pad(w, padding)
+                else:
+                    u = jnp.zeros((self.n, capacity), dtype=jnp.float64)
+                    w = jnp.zeros_like(u)
+            u = u.at[:, self.rank].set(v[:, 0]/factor)
+            w = w.at[:, self.rank].set(av[:, 0]/factor)
+            u32, w32 = u.astype(jnp.float32), w.astype(jnp.float32)
+            jax.block_until_ready((u, w, u32, w32))
+        except (RuntimeError, MemoryError) as error:
+            if not device_allocation_failed(error):
+                raise
+            self.allocation_failures += 1
+            return
+        self.u, self.w, self.u32, self.w32 = u, w, u32, w32
+        self.capacity = capacity
         self.rank += 1

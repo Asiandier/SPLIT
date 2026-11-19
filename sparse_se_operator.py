@@ -9,7 +9,7 @@ import numpy as np
 from .sparse_information import solve_sparse_pcg
 from .sparse_heritability_se import Backend
 from .pcg import pcg_solve
-from .sparse_basis import gpu_workspace_bytes
+from .sparse_memory import available_device_bytes, device_allocation_failed
 from .sparse_trace import ProjectedTrace
 
 logger = logging.getLogger(__name__)
@@ -129,11 +129,11 @@ class OperatorKernelBank:
         budget = getattr(self.fitter.cfg, 'gpu_budget_bytes', None)
         if device is None or device.platform != 'gpu' or budget is None:
             return
-        available = gpu_workspace_bytes(device, budget)
+        available = available_device_bytes(device, budget)
         # These arrays coexist even before including operator scratch.
         required = (12*self.n*rank if projected
                     else 24*self.n*rank+8*rank*rank)
-        if available and required > available:
+        if available is not None and required > available:
             method = 'Projected' if projected else 'Inverse-column'
             raise MemoryError(f'{method} SE needs at least {required/1024**3:.2f} GiB '
                               f'for selected arrays, with {available/1024**3:.2f} GiB available')
@@ -192,8 +192,7 @@ class OperatorKernelBank:
                     hv, precond, target[:, start:stop],
                     None if initial is None else initial[:, start:stop])
             except (RuntimeError, MemoryError) as error:
-                if width == 1 or not (isinstance(error, MemoryError) or
-                    any(term in str(error) for term in ('RESOURCE_EXHAUSTED', 'OUT_OF_MEMORY'))):
+                if width == 1 or not device_allocation_failed(error):
                     raise
                 self.solve_batch_size = max(1, width//2)
                 self.allocation_retries += 1

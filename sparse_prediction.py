@@ -451,6 +451,8 @@ def _predict_sparse_path(
         n=n_test,
         n_calls=int(test_streamer._n_calls),
         pop_block=test_streamer._pop_cached,
+        packed_stream=getattr(test_streamer, "_sparse_packed_stream", None),
+        call_parameters=getattr(test_streamer, "_sparse_call_parameters", None),
         missing_val=int(test_streamer._missing_val),
     )
     background = np.column_stack(

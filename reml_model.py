@@ -83,6 +83,7 @@ class FitConfig:
     gpu_budget_bytes: float | None = None
     capture_reml_diagnostics: bool = False
     cache_reml_setup: bool = False
+    sparse_packed_streaming: bool = False
 
 
 @dataclasses.dataclass
@@ -533,6 +534,7 @@ class InfinitesimalREMLFitter:
                     sample_mask=cfg.sample_mask,
                     ring_depth=cfg.ring_depth,
                     source_build_chunk_width=cfg.source_build_chunk_width,
+                    sparse_packed_streaming=cfg.sparse_packed_streaming,
                 )
 
             build_items = list(zip(sources, dense_standardization_overrides or [None] * len(sources)))
@@ -573,6 +575,7 @@ class InfinitesimalREMLFitter:
                     sample_mask=cfg.sample_mask,
                     ring_depth=cfg.ring_depth,
                     source_build_chunk_width=cfg.source_build_chunk_width,
+                    sparse_packed_streaming=cfg.sparse_packed_streaming,
                 )
 
             build_items = list(zip(prefixes, dense_standardization_overrides or [None] * len(prefixes)))
@@ -589,9 +592,12 @@ class InfinitesimalREMLFitter:
                         if cfg.packed_device_cache_bytes is None else int(cfg.packed_device_cache_bytes))
         per_source_cache = cache_budget//max(1, len(self.streamers))
         for streamer in self.streamers:
-            cache = getattr(streamer, 'cache_packed_on_device', None)
-            if cache is not None:
-                cache(per_source_cache)
+            if cfg.sparse_packed_streaming:
+                streamer.configure_sparse_packed_cache(per_source_cache, budget_bytes=cfg.gpu_budget_bytes)
+            else:
+                cache = getattr(streamer, 'cache_packed_on_device', None)
+                if cache is not None:
+                    cache(per_source_cache)
         n_dense = len(self.streamers)
         self._n_dense_streamers = n_dense
         if use_component_partition and self.streamers:
@@ -1736,6 +1742,8 @@ class InfinitesimalREMLFitter:
                 missing_val=int(test_st._missing_val),
                 component_ids=np.asarray(test_st._call_component_ids, dtype=np.int32),
                 n_components=int(test_st.n_components),
+                packed_stream=getattr(test_st, "_sparse_packed_stream", None),
+                call_parameters=getattr(test_st, "_sparse_call_parameters", None),
             )
         else:
             if self._smile_operators:
@@ -1808,6 +1816,8 @@ class InfinitesimalREMLFitter:
                     n_calls=int(st_test._n_calls),
                     pop_block=st_test._pop_cached,
                     missing_val=int(st_test._missing_val),
+                    packed_stream=getattr(st_test, "_sparse_packed_stream", None),
+                    call_parameters=getattr(st_test, "_sparse_call_parameters", None),
                 )
                 random_components = (comp_pred,)
                 random_effect = comp_pred

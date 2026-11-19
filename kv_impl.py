@@ -41,6 +41,32 @@ def _device_put_block(block: np.ndarray, dev) -> Array:
     return jax.device_put(np.array(block, copy=True, order="C"), dev)
 
 
+def reduce_packed_blocks(calls, state, step, *, pop_block, dev, packed_stream=None):
+    """Keep the same arithmetic order with either device input pipeline."""
+    if packed_stream is not None:
+        return packed_stream.reduce(calls, state, step)
+    indices = iter(calls)
+    call = next(indices, None)
+    if call is None:
+        return state
+    pending = _device_put_block(pop_block(call), dev)
+    for following in indices:
+        block = pending
+        pending = _device_put_block(pop_block(following), dev)
+        state = step(state, call, block)
+        del block
+        call = following
+    return step(state, call, pending)
+
+
+def _call_parameters(streamer, call):
+    params = getattr(streamer, "_sparse_call_parameters", None)
+    if params is not None:
+        return params[call]
+    return (streamer._true_widths_dev[call], streamer._means_by_call[call],
+            streamer._inv_by_call[call], streamer._snp_starts_dev[call])
+
+
 def _stack_leading_axis(arrays: Sequence[Array]) -> Array:
     """Assemble equal-shaped arrays without building one large concatenate op."""
     if not arrays:
@@ -323,6 +349,8 @@ def kv_impl_streamed(
     missing_val: int = 3,
     normalize: bool = True,
     fp64_workspace_bytes: int = 0,
+    packed_stream=None,
+    call_parameters=None,
 ) -> Array:
     """
     Double-buffered streaming K·V.
@@ -343,28 +371,14 @@ def kv_impl_streamed(
     if n_calls == 0:
         return acc[:, 0] if squeeze else acc
 
-    # ---- double-buffer: pre-fetch block 0 --------------------------------
-    g_dev_next = _device_put_block(pop_block(0), dev)
+    def step(acc, c, packed):
+        width, mean, inv = ((true_widths[c], means_by_call[c], inv_by_call[c])
+                            if call_parameters is None else call_parameters[c][:3])
+        return _kv_one_call_jit(packed, width, mean, inv, V, miss_u8, acc,
+                                fp64_workspace_bytes=fp64_workspace_bytes)
 
-    for c in range(n_calls):
-        g_dev_cur = g_dev_next
-        # Initiate H2D for block c+1 *before* launching compute on block c.
-        # jax.device_put is asynchronous: it returns immediately while the
-        # DMA engine copies data over PCIe in the background.
-        if c + 1 < n_calls:
-            g_dev_next = _device_put_block(pop_block(c + 1), dev)
-
-        acc = _kv_one_call_jit(
-            g_dev_cur,
-            true_widths[c],
-            means_by_call[c],
-            inv_by_call[c],
-            V,
-            miss_u8,
-            acc,
-            fp64_workspace_bytes=fp64_workspace_bytes,
-        )
-        del g_dev_cur   # release device buffer for reuse
+    acc = reduce_packed_blocks(range(n_calls), acc, step, pop_block=pop_block,
+                               dev=dev, packed_stream=packed_stream)
 
     if normalize:
         eff = eff_m.astype(fp)
@@ -387,6 +401,8 @@ def xtv_impl_streamed(
     normalize: bool = False,
     eff_m: Array | None = None,
     sparse_packed_enabled: bool = False,
+    packed_stream=None,
+    call_parameters=None,
 ) -> Array:
     """
     Double-buffered streaming X^T·V.
@@ -406,24 +422,19 @@ def xtv_impl_streamed(
         out = out[:m]
         return out[:, 0] if squeeze else out
 
-    g_dev_next = _device_put_block(pop_block(0), dev)
-
-    for c in range(n_calls):
-        g_dev_cur = g_dev_next
-        if c + 1 < n_calls:
-            g_dev_next = _device_put_block(pop_block(c + 1), dev)
-
+    def step(out, c, packed):
+        width, mean, inv, start = (
+            (true_widths[c], means_by_call[c], inv_by_call[c], snp_starts[c])
+            if call_parameters is None else call_parameters[c]
+        )
         block_out = _xtv_one_call_jit(
-            g_dev_cur,
-            true_widths[c],
-            means_by_call[c],
-            inv_by_call[c],
-            V,
-            miss_u8,
+            packed, width, mean, inv, V, miss_u8,
             sparse_packed_enabled=sparse_packed_enabled,
         )
-        del g_dev_cur   # release device buffer for reuse
-        out = _xtv_scatter_jit(out, block_out, snp_starts[c])
+        return _xtv_scatter_jit(out, block_out, start)
+
+    out = reduce_packed_blocks(range(n_calls), out, step, pop_block=pop_block,
+                               dev=dev, packed_stream=packed_stream)
 
     if normalize:
         if eff_m is None:
@@ -519,18 +530,24 @@ def packed_cache_transpose(cache, starts, widths, means, inverse, selected, valu
 
 
 @jax.jit
+def _packed_diagonal_step(total, packed, width, means, inverse, missing):
+    diff, inv = _unpack_impute_center(packed, width, means, inverse, total, missing)
+    return total+jnp.sum((diff*inv[None, :])**2, axis=1)
+
+
+@jax.jit
 def packed_cache_diagonal(cache, widths, means, inverse, selected, missing):
     initial = jnp.zeros(cache.shape[1], jnp.float64)
     def body(position, total):
         call = selected[position]
-        diff, inv = _unpack_impute_center(cache[call], widths[call], means[call],
-                                          inverse[call], initial, missing)
-        return total+jnp.sum((diff*inv[None, :])**2, axis=1)
+        return _packed_diagonal_step(total, cache[call], widths[call], means[call],
+                                     inverse[call], missing)
     return initial if selected.shape[0] == 0 else jax.lax.fori_loop(0, selected.shape[0], body, initial)
 
 
 def xv_impl_streamed(effects, snp_starts, true_widths, means_by_call, inv_by_call,
-                     *, n, m, n_calls, pop_block, missing_val=3, sparse_packed_enabled=False):
+                     *, n, m, n_calls, pop_block, missing_val=3, sparse_packed_enabled=False,
+                     packed_stream=None, call_parameters=None):
     """Stream X @ effects using training normalization and caller precision."""
     squeeze = effects.ndim == 1
     if squeeze:
@@ -540,16 +557,16 @@ def xv_impl_streamed(effects, snp_starts, true_widths, means_by_call, inv_by_cal
     dev = next(iter(effects.devices()))
     total = jnp.zeros((n, effects.shape[1]), effects.dtype)
     missing = jnp.asarray(missing_val, jnp.uint8)
-    if n_calls:
-        pending = _device_put_block(pop_block(0), dev)
-        for call in range(n_calls):
-            packed = pending
-            if call+1 < n_calls:
-                pending = _device_put_block(pop_block(call+1), dev)
-            total = _xv_call_accumulate(total, packed, true_widths[call],
-                means_by_call[call], inv_by_call[call], effects, snp_starts[call], missing,
-                sparse_packed_enabled=sparse_packed_enabled)
-            del packed
+    def step(total, call, packed):
+        width, mean, inv, start = (
+            (true_widths[call], means_by_call[call], inv_by_call[call], snp_starts[call])
+            if call_parameters is None else call_parameters[call]
+        )
+        return _xv_call_accumulate(total, packed, width, mean, inv, effects, start, missing,
+                                   sparse_packed_enabled=sparse_packed_enabled)
+
+    total = reduce_packed_blocks(range(n_calls), total, step, pop_block=pop_block,
+                                 dev=dev, packed_stream=packed_stream)
     return total[:, 0] if squeeze else total
 
 
@@ -622,6 +639,8 @@ def zxb_impl_streamed(
     missing_val: int = 3,
     component_ids: np.ndarray | None = None,
     n_components: int = 0,
+    packed_stream=None,
+    call_parameters=None,
 ) -> tuple[Array, tuple[Array, ...]]:
     """Double-buffered streaming test prediction g = Z_test @ b."""
     if b_by_call.ndim != 2:
@@ -669,25 +688,19 @@ def zxb_impl_streamed(
     if n_calls == 0:
         return total, tuple(comp_outs)
 
-    g_dev_next = _device_put_block(pop_block(0), dev)
-    for c in range(n_calls):
-        g_dev_cur = g_dev_next
-        if c + 1 < n_calls:
-            g_dev_next = _device_put_block(pop_block(c + 1), dev)
-        block_out = _zxb_one_call_jit(
-            g_dev_cur,
-            true_widths[c],
-            means_by_call[c],
-            inv_by_call[c],
-            b_by_call[c],
-            miss_u8,
-        )
-        del g_dev_cur
+    def step(state, c, packed):
+        total, comp_outs = state
+        width, mean, inv = ((true_widths[c], means_by_call[c], inv_by_call[c])
+                            if call_parameters is None else call_parameters[c][:3])
+        block_out = _zxb_one_call_jit(packed, width, mean, inv, b_by_call[c], miss_u8)
         total = total + block_out
         if component_ids is not None:
             comp_idx = int(component_ids[c])
             comp_outs[comp_idx] = comp_outs[comp_idx] + block_out
+        return total, comp_outs
 
+    total, comp_outs = reduce_packed_blocks(range(n_calls), (total, comp_outs), step,
+        pop_block=pop_block, dev=dev, packed_stream=packed_stream)
     return total, tuple(comp_outs)
 
 
@@ -701,6 +714,8 @@ def zxb_impl_same_stream_multi(
     n_calls: int,
     pop_block: Callable[[int], np.ndarray],
     missing_val: int = 3,
+    packed_stream=None,
+    call_parameters=None,
 ) -> tuple[Array, tuple[Array, ...]]:
     """Predict several components that share one genotype stream in one pass.
 
@@ -730,21 +745,14 @@ def zxb_impl_same_stream_multi(
         components = tuple(component_matrix[:, idx] for idx in range(n_components))
         return jnp.sum(component_matrix, axis=1), components
 
-    g_dev_next = _device_put_block(pop_block(0), dev)
-    for c in range(n_calls):
-        g_dev_cur = g_dev_next
-        if c + 1 < n_calls:
-            g_dev_next = _device_put_block(pop_block(c + 1), dev)
+    def step(component_matrix, c, packed):
+        width, mean, inv = ((true_widths[c], means_by_call[c], inv_by_call[c])
+                            if call_parameters is None else call_parameters[c][:3])
         b_call = jnp.swapaxes(b_by_call_stack[:, c, :], 0, 1)
-        component_matrix = component_matrix + _zxb_multi_one_call_jit(
-            g_dev_cur,
-            true_widths[c],
-            means_by_call[c],
-            inv_by_call[c],
-            b_call,
-            miss_u8,
-        )
-        del g_dev_cur
+        return component_matrix + _zxb_multi_one_call_jit(packed, width, mean, inv, b_call, miss_u8)
+
+    component_matrix = reduce_packed_blocks(range(n_calls), component_matrix, step,
+        pop_block=pop_block, dev=dev, packed_stream=packed_stream)
 
     components = tuple(component_matrix[:, idx] for idx in range(n_components))
     return jnp.sum(component_matrix, axis=1), components
@@ -1166,22 +1174,16 @@ def kv_impl_partitioned_component(
     if call_start >= call_stop:
         return acc[:, 0] if squeeze else acc
 
-    g_dev_next = _device_put_block(streamer._pop_cached(call_start), dev)
-    for c in range(call_start, call_stop):
-        g_dev_cur = g_dev_next
-        if c + 1 < call_stop:
-            g_dev_next = _device_put_block(streamer._pop_cached(c + 1), dev)
-        acc = _kv_one_call_jit(
-            g_dev_cur,
-            streamer._true_widths_dev[c],
-            streamer._means_by_call[c],
-            streamer._inv_by_call[c],
-            V,
-            miss_u8,
-            acc,
-            fp64_workspace_bytes=getattr(streamer, "_sparse_fp64_workspace_bytes", 0),
-        )
-        del g_dev_cur
+    workspace = getattr(streamer, "_sparse_fp64_workspace_bytes", 0)
+
+    def step(acc, c, packed):
+        width, mean, inv, _ = _call_parameters(streamer, c)
+        return _kv_one_call_jit(packed, width, mean, inv, V, miss_u8, acc,
+                                fp64_workspace_bytes=workspace)
+
+    acc = reduce_packed_blocks(range(call_start, call_stop), acc, step,
+        pop_block=streamer._pop_cached, dev=dev,
+        packed_stream=getattr(streamer, "_sparse_packed_stream", None))
 
     if normalize:
         eff = streamer._component_eff_m_const[component_idx].astype(fp)
@@ -1215,36 +1217,34 @@ def kv_impl_partitioned_weighted(
         result = acc[:, 0] if squeeze else acc
         return (result, transpose[:, 0] if squeeze else transpose) if return_transpose else result
 
-    g_dev_next = _device_put_block(streamer._pop_cached(0), dev)
-    for c in range(streamer._n_calls):
-        g_dev_cur = g_dev_next
-        if c + 1 < streamer._n_calls:
-            g_dev_next = _device_put_block(streamer._pop_cached(c + 1), dev)
+    packed_stream = getattr(streamer, "_sparse_packed_stream", None)
+    workspace = getattr(streamer, "_sparse_fp64_workspace_bytes", 0)
+    scales = None
+    if packed_stream is not None:
+        eff = streamer._component_eff_m_const.astype(fp)
+        scales = tuple(jnp.where(eff > 0, theta_g / eff, jnp.asarray(0, fp)))
+    product = _kv_xtv_scaled_one_call_jit if return_transpose else _kv_one_call_scaled_jit
+
+    def step(state, c, packed):
+        acc, transpose = state
         comp_idx = int(streamer._call_component_ids[c])
-        eff = streamer._component_eff_m_const[comp_idx].astype(fp)
-        scale = jnp.where(
-            eff > 0,
-            theta_g[comp_idx] / eff,
-            jnp.asarray(0.0, dtype=fp),
-        )
-        product = (_kv_xtv_scaled_one_call_jit if return_transpose else _kv_one_call_scaled_jit)(
-            g_dev_cur,
-            streamer._true_widths_dev[c],
-            streamer._means_by_call[c],
-            streamer._inv_by_call[c],
-            V,
-            miss_u8,
-            scale,
-            acc,
-            fp64_workspace_bytes=getattr(streamer, "_sparse_fp64_workspace_bytes", 0),
-        )
-        if return_transpose:
-            acc, block = product
-            width = int(streamer._call_true_widths[c])
-            transpose = _xtv_scatter_jit(transpose, block[:width], streamer._snp_starts_dev[c])
+        if scales is None:
+            eff = streamer._component_eff_m_const[comp_idx].astype(fp)
+            scale = jnp.where(eff > 0, theta_g[comp_idx] / eff, jnp.asarray(0.0, dtype=fp))
         else:
-            acc = product
-        del g_dev_cur
+            scale = scales[comp_idx]
+        width, mean, inv, start = _call_parameters(streamer, c)
+        result = product(packed, width, mean, inv, V, miss_u8, scale, acc,
+                         fp64_workspace_bytes=workspace)
+        if return_transpose:
+            acc, block = result
+            transpose = _xtv_scatter_jit(transpose, block[:int(streamer._call_true_widths[c])], start)
+        else:
+            acc = result
+        return acc, transpose
+
+    acc, transpose = reduce_packed_blocks(range(streamer._n_calls), (acc, transpose), step,
+        pop_block=streamer._pop_cached, dev=dev, packed_stream=packed_stream)
 
     result = acc[:, 0] if squeeze else acc
     return (result, transpose[:, 0] if squeeze else transpose) if return_transpose else result
@@ -1272,23 +1272,20 @@ def kv_impl_partitioned_stacked(
         out = _stack_leading_axis(outs)
         return out[:, :, 0] if squeeze else out
 
-    g_dev_next = _device_put_block(streamer._pop_cached(0), dev)
-    for c in range(streamer._n_calls):
-        g_dev_cur = g_dev_next
-        if c + 1 < streamer._n_calls:
-            g_dev_next = _device_put_block(streamer._pop_cached(c + 1), dev)
+    workspace = getattr(streamer, "_sparse_fp64_workspace_bytes", 0)
+
+    def step(outs, c, packed):
         comp_idx = int(streamer._call_component_ids[c])
+        width, mean, inv, _ = _call_parameters(streamer, c)
         outs[comp_idx] = _kv_one_call_jit(
-            g_dev_cur,
-            streamer._true_widths_dev[c],
-            streamer._means_by_call[c],
-            streamer._inv_by_call[c],
-            V,
-            miss_u8,
-            outs[comp_idx],
-            fp64_workspace_bytes=getattr(streamer, "_sparse_fp64_workspace_bytes", 0),
+            packed, width, mean, inv, V, miss_u8, outs[comp_idx],
+            fp64_workspace_bytes=workspace,
         )
-        del g_dev_cur
+        return outs
+
+    outs = reduce_packed_blocks(range(streamer._n_calls), outs, step,
+        pop_block=streamer._pop_cached, dev=dev,
+        packed_stream=getattr(streamer, "_sparse_packed_stream", None))
 
     if normalize:
         for comp_idx in range(G):
@@ -1320,22 +1317,14 @@ def build_projected_core_atom_streamed(
     k = int(U.shape[1])
     core = jnp.zeros((k, k), dtype=fp)
 
-    if streamer._n_calls > 0:
-        g_dev_next = _device_put_block(streamer._pop_cached(0), dev)
-        for c in range(streamer._n_calls):
-            g_dev_cur = g_dev_next
-            if c + 1 < streamer._n_calls:
-                g_dev_next = _device_put_block(streamer._pop_cached(c + 1), dev)
-            block_out = _xtv_one_call_jit(
-                g_dev_cur,
-                streamer._true_widths_dev[c],
-                streamer._means_by_call[c],
-                streamer._inv_by_call[c],
-                U,
-                miss_u8,
-            )
-            del g_dev_cur
-            core = core + _xtx_from_block_jit(block_out)
+    def step(core, c, packed):
+        width, mean, inv, _ = _call_parameters(streamer, c)
+        block_out = _xtv_one_call_jit(packed, width, mean, inv, U, miss_u8)
+        return core + _xtx_from_block_jit(block_out)
+
+    core = reduce_packed_blocks(range(streamer._n_calls), core, step,
+        pop_block=streamer._pop_cached, dev=dev,
+        packed_stream=getattr(streamer, "_sparse_packed_stream", None))
 
     return _finalize_projected_core_atom(
         core,
@@ -1426,22 +1415,16 @@ def build_projected_core_atoms_partitioned(
     if streamer._n_calls == 0:
         return _stack_leading_axis(cores)
 
-    g_dev_next = _device_put_block(streamer._pop_cached(0), dev)
-    for c in range(streamer._n_calls):
-        g_dev_cur = g_dev_next
-        if c + 1 < streamer._n_calls:
-            g_dev_next = _device_put_block(streamer._pop_cached(c + 1), dev)
-        block_out = _xtv_one_call_jit(
-            g_dev_cur,
-            streamer._true_widths_dev[c],
-            streamer._means_by_call[c],
-            streamer._inv_by_call[c],
-            U,
-            miss_u8,
-        )
-        del g_dev_cur
+    def step(cores, c, packed):
+        width, mean, inv, _ = _call_parameters(streamer, c)
+        block_out = _xtv_one_call_jit(packed, width, mean, inv, U, miss_u8)
         comp_idx = int(streamer._call_component_ids[c])
         cores[comp_idx] = cores[comp_idx] + _xtx_from_block_jit(block_out)
+        return cores
+
+    cores = reduce_packed_blocks(range(streamer._n_calls), cores, step,
+        pop_block=streamer._pop_cached, dev=dev,
+        packed_stream=getattr(streamer, "_sparse_packed_stream", None))
 
     eye = jnp.eye(k, dtype=fp)
     for comp_idx in range(G):
