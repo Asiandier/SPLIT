@@ -12,6 +12,7 @@ import math
 import time
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -31,7 +32,13 @@ from .sparse_memory import available_device_bytes, device_allocation_failed
 logger = logging.getLogger(__name__)
 
 def solve_adaptive_pcg(hv, rhs, M=None, tol=1e-8, maxiter=400, X0=None,
-                       check_every=2, recycle=None, verified_hv=None):
+                       check_every=2, recycle=None, verified_hv=None, *,
+                       verified_start=None, save_verified=None):
+    """Refine single-precision corrections against the original FP64 operator.
+
+    A verified start is a prior (solution, true residual) for this same RHS
+    and covariance. Only verified FP64 states can be returned as converged.
+    """
     with jax.experimental.enable_x64():
         rhs = jnp.asarray(rhs, dtype=jnp.float64)
         value = jnp.zeros_like(rhs) if X0 is None else jnp.asarray(X0, dtype=jnp.float64)
@@ -42,7 +49,9 @@ def solve_adaptive_pcg(hv, rhs, M=None, tol=1e-8, maxiter=400, X0=None,
         previous = math.inf
         recycled_precond = M if recycle is None else recycle.preconditioner(M)
         coarse_residual = None
-        if recycle is not None and recycle.rank:
+        if verified_start is not None:
+            value, coarse_residual = verified_start
+        elif recycle is not None and recycle.rank:
             # The Galerkin minimizer over previous solution directions is
             # U U' rhs. It subsumes a warm start in span(U), without applying
             # the covariance to that warm start again.
@@ -62,6 +71,8 @@ def solve_adaptive_pcg(hv, rhs, M=None, tol=1e-8, maxiter=400, X0=None,
             if actual <= tol:
                 if recycle is not None:
                     recycle.observe(value, product)
+                if save_verified is not None:
+                    save_verified(value, residual)
                 return value, actual, used
             if used >= maxiter or actual >= previous:
                 return value, actual, used
@@ -73,7 +84,7 @@ def solve_adaptive_pcg(hv, rhs, M=None, tol=1e-8, maxiter=400, X0=None,
             eta = min(.5, max(np.finfo(np.float32).eps, .5*tol/actual))
             correction, _, count = pcg_solve(hv, residual.astype(jnp.float32),
                 M=recycled_precond, tol=eta, maxiter=maxiter-used, check_every=check_every,
-                stop_on_residual_gap=True)
+                _verify_final=False)
             used += int(count)
             if not count:
                 if not verified:
@@ -277,17 +288,44 @@ def _matmul(a, b, *, transpose_a=False, workspace_limit=0):
     return (a.T if transpose_a else a)@b
 
 
-class _DeviceColumnCache:
-    """Keep decoded columns on the host and cache FP64 device copies on demand.
+@partial(jax.jit, static_argnames=('workspace_limit',))
+def _device_gram(left, right, *, workspace_limit):
+    # Upload and cache the original FP32 data. Convert within the product
+    # so XLA can lay out the FP64 operands for GEMM in one step.
+    left = left.astype(jnp.float64)
+    right = right.astype(jnp.float64)
+    if workspace_limit:
+        return sparse_fp64.matmul(left, right, transpose_a=True,
+                                  workspace_limit=workspace_limit, split_k=True)
+    return left.T@right
 
-    Eviction changes storage only. Columns, their order, and every arithmetic
-    operation remain the same. Pinned operands survive until their operation
-    completes; scratch and operator workspaces are reserved independently.
+
+@njit(cache=True, parallel=True, nogil=True)
+def _add_host_score(score, columns, coefficients):
+    """Accumulate FP32 host columns in FP64 without a decoded FP64 copy."""
+    tile_rows = 256
+    for tile in prange((len(score)+tile_rows-1)//tile_rows):
+        start = tile*tile_rows
+        end = min(start+tile_rows, len(score))
+        for column in range(columns.shape[1]):
+            effect = coefficients[column]
+            if effect != 0.:
+                for row in range(start, end):
+                    score[row] += columns[row, column]*effect
+
+
+class _DeviceColumnCache:
+    """Keep decoded columns on the host and cache device copies on demand.
+
+    The device copy can use the original FP32 storage. Gram and score products
+    still use FP64. Pinned operands survive until their operation completes.
+    Conversion and operator workspaces are reserved independently.
     """
     def __init__(self, host_blocks, device, *, memory_limit=None, reserve_bytes=0,
-                 release_recycle=None, packed_stream=None):
+                 release_recycle=None, packed_stream=None, dtype=np.float64):
         self.host_blocks = host_blocks
         self.device = device
+        self.dtype = np.dtype(dtype)
         self.memory_limit = memory_limit
         self.reserve_bytes = int(reserve_bytes)
         self.release_recycle = release_recycle
@@ -345,13 +383,13 @@ class _DeviceColumnCache:
                     'after reclaiming optional device caches')
             available = self.available()
 
-    def gemm_workspace(self, requested):
+    def gemm_workspace(self, requested, *, live_bytes):
         if requested <= 0:
             return 0
         available = self.available()
-        if available is None or available <= self.reserve_bytes:
+        if available is None or available <= live_bytes:
             return 0
-        room = available-self.reserve_bytes
+        room = available-live_bytes
         # A handful of workspace sizes avoid recompilation at every small
         # allocator fluctuation. The cuBLAS bridge can tile within this limit.
         return requested if room >= requested else 1 << (room.bit_length()-1)
@@ -379,11 +417,12 @@ class _DeviceColumnCache:
     def hold(self, index):
         if index not in self.arrays:
             host = self.host_blocks[index]
-            size = int(host.size)*np.dtype(np.float64).itemsize
+            dtype = np.result_type(self.dtype, host.dtype)
+            size = int(host.size)*dtype.itemsize
             self._make_room(size)
             def upload():
                 with jax.default_device(self.device):
-                    return jnp.asarray(host, dtype=jnp.float64).block_until_ready()
+                    return jnp.asarray(host, dtype=dtype).block_until_ready()
             self.arrays[index] = self.run(upload)
             self.uploads += 1
             self.uploaded_bytes += size
@@ -395,6 +434,32 @@ class _DeviceColumnCache:
             yield self.arrays[index]
         finally:
             self.pins[index] -= 1
+
+    def fitted(self, coef, n):
+        """Stream only a score vector from host blocks that are off device."""
+        value = jnp.zeros((n, 1), dtype=jnp.float64)
+        host_score = None
+        cold_blocks = 0
+        start = 0
+        for index, host in enumerate(self.host_blocks):
+            end = start+host.shape[1]
+            effects = coef[start:end]
+            start = end
+            if not np.any(effects):
+                continue
+            if self.device.platform == 'gpu' and index not in self.arrays:
+                if host_score is None:
+                    host_score = np.zeros(n, dtype=np.float64)
+                _add_host_score(host_score, host, effects)
+                cold_blocks += 1
+            else:
+                with self.hold(index) as block:
+                    value = self.run(lambda: (value+block@jnp.asarray(
+                        effects[:, None])).block_until_ready())
+        if host_score is not None:
+            value = self.run(lambda: (value+jax.device_put(
+                host_score[:, None], self.device)).block_until_ready())
+        return value, cold_blocks
 
     def clear(self):
         if any(self.pins.values()):
@@ -414,11 +479,11 @@ class _DeviceColumnCache:
 def _lasso_workspace(n, marker_batch, call_width, rank, *, packed, prefetch_bytes):
     """Budget the live phase with the widest mandatory temporaries."""
     max_block = 2*max(1, int(marker_batch))
-    # Two cached column operands may need row-major FFI copies.
+    # Room for both FP64 GEMM operands, independently of their cached dtype.
     metric = 16*n*max_block + 8*max_block**2
     precondition = 8*n*(rank+max_block) + 8*rank*(rank+max_block)
     if packed:
-        partials = 16*((n+511)//512*call_width + (call_width+2047)//2048*n)
+        partials = 16*((n+511)//512*call_width + (call_width+2047)//2048*n) + 32*call_width
     else:
         partials = 16*n*call_width
     return max(metric, precondition, partials+prefetch_bytes) + 128*n
@@ -450,9 +515,9 @@ def fit_weighted_residual_path(*, fitter, grm_index, hv, precond, theta, y,
     prefetch = (packed_stream.prefetch_bytes if packed_stream is not None else
                 0 if getattr(stream, '_device_packed_blocks', None) is not None else n*width//2)
     reserve = _lasso_workspace(n, marker_batch, width, rank, packed=packed, prefetch_bytes=prefetch)
-    # Leave room for two live FP64 candidate-column operands in addition to
-    # the compute scratch. The prefetch window is reserved by the cache.
-    column_bytes = 2*8*n*2*max(1, int(marker_batch))
+    # Leave room for two cached FP32 candidate blocks in addition to the
+    # FP64 GEMM scratch. The prefetch window is reserved by the cache.
+    column_bytes = 2*4*n*2*max(1, int(marker_batch))
     cache_scope = (nullcontext() if packed_stream is None else
                    packed_stream.borrow_cache(reserve + column_bytes))
     with jax.experimental.enable_x64(), _numba_thread_mask(cpu_threads), cache_scope:
@@ -567,14 +632,20 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
     recycling = RecycledInverse(n, workspace_bytes=reserve, memory_limit=memory_limit)
     cache = _DeviceColumnCache(host_blocks, device, memory_limit=memory_limit,
                                reserve_bytes=reserve, release_recycle=recycling.clear,
-                               packed_stream=getattr(stream, '_sparse_packed_stream', None))
+                               packed_stream=getattr(stream, '_sparse_packed_stream', None),
+                               dtype=np.float32 if device.platform == 'gpu' else np.float64)
     if device.platform == 'gpu':
         logger.info('[residual Lasso memory] mandatory workspace=%.2f GiB; packed=%s',
                     reserve/2**30, packed)
 
     def metric_product(left, right):
-        return cache.run(lambda: np.asarray(_matmul(left, right, transpose_a=True,
-            workspace_limit=cache.gemm_workspace(workspace_bytes))))
+        if device.platform == 'gpu':
+            # The solve's larger scratch is idle during this Gram product.
+            # The live phase needs just the FP64 operands and paired output.
+            live_bytes = 8*(left.size+right.size+left.shape[1]*right.shape[1])
+            return cache.run(lambda: np.asarray(_device_gram(left, right,
+                workspace_limit=cache.gemm_workspace(workspace_bytes, live_bytes=live_bytes))))
+        return cache.run(lambda: np.asarray(left.T@right))
     block_of_marker = np.full(int(grm_index.m_total), -1, dtype=np.int32)
     column_of_marker = np.zeros(int(grm_index.m_total), dtype=np.int32)
 
@@ -596,6 +667,7 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         subproblem_seconds=0., validation_seconds=0., max_pcg_residual=0.,
         bfgs_update_seconds=0.,
         fitted_seconds=0., covariance_solve_seconds=0., score_seconds=0.,
+        host_fitted_blocks=0, fitted_reuses=0,
         gradient_events=[], certificate_reuses=0,
         max_pcg_iterations=0, validation_pcg_residual=0., validation_pcg_iterations=0)
     # Reuse only coefficients, never old gradients or curvature after H changes.
@@ -621,22 +693,21 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         return max(path_cfg.kkt_abs_tol, path_cfg.kkt_rel_tol*max(1., value))
 
     def fitted(coef):
-        value = jnp.zeros((n, 1), dtype=jnp.float64)
-        start = 0
-        for index, host in enumerate(host_blocks):
-            end = start+host.shape[1]
-            if np.any(coef[start:end] != 0.):
-                with cache.hold(index) as block:
-                    value = cache.run(lambda: (value+block@jnp.asarray(
-                        coef[start:end, None])).block_until_ready())
-            start = end
+        value, cold_blocks = cache.fitted(coef, n)
+        counters['host_fitted_blocks'] += cold_blocks
         return value
 
-    def evaluate(coef, warm, error_budget=None, reason="proposal"):
+    def evaluate(coef, warm, error_budget=None, reason="proposal", previous_fit=None):
         tick = time.perf_counter()
-        fixed_score = fitted(coef)
-        residual = yj-fixed_score
-        rhs = transform(residual)
+        previous_solve = None if previous_fit is None else previous_fit['verified_solve']
+        if previous_solve is None:
+            fixed_score = fitted(coef)
+            rhs = transform(yj-fixed_score)
+            verified_start = None
+        else:
+            fixed_score = previous_fit['fixed_score']
+            rhs, verified_start = previous_solve
+            counters['fitted_reuses'] += 1
         cache._make_room()
         rhs.block_until_ready()
         fitted_seconds = time.perf_counter()-tick
@@ -647,6 +718,12 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
             raise ValueError('Score-error budget must be positive and finite')
         requested = min(float(pcg_tol), budget/max(bound_scale, 1.))
         retained = None
+        verified_solve = None
+
+        def save_verified(value, residual):
+            nonlocal verified_solve
+            verified_solve = (rhs, (value, residual))
+
         def verified_product(value):
             nonlocal retained
             w = adjoint(value)
@@ -656,7 +733,8 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         solved, error, count = cache.run(lambda: solve_adaptive_pcg(
             projected_hv, rhs, M=projected_pre, tol=requested, maxiter=max_pcg_iters,
             X0=projected_pre(rhs) if warm is None else warm, recycle=recycling,
-            verified_hv=verified_product if hv_with_score is not None else None))
+            verified_hv=verified_product if hv_with_score is not None else None,
+            verified_start=verified_start, save_verified=save_verified))
         if error > requested:
             raise RuntimeError('Lasso residual solve failed its requested accuracy')
         reused = retained is not None and retained[0] is solved
@@ -671,7 +749,7 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         seconds = time.perf_counter()-tick
         event = dict(reason=reason, lam=float(lam), support=int(np.count_nonzero(coef)),
             workset=len(coef), fitted_seconds=fitted_seconds, covariance_solve_seconds=solve_seconds,
-            score_seconds=score_seconds,
+            score_seconds=score_seconds, reused_verified_start=verified_start is not None,
             requested_tolerance=float(requested), true_residual=float(error), pcg_iterations=int(count))
         counters['gradient_events'].append(event)
         logger.debug('[residual Lasso solve] %s', json.dumps(event))
@@ -682,7 +760,7 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
         counters['max_pcg_residual'] = max(counters['max_pcg_residual'], float(error))
         counters['max_pcg_iterations'] = max(counters['max_pcg_iterations'], int(count))
         return score, solved if ridged else dual, dict(seconds=seconds, residual=float(error),
-            fixed_score=fixed_score,
+            fixed_score=fixed_score, verified_solve=verified_solve,
             iterations=int(count), gradient_error_bound=bound_scale*float(error))
 
     gradient, warm, diagnostic = evaluate(beta, None, reason="initial")
@@ -712,7 +790,8 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
                     1.+guess['ratio'], -guess['ratio'], column_norm_bound**2/sigma)
                 beta, gradient = guess['beta'], guess['score']
                 warm = warm+guess['ratio']*(warm-previous_state['warm'])
-                diagnostic = dict(diagnostic, gradient_error_bound=guess['error_bound'], fixed_score=None)
+                diagnostic = dict(diagnostic, gradient_error_bound=guess['error_bound'],
+                                  fixed_score=None, verified_solve=None)
         for iteration in range(max_iterations+1):
             check = check_certificate(gradient, indices, beta, lam, tolerance,
                 diagnostic['gradient_error_bound'])
@@ -722,7 +801,8 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
                 elapsed_seconds=time.perf_counter()-started))
             if check['refine_score']:
                 gradient, warm, diagnostic = evaluate(beta, warm,
-                    error_budget=check['next_error_budget'], reason='refine_certificate')
+                    error_budget=check['next_error_budget'], reason='refine_certificate',
+                    previous_fit=diagnostic)
                 continue
             if check['certified']:
                 # The full-marker score and its propagated error already
@@ -814,9 +894,11 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
                 if step_size > 0 and delta+uncertainty < 0:
                     break
                 accuracy = .1*min(diagnostic['gradient_error_bound'], proposed_diag['gradient_error_bound'])
-                gradient, warm, diagnostic = evaluate(beta, warm, error_budget=accuracy, reason="line_search_current")
+                gradient, warm, diagnostic = evaluate(beta, warm, error_budget=accuracy,
+                    reason="line_search_current", previous_fit=diagnostic)
                 proposed_gradient, proposed_warm, proposed_diag = evaluate(
-                    proposal, proposed_warm, error_budget=accuracy, reason="line_search_proposal")
+                    proposal, proposed_warm, error_budget=accuracy, reason="line_search_proposal",
+                    previous_fit=proposed_diag)
                 change = gradient-proposed_gradient
             else:
                 raise RuntimeError('Residual Lasso line search cannot certify descent')
@@ -839,7 +921,8 @@ def _fit_path(*, fitter, grm_index, hv, precond, theta, y, covar, lam_max,
                     product=update[0], denominator=update[1], target=update[2]))
             diagnostic = dict(proposed_diag, gradient_error_bound=(1-step_size)*diagnostic['gradient_error_bound']
                 +step_size*proposed_diag['gradient_error_bound']+rounding_bound,
-                fixed_score=proposed_diag['fixed_score'] if step_size == 1. else None)
+                fixed_score=proposed_diag['fixed_score'] if step_size == 1. else None,
+                verified_solve=proposed_diag['verified_solve'] if step_size == 1. else None)
         else:
             # Refining an uncertain score also consumes the iteration budget.
             # In particular, the last refinement must not fall through and

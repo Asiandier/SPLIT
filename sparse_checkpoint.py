@@ -124,7 +124,7 @@ class _Encoder:
             node = dict(type='tuple' if isinstance(value, tuple) else 'list',
                         items=[self.encode(v) for v in value])
         elif isinstance(value, SparseProjectedInformation):
-            if value.q64 is not None:
+            if value.q32 is not None or value.q64 is not None:
                 raise ValueError('Checkpoint boundary retains a live projected-likelihood cache')
             node = dict(type='projected_information', exact=self.encode(value.exact),
                         slq_workspace_bytes=value.slq_workspace_bytes)

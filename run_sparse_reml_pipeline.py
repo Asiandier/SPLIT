@@ -5136,11 +5136,12 @@ def main() -> None:
         information_started = time.perf_counter()
         active_markers = candidate[active_local]
         if information_markers is None or not np.array_equal(active_markers, information_markers):
+            information_device = fitter.streamers[0].dev if fitter.streamers else None
             mean_information = SparseMeanInformation(
                 active_design, covar_np,
                 hinv_active=None if sol_z_np is None else sol_z_np[:, active_local],
                 batch_size=int(args.candidate_pcg_rhs_batch_size),
-                device=fitter.streamers[0].dev if fitter.streamers else None,
+                device=information_device,
                 gpu_budget_bytes=gpu_budget_bytes,
             )
             mean_information = _sparse_reml_mod.with_projected_likelihood(
@@ -5150,6 +5151,8 @@ def main() -> None:
                 slq_workspace_bytes=fit_cfg.slq_workspace_bytes if args.device != "cpu" else None,
                 slq_samples=args.slq_samples,
                 slq_depth=args.slq_m,
+                device=information_device,
+                gpu_budget_bytes=gpu_budget_bytes,
             )
             information_markers = active_markers.copy()
         # Both branches profile ordinary covariates at the current covariance.

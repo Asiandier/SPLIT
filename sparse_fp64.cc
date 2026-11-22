@@ -90,7 +90,7 @@ size_t Workspace(size_t m, size_t n, size_t k, int bits) {
 
 template <ffi::DataType D>
 ffi::Error Matmul(Stream stream, int32_t device, ffi::ScratchAllocator scratch,
-                  bool ta, bool tb, int64_t limit,
+                  bool ta, bool tb, bool split_k, int64_t limit,
                   ffi::Buffer<D,2> a, ffi::Buffer<D,2> b,
                   ffi::ResultBuffer<D,2> out) {
   constexpr bool fp64 = D == ffi::F64;
@@ -106,13 +106,27 @@ ffi::Error Matmul(Stream stream, int32_t device, ffi::ScratchAllocator scratch,
     if (k != (tb?bd[1]:bd[0]) || cd[0]!=m || cd[1]!=n || m<1 || n<1 || k<1
         || std::max({m,n,k,ad[1],bd[1]})>INT32_MAX)
       return ffi::Error::InvalidArgument("Invalid sparse GEMM dimensions");
-    int64_t tm=m, tn=n;
-    while (fp64 && limit>0 && Workspace(tm,tn,k,ctx.bits)+255>static_cast<size_t>(limit) && (tm>1 || tn>1)) {
+    int64_t tm=m, tn=n, tk=k;
+    const auto fits = [&](int64_t rows, int64_t cols, int64_t inner) {
+      return Workspace(rows,cols,inner,ctx.bits)+255<=static_cast<size_t>(limit);
+    };
+    if (fp64 && split_k && limit>0 && !fits(m,n,k) && fits(m,n,std::min<int64_t>(k,128))) {
+      // A tall Gram product may exceed the cap even for one output tile.
+      // Accumulate FP64 products of consecutive row tiles.
+      int64_t low=std::min<int64_t>(k,128), high=k;
+      while (low<high) {
+        int64_t middle=low+(high-low+1)/2;
+        if (fits(m,n,middle)) low=middle;
+        else high=middle-1;
+      }
+      tk=low;
+    }
+    while (fp64 && limit>0 && !fits(tm,tn,tk) && (tm>1 || tn>1)) {
       if (tm>=tn && tm>1) tm=(tm+1)/2; else tn=(tn+1)/2;
     }
     // Native FP32 needs no precision-emulation scratch. Bound its GEMM
     // workspace independently; it is much smaller than the FP64 allowance.
-    size_t bytes=fp64 ? Workspace(tm,tn,k,ctx.bits)
+    size_t bytes=fp64 ? Workspace(tm,tn,tk,ctx.bits)
         : static_cast<size_t>(std::min<int64_t>(64*1024*1024, std::max<int64_t>(0,limit-255)));
     void* work=nullptr;
     if (limit>0 && bytes+255<=static_cast<size_t>(limit)) {
@@ -126,7 +140,7 @@ ffi::Error Matmul(Stream stream, int32_t device, ffi::ScratchAllocator scratch,
         const size_t previous=bytes;
         do {
           if (tm>=tn && tm>1) tm=(tm+1)/2; else tn=(tn+1)/2;
-          bytes=Workspace(tm,tn,k,ctx.bits);
+          bytes=Workspace(tm,tn,tk,ctx.bits);
         } while (bytes>=previous && (tm>1 || tn>1));
         if (bytes>=previous) break;
         allocated=scratch.Allocate(bytes+255,16);
@@ -135,29 +149,36 @@ ffi::Error Matmul(Stream stream, int32_t device, ffi::ScratchAllocator scratch,
         work=reinterpret_cast<void*>((reinterpret_cast<uintptr_t>(*allocated)+255)&~uintptr_t(255));
         Check(api.math(ctx.handle,fp64?8:0), "GEMM math mode");
       } else {
-        tm=m;tn=n;bytes=0;
+        tm=m;tn=n;tk=k;bytes=0;
         Check(api.math(ctx.handle,0), "native math without scratch");
       }
     } else {
-      tm=m;tn=n;bytes=0;
+      tm=m;tn=n;tk=k;bytes=0;
       Check(api.math(ctx.handle,0), "native math");
     }
     // Explicit workspace prevents cuBLAS from allocating outside XLA's budget.
     Check(api.workspace(ctx.handle,work,bytes), "set workspace");
-    const Scalar alpha=1., beta=0.;
+    const Scalar alpha=1.;
     for (int64_t i=0;i<m;i+=tm) for (int64_t j=0;j<n;j+=tn) {
       int rows=static_cast<int>(std::min(tm,m-i));
       int cols=static_cast<int>(std::min(tn,n-j));
-      const Scalar* ap=a.typed_data()+(ta?i:i*ad[1]);
-      const Scalar* bp=b.typed_data()+(tb?j*bd[1]:j);
       // C_row^T = op(B_row)^T op(A_row)^T, using column-major cuBLAS.
       if constexpr (fp64) {
-        Check(api.gemm(ctx.handle,tb?1:0,ta?1:0,cols,rows,static_cast<int>(k),
-            &alpha,bp,static_cast<int>(bd[1]),ap,static_cast<int>(ad[1]),&beta,
-            out->typed_data()+i*n+j,static_cast<int>(n)), "Dgemm");
+        for (int64_t offset=0;offset<k;offset+=tk) {
+          int inner=static_cast<int>(std::min(tk,k-offset));
+          const Scalar beta=offset==0?0.:1.;
+          const Scalar* ap=a.typed_data()+(ta?offset*ad[1]+i:i*ad[1]+offset);
+          const Scalar* bp=b.typed_data()+(tb?j*bd[1]+offset:offset*bd[1]+j);
+          Check(api.gemm(ctx.handle,tb?1:0,ta?1:0,cols,rows,inner,
+              &alpha,bp,static_cast<int>(bd[1]),ap,static_cast<int>(ad[1]),&beta,
+              out->typed_data()+i*n+j,static_cast<int>(n)), "Dgemm");
+        }
       } else {
         // CUDA_R_32F=0, CUBLAS_COMPUTE_32F=68, CUBLAS_GEMM_DEFAULT=-1.
         // Use native FP32, never FAST_TF32/FP16/BF16 or reduced precision.
+        const Scalar beta=0.;
+        const Scalar* ap=a.typed_data()+(ta?i:i*ad[1]);
+        const Scalar* bp=b.typed_data()+(tb?j*bd[1]:j);
         Check(api.gemm_ex(ctx.handle,tb?1:0,ta?1:0,cols,rows,static_cast<int>(k),
             &alpha,bp,0,static_cast<int>(bd[1]),ap,0,static_cast<int>(ad[1]),&beta,
             out->typed_data()+i*n+j,0,static_cast<int>(n),68,-1), "FP32 GemmEx");
@@ -193,11 +214,11 @@ extern "C" int split_fp64_init(const char* library, char* error, size_t capacity
 XLA_FFI_DEFINE_HANDLER_SYMBOL(SplitFp64Matmul, Matmul<ffi::F64>,
     ffi::Ffi::Bind().Ctx<ffi::PlatformStream<Stream>>().Ctx<ffi::DeviceOrdinal>()
       .Ctx<ffi::ScratchAllocator>().Attr<bool>("transpose_a").Attr<bool>("transpose_b")
-      .Attr<int64_t>("workspace_limit").Arg<Matrix>()
+      .Attr<bool>("split_k").Attr<int64_t>("workspace_limit").Arg<Matrix>()
       .Arg<Matrix>().Ret<Matrix>());
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(SplitFp32Matmul, Matmul<ffi::F32>,
     ffi::Ffi::Bind().Ctx<ffi::PlatformStream<Stream>>().Ctx<ffi::DeviceOrdinal>()
       .Ctx<ffi::ScratchAllocator>().Attr<bool>("transpose_a").Attr<bool>("transpose_b")
-      .Attr<int64_t>("workspace_limit").Arg<Matrix32>()
+      .Attr<bool>("split_k").Attr<int64_t>("workspace_limit").Arg<Matrix32>()
       .Arg<Matrix32>().Ret<Matrix32>());

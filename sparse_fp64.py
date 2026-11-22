@@ -109,7 +109,7 @@ def initialize() -> bool:
         return _library is not None
 
 
-def matmul(a, b, *, transpose_a=False, transpose_b=False, workspace_limit=0):
+def matmul(a, b, *, transpose_a=False, transpose_b=False, workspace_limit=0, split_k=False):
     """Matrix product with explicit transposes and row-major FFI operands."""
     if (a.ndim != 2 or b.ndim != 2 or a.dtype != b.dtype
             or a.dtype not in (jnp.float32, jnp.float64)):
@@ -127,5 +127,5 @@ def matmul(a, b, *, transpose_a=False, transpose_b=False, workspace_limit=0):
         "split_sparse_fp64" if a.dtype == jnp.float64 else "split_sparse_fp32",
         jax.ShapeDtypeStruct((m,n), a.dtype),
         input_layouts=[(0,1),(0,1)], output_layouts=(0,1), vmap_method="sequential",
-    )(a, b, transpose_a=bool(transpose_a), transpose_b=bool(transpose_b),
+    )(a, b, transpose_a=bool(transpose_a), transpose_b=bool(transpose_b), split_k=bool(split_k),
       workspace_limit=np.int64(workspace_limit))

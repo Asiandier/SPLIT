@@ -110,6 +110,11 @@ class SupportPrecisionSolver:
             precision_safeguard_count=self.precision_safeguard_count)
 
 
+def trace_probe_workspace_bytes(n: int, maximum_depth: int) -> int:
+    """Workspace for one probe at the maximum certified quadrature depth."""
+    return 8 * (n * (2 * maximum_depth + 32) + 8 * (maximum_depth + 1)**2)
+
+
 class MatrixFreeSampleSolver:
     """Solve (A A' + shift I)u=b and estimate tr(G/(G+shift I))/p.
 
@@ -207,7 +212,7 @@ class MatrixFreeSampleSolver:
         # Two-pass reorthogonalization retains one basis for the current
         # batch. Account for matvec, recurrence and small eigensystem buffers.
         maximum = self.maximum_lanczos_steps
-        per_probe = 8*(self.n*(2*maximum+32)+8*(maximum+1)**2)
+        per_probe = trace_probe_workspace_bytes(self.n, maximum)
         if per_probe > workspace_bytes:
             raise MemoryError('SS trace workspace cannot hold one Lanczos probe; '
                               'reduce Lanczos steps or increase workspace_bytes')

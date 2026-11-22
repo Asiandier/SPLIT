@@ -74,6 +74,8 @@ def pcg_solve(
     X0: Optional[Array] = None,
     check_every: int = 2,
     stop_on_residual_gap: bool = False,
+    *,
+    _verify_final: bool = True,
 ) -> Tuple[Array, Array, int]:
     """
     Solve H X = B with block PCG.
@@ -100,6 +102,10 @@ def pcg_solve(
     convergence fails the true-residual check, return that verified inexact
     solution to the higher-precision correction loop instead of restarting
     this precision. The ordinary solver keeps its existing restart behavior.
+
+    Mixed-precision callers that independently verify and refine their
+    combined iterate can set ``_verify_final=False``. In this mode the final
+    residual is recursive, so it must never be used for acceptance.
     """
     if M is None:
         M = _identity
@@ -161,15 +167,18 @@ def pcg_solve(
 
         # Periodic convergence check (GPU→CPU sync).
         if k % check_every == 0 or k == maxiter:
-            recursive_relative = float(jax.device_get(jnp.where(
+            recursive_residual = jnp.where(
                 breakdown, jnp.inf, jnp.max(rnorm / b_norm)
-            )))
+            )
+            recursive_relative = float(jax.device_get(recursive_residual))
             if not math.isfinite(recursive_relative):
                 raise FloatingPointError(
                     "PCG encountered nonpositive curvature or a non-finite recurrence."
                 )
             if recursive_relative <= tol or k == maxiter:
                 solution = X * rhs_scale
+                if not _verify_final:
+                    return solution, recursive_residual, k
                 R, rnorm, res_final, relative_host = true_residual(solution)
                 if relative_host <= tol or k == maxiter or stop_on_residual_gap:
                     return solution, res_final, k

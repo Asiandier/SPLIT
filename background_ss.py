@@ -29,7 +29,8 @@ class StreamedGenotypeProducts:
     """
     def __init__(self, index, n, normalizers, *, block_bytes=64*1024**2,
                  device_cache_bytes=0, accelerate_packed=False,
-                 gpu_budget_bytes=None, trace_workspace_bytes=0):
+                 gpu_budget_bytes=None, trace_workspace_bytes=0,
+                 min_trace_workspace_bytes=None):
         self.index, self.n, self.p = index, int(n), int(index.m_total)
         self.streamer = getattr(index, 'streamer', None)
         self.normalizers = np.asarray(normalizers, float)
@@ -39,6 +40,7 @@ class StreamedGenotypeProducts:
         self._device_packed = None
         self._prefetch = None
         self.device_cache_bytes = 0
+        self.trace_workspace_bytes = trace_workspace_bytes
         self.sparse_packed_enabled = False
         if (self.streamer is not None and getattr(self.streamer, '_packed_buf', None) is not None
                 and getattr(self.streamer, '_means_host', None) is not None
@@ -47,7 +49,13 @@ class StreamedGenotypeProducts:
             # call planned for the FP32 REML stage cannot create an oversized
             # FP64 decode workspace. Source order and training statistics stay
             # exactly those of the native streamer.
-            width = max(4, self.chunk_size//4*4)
+            max_width = max(4, self.chunk_size//4*4)
+            source_width = int(self.streamer._max_unpack_width)
+            tiles_per_call = (source_width + max_width - 1)//max_width
+            # Balance full source calls over the same number of tiles to
+            # avoid padding every call's final tile up to max_width.
+            width = 4*((source_width + 4*tiles_per_call - 1)//(4*tiles_per_call))
+            self.chunk_size = width
             calls = []
             for call, (start, size) in enumerate(zip(self.streamer._call_snp_starts,
                                                     self.streamer._call_true_widths)):
@@ -56,7 +64,7 @@ class StreamedGenotypeProducts:
                     calls.append((call, offset//4, (offset+actual+3)//4,
                                   int(start)+offset, actual))
             self.packed_calls = calls
-            self.packed_width = min(width, int(self.streamer._max_unpack_width))
+            self.packed_width = width
             means = np.zeros((len(calls), self.packed_width), np.float32)
             inverse = np.zeros_like(means)
             for k, (_, _, _, start, actual) in enumerate(calls):
@@ -82,19 +90,32 @@ class StreamedGenotypeProducts:
                 # Reserve two decode tiles, trace storage and outputs before
                 # retaining any packed blocks. Driver/allocator usage also
                 # includes the remaining native fit state.
-                reserve = (block_bytes + trace_workspace_bytes
-                           + 16*(self.n+self.p))
-                self._cache_prefix(shape, size, device_cache_bytes, reserve)
+                reserve = block_bytes + 16*(self.n+self.p)
+                self._cache_prefix(shape, size, device_cache_bytes, reserve,
+                                   min_trace_workspace_bytes)
             self._parameters = tuple(zip(self.widths, self.means, self.inverse, self.starts))
 
-    def _cache_prefix(self, shape, size, limit, reserve):
+    def _cache_prefix(self, shape, size, limit, reserve, min_trace_workspace_bytes):
         from .kv_impl import _store_packed_call
         device = self.streamer.dev
         available = available_device_bytes(device, self._prefetch.budget_bytes)
         if available is None:
             return
-        limit = min(limit, available-reserve-self._prefetch.prefetch_bytes)
-        count = min(len(self.packed_calls), max(0, int(limit)//size))
+        usable = available - reserve - self._prefetch.prefetch_bytes
+        preferred_trace = self.trace_workspace_bytes
+        blocks = len(self.packed_calls)
+        limit = int(limit)
+        count = min(blocks, max(0, min(limit, usable-preferred_trace)//size))
+        preferred_count = count
+        full_bytes = blocks*size
+        trace_with_full_cache = usable-full_bytes
+        if (count < blocks and full_bytes <= limit
+                and min_trace_workspace_bytes is not None
+                and min_trace_workspace_bytes <= trace_with_full_cache):
+            # Trace quadrature is built once in batches. A fully resident
+            # genotype panel avoids transfers during every later PCG solve.
+            count = blocks
+            self.trace_workspace_bytes = min(preferred_trace, trace_with_full_cache)
 
         def fill(count):
             with jax.default_device(device):
@@ -108,7 +129,8 @@ class StreamedGenotypeProducts:
             except (RuntimeError, MemoryError) as exc:
                 if not device_allocation_failed(exc):
                     raise
-                count //= 2
+                count = min(count//2, preferred_count)
+                self.trace_workspace_bytes = preferred_trace
             else:
                 self.device_cache_bytes = count*size
                 break

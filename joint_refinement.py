@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 
 from .background_ss import StreamedGenotypeProducts
-from .ss_linear import MatrixFreeSampleSolver
+from .ss_linear import MatrixFreeSampleSolver, trace_probe_workspace_bytes
 
 from .grouped_ss_vamp import VAMPConfig, validate_vamp_config
 from .joint_vamp import fit_joint
@@ -29,7 +29,7 @@ def joint_workspace(n, config, budget):
     cap = max(1, int(budget) // 8)
     block_bytes = min(2 * 1024**3, cap)
     depth = min(config.trace_lanczos_steps, n)
-    per_probe = 8 * (n * (2 * depth + 32) + 8 * (depth + 1) ** 2)
+    per_probe = trace_probe_workspace_bytes(n, depth)
     population = 1 << (int(n) - 1).bit_length()
     probes = (population if population <= config.trace_exact_probe_limit
               else min(population, config.trace_probes))
@@ -399,7 +399,6 @@ def refine_native_fit(
     # not model parameters or a change to ordinary REML planning.
     budget = getattr(getattr(fitter, "cfg", None), "gpu_budget_bytes", None)
     block_bytes, workspace = joint_workspace(n, config, budget)
-    config = replace(config, trace_workspace_bytes=workspace)
     cache_bytes = getattr(
         getattr(fitter, "cfg", None), "packed_device_cache_bytes", None
     )
@@ -418,7 +417,13 @@ def refine_native_fit(
             accelerate_packed=True,
             gpu_budget_bytes=budget,
             trace_workspace_bytes=workspace,
+            min_trace_workspace_bytes=(
+                trace_probe_workspace_bytes(n, min(n, config.trace_lanczos_steps))
+                + 24*n*8 if budget is not None else None
+            ),
         )
+        workspace = products.trace_workspace_bytes
+        config = replace(config, trace_workspace_bytes=workspace)
         logger.info('[joint VAMP setup] n=%s, SNPs=%s, packed cache=%.3f GiB, '
                     'product block=%s SNPs, trace workspace=%.1f MiB',
                     n, p, products.device_cache_bytes / 2**30,

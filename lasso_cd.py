@@ -277,6 +277,37 @@ def _cd_active_full_qb_epoch(
     return max_delta
 
 
+def _cd_blocked_epoch(Q, q, diag, beta, Qb, lam, active=None):
+    """Keep the coordinate order while batching full-column score updates."""
+    # The local sweep already sees all preceding coordinates. Its updates to
+    # other rows can wait until this block finishes, when one GEMV applies
+    # Q[:, start:stop] @ (beta_new - beta_old) to the full score.
+    block_size = 128
+    max_delta = 0.
+    cursor = 0
+    for start in range(0, beta.size, block_size):
+        stop = min(start+block_size, beta.size)
+        if active is not None:
+            end = int(np.searchsorted(active, stop))
+            if end == cursor:
+                continue
+            local_active = active[cursor:end]-start
+            cursor = end
+        block = slice(start, stop)
+        local_beta = beta[block]
+        old_beta = local_beta.copy()
+        args = (Q[block, block], q[block], diag[block], local_beta, Qb[block].copy(), lam)
+        if active is None:
+            delta = _cd_epoch(*args)
+        else:
+            delta = _cd_active_full_qb_epoch(*args, local_active)
+        if delta > 0.:
+            Qb[:] = sla.blas.dgemv(1., Q[:, block], local_beta-old_beta,
+                                  beta=1., y=Qb, overwrite_y=1)
+            max_delta = max(max_delta, delta)
+    return max_delta
+
+
 @njit(cache=True, nogil=True)
 def _score_kkt_errors(
     q: np.ndarray,
@@ -427,17 +458,22 @@ def solve_lasso_cd_gram(
     # need the decisive exact-matvec KKT certificate.
     active_set_period = max(int(active_set_period), 1)
     it = 0
-    active = np.empty((0,), dtype=np.int64)
+    # Large dense sweeps benefit from BLAS block updates. A sparse sweep
+    # still avoids reading columns for which there is no coefficient change.
+    can_block = k >= 8192
+    active = np.flatnonzero(beta != 0.) if can_block else np.empty(0, dtype=np.int64)
 
     for it_idx in range(1, max_iter + 1):
         it = it_idx
         completed_full_sweep = False
+        blocked = can_block and 4*active.size >= k
+        full_sweep = _cd_blocked_epoch if blocked else _cd_epoch
         if it_idx == 1 or it_idx % active_set_period == 0:
             # Full sweep
             if qb_full_stale:
                 Qb = Q @ beta
                 qb_full_stale = False
-            max_delta = _cd_epoch(Q, q, diag, beta, Qb, lam)
+            max_delta = full_sweep(Q, q, diag, beta, Qb, lam)
             completed_full_sweep = True
             active = np.flatnonzero(beta != 0.0).astype(np.int64)
         else:
@@ -447,7 +483,7 @@ def solve_lasso_cd_gram(
                 if qb_full_stale:
                     Qb = Q @ beta
                     qb_full_stale = False
-                max_delta = _cd_epoch(Q, q, diag, beta, Qb, lam)
+                max_delta = full_sweep(Q, q, diag, beta, Qb, lam)
                 completed_full_sweep = True
                 active = np.flatnonzero(beta != 0.0).astype(np.int64)
             elif not qb_full_stale and 4 * active.size >= k:
@@ -455,7 +491,8 @@ def solve_lasso_cd_gram(
                 # updates become cheaper than gathered active-row updates on
                 # the publication-scale Gram matrices.  This is purely a
                 # memory-layout choice; the coordinate sequence is unchanged.
-                max_delta = _cd_active_full_qb_epoch(
+                dense_sweep = _cd_blocked_epoch if blocked else _cd_active_full_qb_epoch
+                max_delta = dense_sweep(
                     Q, q, diag, beta, Qb, lam, active
                 )
             else:
@@ -470,7 +507,7 @@ def solve_lasso_cd_gram(
             if qb_full_stale:
                 Qb = Q @ beta
                 qb_full_stale = False
-            max_delta = _cd_epoch(Q, q, diag, beta, Qb, lam)
+            max_delta = full_sweep(Q, q, diag, beta, Qb, lam)
             it += 1
             completed_full_sweep = True
             active = np.flatnonzero(beta != 0.0).astype(np.int64)

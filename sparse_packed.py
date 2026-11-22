@@ -107,11 +107,19 @@ def _centered_product(packed, means, value, true_width, missing, *, transpose):
     shape = (((n+511)//512, width, value.shape[1]) if transpose
              else ((packed.shape[1]+511)//512, n, value.shape[1]))
     target = "split_sparse_packed_f64" if value.dtype == jnp.float64 else "split_sparse_packed_f32"
+    lookup = not transpose and value.dtype == jnp.float64 and value.shape[1] == 1 and n >= 512
+    if lookup:
+        # For a single FP64 RHS, reuse the four possible contributions per
+        # marker across rows. Missing genotypes and padding contribute zero.
+        alleles = jnp.arange(4, dtype=jnp.uint8)
+        present = (jnp.arange(width)[:, None] < true_width) & (alleles[None, :] != missing)
+        centered = alleles[None, :].astype(value.dtype) - means[:width, None].astype(value.dtype)
+        value = jnp.where(present, centered*value, 0).reshape((width*4, 1))
     partial = ffi.ffi_call(target, jax.ShapeDtypeStruct(shape, value.dtype),
         input_layouts=[(0, 1), (0,), (), (), (0, 1)], output_layouts=(0, 1, 2),
         vmap_method="sequential")(
             packed, means, jnp.asarray(true_width, dtype=jnp.int32),
-            jnp.asarray(missing, dtype=jnp.uint8), value, transpose=bool(transpose),
+            jnp.asarray(missing, dtype=jnp.uint8), value, transpose=bool(transpose), lookup=lookup,
         )
     return jnp.sum(partial, axis=0)
 
